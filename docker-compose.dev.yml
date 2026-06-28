@@ -1,0 +1,19 @@
+services:
+  api:
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    volumes:
+      - ./backend:/app/backend
+      - ./storage:/app/storage
+  worker:
+    volumes:
+      - ./backend:/app/backend
+      - ./storage:/app/storage
+  frontend:
+    build:
+      target: development
+    command: npm run dev -- --host 0.0.0.0
+    ports: !override
+      - "3000:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
