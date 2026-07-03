@@ -1,9 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { api, sourceVideoUrl } from "../api/client";
+import { api, candidateVideoUrl, downloadUrl, sourceVideoUrl } from "../api/client";
 import { WorkflowSteps } from "../components/WorkflowSteps";
-import type { Candidate, Project, Transformation } from "../types";
+import type { Candidate, Project, ProjectClip } from "../types";
 
 type Status = {
   project_id: string;
@@ -13,6 +13,15 @@ type Status = {
   current_step: string;
   error_code?: string;
   error_message?: string;
+};
+
+type CandidateSelection = {
+  candidate_id: string;
+  job_id: string;
+  clip_id: string;
+  transformation_id: string;
+  status: "created" | "existing";
+  message: string;
 };
 
 const processing = new Set([
@@ -48,6 +57,8 @@ export function ProjectPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [selectedCandidateId, setSelectedCandidateId] = useState("");
+  const [actionKey, setActionKey] = useState("");
+  const [actionMessage, setActionMessage] = useState("");
 
   const project = useQuery({
     queryKey: ["project", projectId],
@@ -60,28 +71,21 @@ export function ProjectPage() {
       processing.has(query.state.data?.status || "") ? 2000 : false,
   });
   const candidates = useQuery({
-    queryKey: ["candidates", projectId],
-    queryFn: () => api<Candidate[]>(`/api/projects/${projectId}/candidates`),
-    enabled: status.data?.status === "candidates_ready",
-  });
-  const latestTransformation = useQuery({
-    queryKey: ["latest-transformation", projectId],
-    queryFn: () =>
-      api<Transformation>(`/api/projects/${projectId}/latest-transformation`),
+    queryKey: ["project-clips", projectId],
+    queryFn: () => api<ProjectClip[]>(`/api/projects/${projectId}/clips`),
     enabled: Boolean(
       status.data &&
         !processing.has(status.data.status) &&
-        status.data.status !== "candidates_ready" &&
         status.data.status !== "failed",
     ),
-    retry: false,
+    refetchInterval: (query) =>
+      query.state.data?.some((clip) =>
+        ["queued", "running"].includes(clip.preview_status || "") ||
+        ["queued", "running"].includes(clip.final_status || ""),
+      )
+        ? 2000
+        : false,
   });
-
-  useEffect(() => {
-    if (latestTransformation.data) {
-      navigate(`/transformations/${latestTransformation.data.id}`, { replace: true });
-    }
-  }, [latestTransformation.data, navigate]);
 
   useEffect(() => {
     if (!selectedCandidateId && candidates.data?.length) {
@@ -89,22 +93,95 @@ export function ProjectPage() {
     }
   }, [candidates.data, selectedCandidateId]);
 
-  const choose = useMutation({
-    mutationFn: async (candidate: Candidate) => {
-      await api(`/api/candidates/${candidate.id}/select`, { method: "POST" });
-      return api<{ id: string }>(
-        `/api/candidates/${candidate.id}/transformation`,
+  const openEditor = useMutation({
+    mutationFn: async (clip: ProjectClip) => {
+      console.log("Edit clip clicked", {
+        clip,
+        candidate_id: clip.candidate_id || clip.id,
+        transformation_id: clip.transformation_id,
+      });
+      if (clip.transformation_id) {
+        return { transformation_id: clip.transformation_id, message: "Editor dibuka." };
+      }
+      const endpoint = `/api/candidates/${clip.candidate_id || clip.id}/select`;
+      console.log("Opening editor via", endpoint);
+      return api<CandidateSelection>(endpoint, { method: "POST" });
+    },
+    onMutate: (clip) => {
+      setActionKey(`edit:${clip.id}`);
+      setActionMessage("");
+    },
+    onSuccess: (result) => {
+      console.log("Edit clip response", result);
+      if (!result.transformation_id) {
+        setActionMessage("Gagal membuka editor klip. ID transformation tidak ditemukan.");
+        return;
+      }
+      navigate(`/transformations/${result.transformation_id}`);
+    },
+    onError: (error) => {
+      console.error("Edit clip failed", error);
+      setActionMessage(
+        error instanceof Error
+          ? error.message
+          : "Gagal membuka editor klip. ID transformation tidak ditemukan.",
+      );
+    },
+    onSettled: () => setActionKey(""),
+  });
+  const queueRender = useMutation({
+    mutationFn: async ({ clip, preview }: { clip: ProjectClip; preview: boolean }) => {
+      console.log(preview ? "Render preview clicked" : "Render final clicked", {
+        clip,
+        candidate_id: clip.candidate_id || clip.id,
+        transformation_id: clip.transformation_id,
+      });
+      let transformationId = clip.transformation_id;
+      if (!transformationId) {
+        const selection = await api<CandidateSelection>(
+          `/api/candidates/${clip.candidate_id || clip.id}/select`,
+          { method: "POST" },
+        );
+        transformationId = selection.transformation_id;
+      }
+      if (!transformationId) {
+        throw new Error("Gagal render. ID transformation tidak ditemukan.");
+      }
+      const endpoint = `/api/transformations/${transformationId}/${
+          preview ? "render-preview" : "render-final"
+        }`;
+      console.log("Calling render endpoint", endpoint);
+      return api(
+        endpoint,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            purpose: "analysis",
-            audience: "Kreator konten Indonesia",
+            preset: "blurred_background",
+            subtitle_language: "id",
           }),
         },
       );
     },
-    onSuccess: (plan) => navigate(`/transformations/${plan.id}`),
+    onMutate: ({ clip, preview }) => {
+      setActionKey(`${preview ? "preview" : "final"}:${clip.id}`);
+      setActionMessage("");
+    },
+    onSuccess: async (_result, variables) => {
+      setActionMessage(
+        variables.preview ? "Render preview dimulai." : "Render final dimulai.",
+      );
+      await queryClient.invalidateQueries({ queryKey: ["project-clips", projectId] });
+    },
+    onError: (error) => {
+      console.error("Render action failed", error);
+      setActionMessage(
+        error instanceof Error
+          ? error.message
+          : "Terjadi kesalahan saat memproses permintaan.",
+      );
+    },
+    onSettled: () => setActionKey(""),
   });
 
   const retry = useMutation({
@@ -120,11 +197,11 @@ export function ProjectPage() {
         method: "POST",
       }),
     onSuccess: (updated) => {
-      queryClient.setQueryData<Candidate[]>(
-        ["candidates", projectId],
+      queryClient.setQueryData<ProjectClip[]>(
+        ["project-clips", projectId],
         (current) =>
           current?.map((candidate) =>
-            candidate.id === updated.id ? updated : candidate,
+            candidate.id === updated.id ? { ...candidate, ...updated } : candidate,
           ),
       );
     },
@@ -156,7 +233,7 @@ export function ProjectPage() {
     );
   }
 
-  if (status.data?.status !== "candidates_ready") {
+  if (processing.has(status.data?.status || "")) {
     const progress = status.data?.progress || 0;
     return (
       <div className="space-y-8">
@@ -270,7 +347,7 @@ export function ProjectPage() {
         <div>
           <h1 className="max-w-4xl text-2xl font-black">{project.data?.title}</h1>
           <p className="mt-1 text-slate-500">
-            {candidates.data?.length || 0} klip ditemukan - pilih satu untuk diedit
+            {candidates.data?.length || 0} klip terbaik tersimpan - edit dan render per klip
           </p>
         </div>
         <div className="flex gap-3">
@@ -284,17 +361,17 @@ export function ProjectPage() {
 
       <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
         <span className="rounded-lg bg-violet-100 px-3 py-2 font-bold text-violet-700">
-          1 dipilih
+          {candidates.data?.length || 0}/5 klip terbaik
         </span>
         <button
           className="btn"
-          disabled={choose.isPending}
-          onClick={() => choose.mutate(selected)}
+          disabled={Boolean(actionKey)}
+          onClick={() => openEditor.mutate(selected)}
         >
-          {choose.isPending ? "Membuka editor..." : "Edit klip"}
+          {actionKey === `edit:${selected.id}` ? "Membuka..." : "Edit klip"}
         </button>
         <span className="ml-auto text-sm text-slate-500">
-          Tahap berikutnya: editing dan render
+          Anda bisa kembali ke daftar ini setelah mengedit setiap klip.
         </span>
       </div>
 
@@ -316,8 +393,17 @@ export function ProjectPage() {
                   className="h-full w-full object-cover"
                   controls
                   preload="metadata"
-                  src={`${sourceVideoUrl(projectId)}#t=${candidate.start_seconds},${candidate.end_seconds}`}
+                  src={
+                    candidate.short_source_clip_path
+                      ? candidateVideoUrl(candidate.id)
+                      : `${sourceVideoUrl(projectId)}#t=${candidate.start_seconds},${candidate.end_seconds}`
+                  }
                 />
+                {candidate.file_missing && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-black/80 p-4 text-center text-sm font-bold text-white">
+                    File short clip hilang. Proses ulang project.
+                  </div>
+                )}
                 <span className="absolute bottom-4 left-4 rounded-lg bg-black/70 px-3 py-1 text-sm font-bold text-white">
                   {formatTime(candidate.duration_seconds)}
                 </span>
@@ -396,12 +482,74 @@ export function ProjectPage() {
                     </span>
                   ))}
                 </div>
+                <div className="mt-6 grid gap-3 border-t border-slate-200 pt-5 sm:grid-cols-2 lg:grid-cols-4">
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={Boolean(actionKey) || candidate.file_missing}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      openEditor.mutate(candidate);
+                    }}
+                  >
+                    {actionKey === `edit:${candidate.id}` ? "Membuka..." : "Edit"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    disabled={Boolean(actionKey) || candidate.file_missing}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      queueRender.mutate({ clip: candidate, preview: true });
+                    }}
+                  >
+                    {actionKey === `preview:${candidate.id}`
+                      ? "Memulai..."
+                      : candidate.preview_status === "completed"
+                      ? "Render preview ulang"
+                      : "Render preview"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    disabled={Boolean(actionKey) || candidate.file_missing}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      queueRender.mutate({ clip: candidate, preview: false });
+                    }}
+                  >
+                    {actionKey === `final:${candidate.id}`
+                      ? "Memulai..."
+                      : candidate.final_status === "completed"
+                      ? "Render final ulang"
+                      : "Render final"}
+                  </button>
+                  {candidate.final_render_id && candidate.final_status === "completed" ? (
+                    <a
+                      className="btn-secondary text-center"
+                      href={downloadUrl(candidate.final_render_id)}
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      Download
+                    </a>
+                  ) : (
+                    <span className="rounded-xl bg-slate-100 px-3 py-2 text-center text-sm font-bold text-slate-500">
+                      Final: {candidate.final_status || "belum ada"}
+                    </span>
+                  )}
+                </div>
               </div>
             </article>
           );
         })}
       </div>
-      {choose.error && <p className="text-red-600">{choose.error.message}</p>}
+      {actionMessage && (
+        <p className="rounded-xl bg-slate-100 p-3 text-sm font-semibold text-slate-700">
+          {actionMessage}
+        </p>
+      )}
+      {openEditor.error && <p className="text-red-600">{openEditor.error.message}</p>}
+      {queueRender.error && <p className="text-red-600">{queueRender.error.message}</p>}
       {regenerateCopy.error && (
         <p className="text-red-600">{regenerateCopy.error.message}</p>
       )}

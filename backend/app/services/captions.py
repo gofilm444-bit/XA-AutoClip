@@ -1,4 +1,5 @@
 import re
+import unicodedata
 
 from app.models import ClipCandidate, Project, SourceDeclaration, TransformationPlan
 
@@ -73,21 +74,43 @@ def summarize_source_description(description: str | None, max_chars: int = 360) 
     return f"{excerpt[:word_end].rstrip()}..."
 
 
+def _normalize_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    return "".join(
+        char if char.isprintable() and unicodedata.category(char) != "Co" else " "
+        for char in normalized
+    )
+
+
+def _safe_words(value: str) -> list[str]:
+    words: list[str] = []
+    current: list[str] = []
+    for char in _normalize_text(value):
+        if char.isalnum():
+            current.append(char)
+        elif current:
+            words.append("".join(current))
+            current = []
+    if current:
+        words.append("".join(current))
+    return words
+
+
 def hashtag_token(value: str) -> str:
-    parts = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+", value)
+    parts = _safe_words(value)
     return "".join(part[:1].upper() + part[1:].lower() for part in parts)
 
 
 def generate_hashtags(title: str, limit: int = 5) -> list[str]:
     hashtags: list[str] = []
     seen: set[str] = set()
-    sections = re.split(r"[|•—–]+", title)
+    sections = re.split(r"[|•—–]+", _normalize_text(title))
     for section in sections:
         phrases = re.split(r"\bvs\.?\b", section, flags=re.IGNORECASE)
         for phrase in phrases:
             tokens = [
                 token
-                for token in re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+", phrase)
+                for token in _safe_words(phrase)
                 if token.lower() not in STOP_WORDS
                 and len(token) >= 3
                 and not token.isdigit()

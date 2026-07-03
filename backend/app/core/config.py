@@ -25,12 +25,20 @@ class Settings(BaseSettings):
     translation_model: str = "gpt-5.5"
     cors_origins: str = "http://localhost:3000"
     media_retention_days: int = 30
+    max_saved_top_clips: int = 5
+    keep_original_video: bool = False
+    temp_retention_hours: int = 24
+    auto_delete_temp_files: bool = True
     originality_min_contribution_ratio: float = 0.55
     originality_max_source_ratio: float = 0.45
     originality_max_uninterrupted_source_seconds: float = 10
     originality_min_commentary_word_ratio: float = 0.35
     repetition_similarity_threshold: float = 0.75
     celery_task_always_eager: bool = False
+    preview_width: int = 540
+    preview_height: int = 960
+    final_width: int = 1080
+    final_height: int = 1920
 
     @property
     def cors_origin_list(self) -> list[str]:

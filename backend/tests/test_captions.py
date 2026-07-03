@@ -32,6 +32,19 @@ def test_hashtag_fallback_has_minimum_two():
     assert len(generate_hashtags("di dan yang")) == 2
 
 
+def test_hashtags_do_not_crash_on_indonesian_unicode_and_mojibake():
+    title = (
+        "Nah, APBD kita tuh, terus kita harus rapi-rapiin, cari efisiensi. "
+        "Pendidikan-kesehatan gratis 100 hari. “Saya” bilang: 1,3 juta warga. "
+        "é Â Ã � – — ’ “"
+    )
+
+    hashtags = generate_hashtags(title)
+
+    assert hashtags
+    assert all(item.startswith("#") for item in hashtags)
+
+
 def test_summarizes_source_description_without_urls():
     result = summarize_source_description(
         "Ringkasan pertandingan dan susunan pemain.\n"

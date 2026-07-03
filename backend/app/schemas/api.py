@@ -81,6 +81,10 @@ class ProjectRead(BaseModel):
     status: str
     created_at: datetime
     updated_at: datetime
+    original_duration: float | None = None
+    total_top_clips: int = 0
+    final_clips_count: int = 0
+    storage_size_estimate: int = 0
 
 
 class JobRead(BaseModel):
@@ -117,6 +121,30 @@ class CandidateRead(BaseModel):
     reasons_json: list
     risks_json: list
     selected: bool
+    short_source_clip_path: str | None = None
+    clip_thumbnail_path: str | None = None
+    file_missing: bool = False
+
+
+class ProjectClipRead(CandidateRead):
+    candidate_id: uuid.UUID
+    job_id: uuid.UUID
+    clip_id: uuid.UUID
+    transformation_id: uuid.UUID | None = None
+    preview_render_id: uuid.UUID | None = None
+    preview_status: str | None = None
+    final_render_id: uuid.UUID | None = None
+    final_status: str | None = None
+    final_file_size_bytes: int | None = None
+
+
+class CandidateSelectionRead(BaseModel):
+    candidate_id: uuid.UUID
+    job_id: uuid.UUID
+    clip_id: uuid.UUID
+    transformation_id: uuid.UUID
+    status: Literal["created", "existing"]
+    message: str
 
 
 class CandidatePatch(BaseModel):
@@ -143,6 +171,7 @@ class TransformationPatch(BaseModel):
     engagement_question: str | None = Field(default=None, min_length=5)
     social_caption: str | None = Field(default=None, min_length=20, max_length=5000)
     storyboard: list[dict] | None = None
+    clipper_style_config: dict | None = None
 
 
 class TransformationRead(BaseModel):
@@ -158,9 +187,15 @@ class TransformationRead(BaseModel):
     conclusion: str
     engagement_question: str
     social_caption: str
+    clipper_style_config: dict
     needs_fact_verification: bool
     status: str
     storyboard: list
+
+
+class HookTextRead(BaseModel):
+    transformation_id: uuid.UUID
+    hook_text: str
 
 
 class TransformationContextRead(BaseModel):
@@ -175,6 +210,7 @@ class TransformationContextRead(BaseModel):
     clip_duration_seconds: float
     candidate_title: str
     candidate_transcript: str
+    caption_cues: list[dict]
     transcription_provider: str | None
     configured_transcription_provider: str
     transcription_language: str | None
@@ -216,3 +252,5 @@ class RenderRead(BaseModel):
     duration_seconds: float | None
     file_size_bytes: int | None
     error_message: str | None
+    warning_message: str | None = None
+    output_url: str | None = None

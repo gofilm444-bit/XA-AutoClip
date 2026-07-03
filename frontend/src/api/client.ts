@@ -61,3 +61,9 @@ export const downloadUrl = (renderId: string) =>
 
 export const sourceVideoUrl = (projectId: string) =>
   `${API_URL}/api/projects/${projectId}/source-file`;
+
+export const candidateVideoUrl = (candidateId: string) =>
+  `${API_URL}/api/candidates/${candidateId}/source-file`;
+
+export const candidateThumbnailUrl = (candidateId: string) =>
+  `${API_URL}/api/candidates/${candidateId}/thumbnail`;

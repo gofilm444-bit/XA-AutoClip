@@ -1,25 +1,74 @@
+import { type ReactNode, useMemo, useState } from "react";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
+
+export type EditorToolbarConfig = {
+  actions?: ReactNode;
+  badge?: ReactNode;
+  compactActions?: ReactNode;
+  meta?: ReactNode;
+  title?: ReactNode;
+};
+
+export type LayoutOutletContext = {
+  setEditorToolbar: (toolbar: EditorToolbarConfig | null) => void;
+};
 
 export function Layout() {
   const location = useLocation();
   const focusMode = location.pathname !== "/";
+  const [editorToolbar, setEditorToolbar] = useState<EditorToolbarConfig | null>(null);
+  const outletContext = useMemo<LayoutOutletContext>(
+    () => ({ setEditorToolbar }),
+    [],
+  );
 
   if (focusMode) {
     return (
       <div className="min-h-screen bg-[#f7f8fc] text-slate-900">
-        <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/95 backdrop-blur">
-          <div className="flex h-16 items-center justify-between px-4 sm:px-7">
-            <Link to="/" className="flex items-center gap-3 font-bold text-slate-700">
+        <header className="sticky top-0 z-50 border-b border-slate-200 bg-white/95 shadow-sm backdrop-blur">
+          <div className="flex h-16 items-center gap-3 px-4 sm:px-7">
+            <Link
+              to="/"
+              className="flex shrink-0 items-center gap-2 font-bold text-slate-700 hover:text-violet-700"
+            >
               <span className="text-2xl leading-none">{"<"}</span>
-              <span>Kembali ke beranda</span>
+              <span className="hidden sm:inline">Kembali ke beranda</span>
             </Link>
-            <Link to="/" className="text-lg font-black tracking-tight">
-              <span className="text-violet-600">XA</span> AutoClip
-            </Link>
+            {editorToolbar && (
+              <div className="min-w-0 flex-1 text-center sm:text-left">
+                <div className="flex min-w-0 items-center justify-center gap-2 sm:justify-start">
+                  <p className="min-w-0 truncate text-sm font-black text-slate-950 sm:text-base">
+                    {editorToolbar.title}
+                  </p>
+                  {editorToolbar.badge}
+                </div>
+                {editorToolbar.meta && (
+                  <p className="mt-0.5 truncate text-[11px] font-semibold text-slate-500 sm:text-xs">
+                    {editorToolbar.meta}
+                  </p>
+                )}
+              </div>
+            )}
+            <div className="ml-auto flex shrink-0 items-center gap-3">
+              {editorToolbar?.actions && (
+                <div className="hidden items-center gap-2 lg:flex">{editorToolbar.actions}</div>
+              )}
+              {editorToolbar?.compactActions && (
+                <details className="relative lg:hidden">
+                  <summary className="btn-secondary list-none px-3 py-2 text-sm">Aksi</summary>
+                  <div className="absolute right-0 top-11 z-50 w-56 space-y-2 rounded-xl border border-slate-200 bg-white p-3 shadow-xl">
+                    {editorToolbar.compactActions}
+                  </div>
+                </details>
+              )}
+              <Link to="/" className="hidden text-lg font-black tracking-tight sm:block">
+                <span className="text-violet-600">XA</span> AutoClip
+              </Link>
+            </div>
           </div>
         </header>
         <main className="mx-auto max-w-[1540px] px-4 py-7 sm:px-7 lg:px-10">
-          <Outlet />
+          <Outlet context={outletContext} />
         </main>
       </div>
     );
@@ -52,7 +101,7 @@ export function Layout() {
             }
           >
             <span>+</span>
-            Buat klip AI
+            Upload Baru
           </NavLink>
         </nav>
         <div className="mt-8 border-t border-zinc-800 pt-6">
@@ -61,8 +110,8 @@ export function Layout() {
           </p>
           <ol className="mt-4 space-y-3 px-3 text-sm text-zinc-500">
             <li>1. Paste link dan upload video</li>
-            <li>2. Pilih klip</li>
-            <li>3. Editing klip</li>
+            <li>2. Simpan 5 klip terbaik</li>
+            <li>3. Edit dan render per klip</li>
           </ol>
         </div>
         <div className="mt-auto rounded-2xl border border-zinc-800 bg-zinc-900 p-4">
@@ -82,7 +131,7 @@ export function Layout() {
           </div>
         </header>
         <main className="mx-auto max-w-[1500px] px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
-          <Outlet />
+          <Outlet context={outletContext} />
         </main>
       </div>
     </div>

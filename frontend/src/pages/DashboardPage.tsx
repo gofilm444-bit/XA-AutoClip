@@ -19,6 +19,19 @@ const statusLabels: Record<string, string> = {
   failed: "Gagal",
 };
 
+function formatDuration(value?: number | null) {
+  if (!value) return "-";
+  const minutes = Math.floor(value / 60);
+  const seconds = Math.floor(value % 60);
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+function formatSize(value?: number) {
+  if (!value) return "-";
+  if (value < 1024 * 1024) return `${Math.ceil(value / 1024)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
 export function DashboardPage() {
   const client = useQueryClient();
   const projects = useQuery({
@@ -82,7 +95,7 @@ export function DashboardPage() {
       <div id="recent-projects" className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <p className="text-sm font-bold text-cyan-400">Workspace</p>
-          <h2 className="mt-1 text-2xl font-black">Proyek terbaru</h2>
+          <h2 className="mt-1 text-2xl font-black">Riwayat hasil proses</h2>
         </div>
         <Link className="btn-secondary" to="/projects/new">+ Proyek baru</Link>
       </div>
@@ -109,10 +122,16 @@ export function DashboardPage() {
               {project.description || "Tanpa deskripsi"}
             </p>
             <div className="mt-5 flex gap-3 border-t border-zinc-800 pt-4">
-              <Link className="btn flex-1" to={`/projects/${project.id}`}>Buka studio</Link>
+              <Link className="btn flex-1" to={`/jobs/${project.id}/clips`}>Buka</Link>
               <button className="btn-secondary" onClick={() => remove.mutate(project.id)}>
                 Hapus
               </button>
+            </div>
+            <div className="mt-4 grid grid-cols-2 gap-2 border-t border-zinc-800 pt-4 text-xs text-zinc-400">
+              <span>Durasi: {formatDuration(project.original_duration)}</span>
+              <span>Top clips: {project.total_top_clips || 0}/5</span>
+              <span>Final: {project.final_clips_count || 0}</span>
+              <span>Storage: {formatSize(project.storage_size_estimate)}</span>
             </div>
           </article>
         ))}

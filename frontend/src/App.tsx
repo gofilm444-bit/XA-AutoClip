@@ -12,6 +12,7 @@ export default function App() {
         <Route index element={<DashboardPage />} />
         <Route path="projects/new" element={<NewProjectPage />} />
         <Route path="projects/:projectId" element={<ProjectPage />} />
+        <Route path="jobs/:projectId/clips" element={<ProjectPage />} />
         <Route path="transformations/:transformationId" element={<TransformationPage />} />
       </Route>
     </Routes>

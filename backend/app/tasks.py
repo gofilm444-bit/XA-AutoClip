@@ -1,8 +1,11 @@
 import hashlib
+import traceback
 import uuid
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import structlog
 from sqlalchemy import delete, select
 
 from app.celery_app import celery_app
@@ -26,15 +29,32 @@ from app.services.candidates import (
     normalize_to_one_minute_candidates,
     weighted_score,
 )
-from app.services.media import extract_audio, probe_media, render_vertical
+from app.services.clipper_style import (
+    build_effect_timeline,
+    extract_keywords,
+    normalize_clipper_style,
+    validate_effect_timeline,
+)
+from app.services.media import (
+    extract_audio,
+    extract_clip,
+    extract_thumbnail,
+    layout_mode,
+    probe_media,
+    render_clean_vertical,
+    render_vertical,
+    validate_render_output,
+)
 from app.services.sports import (
     analyze_sports_video,
     generate_sports_candidates,
     sports_transcript,
 )
-from app.services.subtitles import transcript_cues, write_ass_cues
+from app.services.subtitles import filter_safe_cues, transcript_cues, write_ass_cues
 from app.services.titles import generate_candidate_copy
 from app.services.translation import normalize_language, translate_texts
+
+logger = structlog.get_logger()
 
 
 def _transition(project: Project, target: ProjectStatus) -> None:
@@ -160,15 +180,17 @@ def process_project(project_id: str, job_id: str) -> None:
         _transition(project, ProjectStatus.GENERATING_CANDIDATES)
         _job_progress(job, 80, "Memberi skor kandidat")
         db.commit()
+        settings = get_settings()
+        max_top_clips = max(1, settings.max_saved_top_clips)
         if project.content_type == "sports":
             sports_signals = analyze_sports_video(source_path, metadata.has_audio)
             drafts = generate_sports_candidates(
                 sports_signals,
                 metadata.duration,
-                limit=5,
+                limit=max_top_clips,
             )
         else:
-            drafts = generate_candidates(segments, limit=30)
+            drafts = generate_candidates(segments, limit=max(30, max_top_clips))
         if not drafts:
             raise AppError(
                 ErrorCode.INVALID_TIMESTAMPS,
@@ -182,8 +204,9 @@ def process_project(project_id: str, job_id: str) -> None:
         final_drafts = (
             drafts
             if project.content_type == "sports"
-            else normalize_to_one_minute_candidates(drafts, metadata.duration)
+            else normalize_to_one_minute_candidates(drafts, metadata.duration, limit=max_top_clips)
         )
+        final_drafts = final_drafts[:max_top_clips]
         existing_candidates = list(
             db.scalars(
                 select(ClipCandidate)
@@ -256,6 +279,30 @@ def process_project(project_id: str, job_id: str) -> None:
             candidate.rank = rank
             candidate.selected = False
             db.add(candidate)
+        for stale in existing_candidates[len(final_drafts) :]:
+            db.delete(stale)
+        db.flush()
+
+        saved_candidates = list(
+            db.scalars(
+                select(ClipCandidate)
+                .where(ClipCandidate.project_id == project.id)
+                .order_by(ClipCandidate.rank)
+            )
+        )
+        for candidate in saved_candidates[:max_top_clips]:
+            clip_path = storage.resolve(f"{project.id}/clips/{candidate.id}.mp4")
+            thumb_path = storage.resolve(f"{project.id}/thumbnails/{candidate.id}.jpg")
+            extract_clip(
+                source_path,
+                clip_path,
+                candidate.start_seconds,
+                candidate.duration_seconds,
+            )
+            extract_thumbnail(clip_path, thumb_path, min(1.0, candidate.duration_seconds / 2))
+            candidate.short_source_clip_path = str(clip_path)
+            candidate.clip_thumbnail_path = str(thumb_path)
+            candidate.file_missing = False
         _transition(project, ProjectStatus.CANDIDATES_READY)
         _job_progress(job, 100, f"{len(final_drafts)} kandidat siap")
         job.status = "completed"
@@ -276,9 +323,12 @@ def process_project(project_id: str, job_id: str) -> None:
 
 
 @celery_app.task(name="render_video")
-def render_video(render_id: str, preview: bool) -> None:
+def render_video(render_id: str, preview: bool) -> dict | None:
     db = SessionLocal()
     render = db.get(Render, uuid.UUID(render_id))
+    destination: Path | None = None
+    width = 0
+    height = 0
     try:
         if not render:
             return
@@ -291,15 +341,44 @@ def render_video(render_id: str, preview: bool) -> None:
                 MediaAsset.asset_type == "source_video",
             )
         )
-        if not all((project, plan, candidate, source)):
+        if not all((project, plan, candidate)):
             raise AppError(ErrorCode.RENDER_FAILED, "Data render tidak lengkap.")
-        target_status = (
-            ProjectStatus.RENDERING_PREVIEW if preview else ProjectStatus.RENDERING_FINAL
-        )
-        _transition(project, target_status)
+        source_candidates = [
+            Path(candidate.short_source_clip_path)
+            if candidate.short_source_clip_path
+            else None,
+            Path(source.storage_path) if source else None,
+        ]
+        source_path = None
+        source_validation_errors: list[str] = []
+        for possible_source in source_candidates:
+            if not possible_source:
+                continue
+            if not possible_source.is_file() or possible_source.stat().st_size <= 0:
+                source_validation_errors.append(f"{possible_source}: file tidak ada atau kosong")
+                continue
+            try:
+                probe_media(possible_source)
+            except AppError as exc:
+                source_validation_errors.append(f"{possible_source}: {exc.message}")
+                continue
+            source_path = possible_source
+            break
+        if not source_path:
+            candidate.file_missing = True
+            raise AppError(
+                ErrorCode.RENDER_FAILED,
+                "Source video tidak valid untuk render. "
+                f"Checked: {'; '.join(source_validation_errors) or 'tidak ada source tersedia'}",
+            )
         render.status = "running"
         db.commit()
-        width, height = (540, 960) if preview else (1080, 1920)
+        settings = get_settings()
+        width, height = (
+            (settings.preview_width, settings.preview_height)
+            if preview
+            else (settings.final_width, settings.final_height)
+        )
         folder = "previews" if preview else "exports"
         destination = LocalStorageProvider().resolve(
             f"{project.id}/{folder}/{render.id}.mp4"
@@ -324,12 +403,12 @@ def render_video(render_id: str, preview: bool) -> None:
             segments,
             candidate.start_seconds,
             candidate.end_seconds,
+            max_words=int(
+                normalize_clipper_style(plan.clipper_style_config, plan.original_hook).get(
+                    "caption_max_words", 8
+                )
+            ),
         )
-        if not cues and project.content_type != "sports":
-            raise AppError(
-                ErrorCode.TRANSCRIPTION_FAILED,
-                "Tidak ada ucapan bertimestamp pada klip yang dipilih.",
-            )
         source_language = normalize_language(project.transcript_language)
         if cues and source_language != render.subtitle_language:
             translated = translate_texts(
@@ -340,39 +419,259 @@ def render_video(render_id: str, preview: bool) -> None:
                 (start, end, translated[index])
                 for index, (start, end, _) in enumerate(cues)
             ]
+            cues = filter_safe_cues(cues)
         if cues:
             write_ass_cues(subtitle_path, cues)
-        render_vertical(
-            Path(source.storage_path),
-            destination,
+        style_config = normalize_clipper_style(plan.clipper_style_config, plan.original_hook)
+        saved_effect_timeline = validate_effect_timeline(
+            style_config.get("effect_timeline"),
+            candidate.duration_seconds,
+        )
+        effect_timeline = saved_effect_timeline or build_effect_timeline(
+            style_config,
+            segments,
             candidate.start_seconds,
             candidate.duration_seconds,
-            width,
-            height,
-            render.preset,
-            None,
-            subtitle_path if cues else None,
+            candidate.transcript_text,
+            plan.original_hook,
+            plan.new_angle,
         )
+        style_config["effect_timeline"] = effect_timeline
+        plan.clipper_style_config = style_config
+        db.commit()
+        keywords = extract_keywords(candidate.transcript_text, plan.original_hook, plan.new_angle)
+        render_start = (
+            0.0
+            if candidate.short_source_clip_path and source_path == Path(candidate.short_source_clip_path)
+            else candidate.start_seconds
+        )
+        working_destination = destination.with_name(f"{destination.stem}.tmp{destination.suffix}")
+        fallback_warning = None
+
+        logger.info(
+            "render_video_start",
+            render_id=str(render.id),
+            transformation_id=str(plan.id),
+            candidate_id=str(candidate.id),
+            source_path=str(source_path),
+            working_destination=str(working_destination),
+            final_destination=str(destination),
+            preset=render.preset,
+            selected_template_label={
+                "blurred_background": "Latar buram",
+                "center_crop": "Potong tengah",
+                "fit_background": "Video penuh",
+                "picture_in_picture": "Picture in picture",
+            }.get(render.preset, render.preset),
+            selected_template_internal_value=render.preset,
+            resolved_layout_mode=layout_mode(render.preset),
+            target_resolution=f"{width}x{height}",
+            preview=preview,
+            selected_style_preset=style_config.get("clipper_style_preset"),
+            caption_enabled=bool(cues),
+            caption_cue_count=len(cues),
+            subtitle_path=str(subtitle_path) if cues else None,
+            style_config=style_config,
+            effect_timeline=effect_timeline,
+        )
+
+        def render_to_temp(
+            attempt_name: str,
+            config: dict | None = None,
+            clean: bool = False,
+            include_caption: bool = True,
+        ) -> None:
+            with suppress(FileNotFoundError):
+                working_destination.unlink()
+            active_subtitle_path = subtitle_path if include_caption and cues else None
+            logger.info(
+                "render_video_attempt",
+                render_id=str(render.id),
+                attempt=attempt_name,
+                fallback=clean,
+                include_caption=bool(active_subtitle_path),
+                caption_cue_count=len(cues) if active_subtitle_path else 0,
+                source_path=str(source_path),
+                working_destination=str(working_destination),
+            )
+            if clean:
+                render_clean_vertical(
+                    source_path,
+                    working_destination,
+                    render_start,
+                    candidate.duration_seconds,
+                    width,
+                    height,
+                    render.preset,
+                    active_subtitle_path,
+                )
+            else:
+                render_vertical(
+                    source_path,
+                    working_destination,
+                    render_start,
+                    candidate.duration_seconds,
+                    width,
+                    height,
+                    render.preset,
+                    None,
+                    active_subtitle_path,
+                    config,
+                    (config or {}).get("hook_text", ""),
+                    keywords if config else None,
+                    (config or {}).get("effect_timeline", []) if config else None,
+                )
+            validate_render_output(working_destination, candidate.duration_seconds)
+            logger.info(
+                "render_video_attempt_valid",
+                render_id=str(render.id),
+                attempt=attempt_name,
+                fallback=clean,
+                include_caption=bool(active_subtitle_path),
+                output_size=working_destination.stat().st_size,
+            )
+
+        without_keyword = {
+            **style_config,
+            "keyword_popup_enabled": False,
+            "effect_timeline": [
+                event for event in effect_timeline if event.get("type") != "keyword_popup"
+            ],
+        }
+        without_pattern = {
+            **without_keyword,
+            "pattern_interrupt_enabled": False,
+            "effect_timeline": [
+                event
+                for event in without_keyword["effect_timeline"]
+                if event.get("type") != "pattern_interrupt"
+            ],
+        }
+        without_punch = {
+            **without_pattern,
+            "punch_zoom_enabled": False,
+            "effect_timeline": [
+                event for event in without_pattern["effect_timeline"] if event.get("type") != "punch_zoom"
+            ],
+        }
+        attempts = [
+            (
+                "style_with_caption",
+                style_config,
+                False,
+                True,
+                None,
+            ),
+            (
+                "without_keyword_popup",
+                without_keyword,
+                False,
+                True,
+                "Keyword pop-up gagal diproses, render dilanjutkan tanpa keyword.",
+            ),
+            (
+                "without_pattern_interrupt",
+                without_pattern,
+                False,
+                True,
+                "Pattern interrupt gagal diproses, render dilanjutkan tanpa pattern interrupt.",
+            ),
+            (
+                "without_punch_zoom",
+                without_punch,
+                False,
+                True,
+                "Punch zoom gagal, preview dibuat dengan mode aman.",
+            ),
+            (
+                "clean_template_with_caption",
+                None,
+                True,
+                True,
+                "Sebagian efek gaya tidak diterapkan.",
+            ),
+            (
+                "clean_template_video_only",
+                None,
+                True,
+                False,
+                "Caption gagal dirender, preview dibuat tanpa caption.",
+            ),
+        ]
+        last_error: AppError | None = None
+        for attempt_name, attempt_config, clean, include_caption, warning in attempts:
+            try:
+                render_to_temp(attempt_name, attempt_config, clean, include_caption)
+                if attempt_name != "style_with_caption":
+                    fallback_warning = warning or "Sebagian efek gaya tidak diterapkan."
+                    render.error_message = fallback_warning[:1000]
+                    db.commit()
+                break
+            except AppError as attempt_error:
+                last_error = attempt_error
+                logger.warning(
+                    "render_video_attempt_failed",
+                    render_id=str(render.id),
+                    attempt=attempt_name,
+                    include_caption=include_caption,
+                    error=attempt_error.message,
+                )
+        else:
+            raise last_error or AppError(ErrorCode.RENDER_FAILED, "Render gagal.")
+
+        working_destination.replace(destination)
+        output_metadata = validate_render_output(destination, candidate.duration_seconds)
         render.status = "completed"
         render.width = width
         render.height = height
-        render.duration_seconds = candidate.duration_seconds
+        render.duration_seconds = output_metadata.duration
         render.file_size_bytes = destination.stat().st_size
         render.preview_path = str(destination) if preview else render.preview_path
         render.output_path = str(destination) if not preview else render.output_path
         render.completed_at = datetime.now(UTC)
-        project.status = ProjectStatus.PREVIEW_READY if preview else ProjectStatus.COMPLETED
+        render.error_message = fallback_warning[:1000] if fallback_warning else None
+        if preview and project.status not in {ProjectStatus.COMPLETED, ProjectStatus.FAILED}:
+            project.status = ProjectStatus.PREVIEW_READY
+        elif not preview:
+            project.status = ProjectStatus.COMPLETED
         db.commit()
+        return {"status": "completed", "render_id": str(render.id)}
     except Exception as exc:
         db.rollback()
         if render:
+            if destination:
+                try:
+                    output_metadata = validate_render_output(destination, None)
+                    render.status = "completed"
+                    render.width = width or output_metadata.width
+                    render.height = height or output_metadata.height
+                    render.duration_seconds = output_metadata.duration
+                    render.file_size_bytes = destination.stat().st_size
+                    render.preview_path = str(destination) if preview else render.preview_path
+                    render.output_path = str(destination) if not preview else render.output_path
+                    render.completed_at = datetime.now(UTC)
+                    render.error_message = None
+                    db.commit()
+                    logger.warning(
+                        "render_video_recovered_valid_destination",
+                        render_id=render_id,
+                        destination=str(destination),
+                    )
+                    return {"status": "completed", "render_id": render_id}
+                except Exception:
+                    db.rollback()
             render.status = "failed"
-            render.error_message = str(exc)[:1000]
-            project = db.get(Project, render.project_id)
-            if project:
-                project.status = ProjectStatus.FAILED
+            message = exc.message if isinstance(exc, AppError) else str(exc)
+            render.error_message = message[:1000]
+            render.completed_at = datetime.now(UTC)
+            logger.error(
+                "render_video_failed",
+                render_id=render_id,
+                error=message,
+                traceback=traceback.format_exc()[-4000:],
+            )
             db.commit()
-        raise
+        return {"status": "failed", "error": str(exc)}
     finally:
         db.close()
 

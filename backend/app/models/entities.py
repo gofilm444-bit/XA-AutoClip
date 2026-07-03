@@ -124,6 +124,9 @@ class ClipCandidate(TimestampMixin, Base):
     overlap_group: Mapped[str | None] = mapped_column(String(50))
     rank: Mapped[int] = mapped_column(Integer)
     selected: Mapped[bool] = mapped_column(Boolean, default=False)
+    short_source_clip_path: Mapped[str | None] = mapped_column(String(1000))
+    clip_thumbnail_path: Mapped[str | None] = mapped_column(String(1000))
+    file_missing: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class TransformationPlan(TimestampMixin, Base):
@@ -139,6 +142,7 @@ class TransformationPlan(TimestampMixin, Base):
     conclusion: Mapped[str] = mapped_column(Text)
     engagement_question: Mapped[str] = mapped_column(Text)
     social_caption: Mapped[str] = mapped_column(Text, default="")
+    clipper_style_config: Mapped[dict] = mapped_column(JSON, default=dict)
     needs_fact_verification: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(30), default="draft")
     storyboard: Mapped[list] = mapped_column(JSON, default=list)
