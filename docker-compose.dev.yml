@@ -1,6 +1,8 @@
 services:
   api:
     command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    environment:
+      CORS_ORIGINS: http://localhost:3000,http://localhost:3001
     volumes:
       - ./backend:/app/backend
       - ./storage:/app/storage
@@ -13,7 +15,7 @@ services:
       target: development
     command: npm run dev -- --host 0.0.0.0
     ports: !override
-      - "3000:5173"
+      - "3001:5173"
     volumes:
       - ./frontend:/app
       - /app/node_modules

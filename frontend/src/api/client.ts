@@ -67,3 +67,6 @@ export const candidateVideoUrl = (candidateId: string) =>
 
 export const candidateThumbnailUrl = (candidateId: string) =>
   `${API_URL}/api/candidates/${candidateId}/thumbnail`;
+
+export const uploadedAudioUrl = (transformationId: string, assetId: string) =>
+  `${API_URL}/api/transformations/${transformationId}/audio-assets/${assetId}`;

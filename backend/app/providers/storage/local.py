@@ -15,7 +15,9 @@ AUDIO_MIME_TYPES = {
     "audio/wav",
     "audio/x-wav",
     "audio/mpeg",
+    "audio/mp3",
     "audio/mp4",
+    "audio/x-m4a",
     "audio/aac",
     "audio/ogg",
     "audio/webm",
@@ -44,8 +46,9 @@ class LocalStorageProvider:
         original = Path(upload.filename or "video").name
         extension = Path(original).suffix.lower()
         mime_type = (upload.content_type or "").lower()
-        extensions = AUDIO_EXTENSIONS if kind == "voiceovers" else ALLOWED_EXTENSIONS
-        mime_types = AUDIO_MIME_TYPES if kind == "voiceovers" else ALLOWED_MIME_TYPES
+        is_audio = kind in {"voiceovers", "audio-library"}
+        extensions = AUDIO_EXTENSIONS if is_audio else ALLOWED_EXTENSIONS
+        mime_types = AUDIO_MIME_TYPES if is_audio else ALLOWED_MIME_TYPES
         if extension not in extensions or mime_type not in mime_types:
             raise AppError(ErrorCode.UNSUPPORTED_FORMAT, "Format media tidak didukung.")
         stored_name = stored_upload_name(extension)

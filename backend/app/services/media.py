@@ -11,6 +11,7 @@ import structlog
 from app.core.config import get_settings
 from app.core.errors import AppError, ErrorCode
 from app.services.clipper_style import (
+    normalize_audio_settings,
     sanitize_keyword_text,
     validate_effect_timeline,
 )
@@ -171,6 +172,65 @@ def extract_clip(source: Path, destination: Path, start: float, duration: float)
         "+faststart",
         str(destination),
     ]
+    _run(command, ErrorCode.RENDER_FAILED)
+
+
+def assemble_media_sequence(
+    source: Path,
+    destination: Path,
+    segments: list[tuple[float, float]],
+) -> None:
+    """Build one continuous A/V source from ordered source-time ranges."""
+    if not segments:
+        raise AppError(ErrorCode.RENDER_FAILED, "Urutan media untuk render kosong.")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    metadata = probe_media(source)
+    filters: list[str] = []
+    concat_inputs: list[str] = []
+    for index, (start, end) in enumerate(segments):
+        filters.append(
+            f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS[v{index}]"
+        )
+        concat_inputs.append(f"[v{index}]")
+        if metadata.has_audio:
+            filters.append(
+                f"[0:a]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS[a{index}]"
+            )
+            concat_inputs.append(f"[a{index}]")
+    filters.append(
+        "".join(concat_inputs)
+        + f"concat=n={len(segments)}:v=1:a={1 if metadata.has_audio else 0}[vout]"
+        + ("[aout]" if metadata.has_audio else "")
+    )
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(source),
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        "[vout]",
+    ]
+    if metadata.has_audio:
+        command.extend(["-map", "[aout]"])
+    command.extend(
+        [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-movflags",
+            "+faststart",
+            str(destination),
+        ]
+    )
     _run(command, ErrorCode.RENDER_FAILED)
 
 
@@ -439,6 +499,19 @@ def validate_render_output(
     return metadata
 
 
+def _audio_filter(style_config: dict[str, Any] | None, duration: float) -> str:
+    settings = normalize_audio_settings((style_config or {}).get("audio_settings"))
+    volume = 0.0 if settings["muted"] else float(settings["volume"])
+    filters = [f"volume={volume:.2f}"]
+    fade_in = min(float(settings["fade_in"]), max(0.0, duration))
+    fade_out = min(float(settings["fade_out"]), max(0.0, duration))
+    if fade_in > 0:
+        filters.append(f"afade=t=in:st=0:d={fade_in:.2f}")
+    if fade_out > 0:
+        filters.append(f"afade=t=out:st={max(0.0, duration - fade_out):.2f}:d={fade_out:.2f}")
+    return ",".join(filters)
+
+
 def render_vertical(
     source: Path,
     destination: Path,
@@ -497,10 +570,16 @@ def render_vertical(
             f"[fg]scale={width}:{height}:force_original_aspect_ratio=decrease[front];"
             "[blur][front]overlay=(W-w)/2:(H-h)/2,setsar=1[base]"
         )
+    base_label = "base"
+    if (style_config or {}).get("video_track_deleted"):
+        video_filter = (
+            f"{video_filter};[base]drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill[blank]"
+        )
+        base_label = "blank"
     punch_events = _enabled_punch_events(style_config, effect_timeline)
     video_filter = _append_punch_zoom_filter(
         video_filter,
-        "base",
+        base_label,
         "effected",
         width,
         height,
@@ -536,10 +615,18 @@ def render_vertical(
         ]
     )
     command.extend(["-map", "[vout]"])
+    audio_filter = _audio_filter(style_config, duration)
     if voiceover:
-        command.extend(["-map", "1:a:0", "-af", "loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=in:d=0.15"])
+        command.extend(
+            [
+                "-map",
+                "1:a:0",
+                "-af",
+                f"loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=in:d=0.15,{audio_filter}",
+            ]
+        )
     else:
-        command.extend(["-map", "0:a?"])
+        command.extend(["-map", "0:a?", "-af", audio_filter])
     command.extend(
         [
             "-r",
@@ -571,29 +658,36 @@ def render_clean_vertical(
     height: int,
     preset: str,
     subtitle_path: Path | None = None,
+    style_config: dict[str, Any] | None = None,
+    audio_source: Path | None = None,
 ) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     subtitle_filter = ""
     if subtitle_path:
         escaped_subtitle = str(subtitle_path).replace("\\", "/").replace(":", "\\:")
         subtitle_filter = f",subtitles='{escaped_subtitle}'"
+    deleted_video_filter = (
+        ",drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill"
+        if (style_config or {}).get("video_track_deleted")
+        else ""
+    )
     if preset == "fit_background":
         video_filter = (
             f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
-            f"{subtitle_filter}"
+            f"{deleted_video_filter}{subtitle_filter}"
         )
     elif preset == "center_crop":
         video_filter = (
             f"scale={width}:{height}:force_original_aspect_ratio=increase,"
             f"crop={width}:{height}:(iw-{width})/2:(ih-{height})/2,setsar=1"
-            f"{subtitle_filter}"
+            f"{deleted_video_filter}{subtitle_filter}"
         )
     else:
         video_filter = (
             f"scale={width}:{height}:force_original_aspect_ratio=increase,"
             f"crop={width}:{height},setsar=1"
-            f"{subtitle_filter}"
+            f"{deleted_video_filter}{subtitle_filter}"
         )
     logger.info(
         "render_clean_layout_filter",
@@ -610,6 +704,11 @@ def render_clean_vertical(
         str(start),
         "-i",
         str(source),
+    ]
+    if audio_source:
+        command.extend(["-i", str(audio_source)])
+    command.extend(
+        [
         "-t",
         str(duration),
         "-vf",
@@ -617,7 +716,9 @@ def render_clean_vertical(
         "-map",
         "0:v:0",
         "-map",
-        "0:a?",
+        "1:a:0" if audio_source else "0:a?",
+        "-af",
+        _audio_filter(style_config, duration),
         "-r",
         "30",
         "-c:v",
@@ -633,5 +734,6 @@ def render_clean_vertical(
         "-movflags",
         "+faststart",
         str(destination),
-    ]
+        ]
+    )
     _run(command, ErrorCode.RENDER_FAILED)

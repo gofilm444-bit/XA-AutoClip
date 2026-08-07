@@ -105,6 +105,78 @@ export type ClipperStyleConfig = {
     text?: string;
     reason?: string;
   }>;
+  audio_settings?: {
+    volume: number;
+    muted: boolean;
+    fade_in: number;
+    fade_out: number;
+  };
+  media_trim?: {
+    start: number;
+    end: number | null;
+  };
+  media_split_points?: number[];
+  media_sequence?: Array<{
+    id: string;
+    source_start: number;
+    source_end: number;
+  }>;
+  video_sequence?: Array<{
+    id: string;
+    source_start: number;
+    source_end: number;
+  }>;
+  audio_sequence?: Array<{
+    id: string;
+    source_start: number;
+    source_end: number;
+  }>;
+  audio_extracted?: boolean;
+  video_track_deleted?: boolean;
+  audio_track_deleted?: boolean;
+  editor_state_version?: number;
+  video_sequence_initialized?: boolean;
+  audio_sequence_initialized?: boolean;
+  caption_timeline_initialized?: boolean;
+  effect_timeline_initialized?: boolean;
+  layer_order?: Array<"caption" | "hook" | "keyword" | "punch" | "pattern" | "video" | "audio">;
+  track_order?: Array<"caption" | "hook" | "keyword" | "punch" | "pattern" | "video" | "audio">;
+  editor_preferences?: {
+    timeline_height?: number;
+    timeline_zoom?: number;
+    theme?: "dark" | "light";
+  };
+  additional_audio_assets?: Array<{
+    id: string;
+    name: string;
+    mime_type: string;
+    size_bytes: number;
+    duration_seconds: number;
+  }>;
+  additional_audio_tracks?: Array<{
+    id: string;
+    asset_id: string;
+    label: string;
+    kind: "backsound" | "sfx";
+    start: number;
+    end: number;
+    volume: number;
+  }>;
+  audio_tracks?: Array<{
+    id: string;
+    asset_id: string;
+    label: string;
+    kind: "backsound" | "sfx";
+    start: number;
+    end: number;
+    volume: number;
+  }>;
+  caption_timeline?: Array<{
+    id: string;
+    start: number;
+    end: number;
+    text: string;
+  }>;
   render_preset?: "blurred_background" | "center_crop" | "fit_background" | "picture_in_picture";
 };
 

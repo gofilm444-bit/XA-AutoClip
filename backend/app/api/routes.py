@@ -55,6 +55,7 @@ from app.services.clipper_style import (
     is_generic_hook,
     normalize_clipper_style,
 )
+from app.services.media import probe_media
 from app.services.originality import assess
 from app.services.source_context import (
     content_title_from_filename,
@@ -852,7 +853,10 @@ def create_transformation(
 def get_transformation(transformation_id: uuid.UUID, db: Session = Depends(get_db)):
     plan = require(TransformationPlan, db, transformation_id)
     candidate = require(ClipCandidate, db, plan.candidate_id)
-    current_config = dict(plan.clipper_style_config or default_clipper_style("clean_podcast"))
+    current_config = normalize_clipper_style(
+        plan.clipper_style_config or default_clipper_style("clean_podcast"),
+        plan.original_hook,
+    )
     if is_generic_hook(current_config.get("hook_text")):
         current_config["hook_text"] = generate_hook_text_for_clip(
             candidate.transcript_text,
@@ -864,6 +868,57 @@ def get_transformation(transformation_id: uuid.UUID, db: Session = Depends(get_d
         plan.clipper_style_config = current_config
         db.commit()
     return plan
+
+
+@router.post("/transformations/{transformation_id}/audio-assets", status_code=201)
+async def upload_transformation_audio_asset(
+    transformation_id: uuid.UUID,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    plan = require(TransformationPlan, db, transformation_id)
+    extension = Path(file.filename or "").suffix.lower()
+    if extension not in {".mp3", ".wav", ".m4a"}:
+        raise HTTPException(status_code=415, detail="Gunakan file audio MP3, WAV, atau M4A.")
+    path, size, _checksum, stored_name = await LocalStorageProvider().save_upload(
+        plan.project_id,
+        file,
+        kind="audio-library",
+    )
+    if size > 50 * 1024 * 1024:
+        path.unlink(missing_ok=True)
+        raise HTTPException(status_code=413, detail="Ukuran audio maksimal 50 MB.")
+    try:
+        duration = max(0.1, float(probe_media(path).duration_seconds))
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail="File audio tidak dapat dibaca.") from None
+    return {
+        "id": Path(stored_name).stem,
+        "name": Path(file.filename or "audio").name,
+        "mime_type": file.content_type or "application/octet-stream",
+        "size_bytes": size,
+        "duration_seconds": round(duration, 3),
+    }
+
+
+@router.get("/transformations/{transformation_id}/audio-assets/{asset_id}")
+def transformation_audio_asset(
+    transformation_id: uuid.UUID,
+    asset_id: uuid.UUID,
+    db: Session = Depends(get_db),
+):
+    plan = require(TransformationPlan, db, transformation_id)
+    folder = LocalStorageProvider().resolve(f"{plan.project_id}/audio-library")
+    matches = list(folder.glob(f"{asset_id}.*")) if folder.is_dir() else []
+    if not matches or matches[0].suffix.lower() not in {".mp3", ".wav", ".m4a"}:
+        raise HTTPException(status_code=404, detail="Aset audio tidak tersedia.")
+    media_type = {
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".m4a": "audio/mp4",
+    }[matches[0].suffix.lower()]
+    return FileResponse(matches[0], media_type=media_type)
 
 
 @router.get(

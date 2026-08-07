@@ -33,9 +33,11 @@ from app.services.clipper_style import (
     build_effect_timeline,
     extract_keywords,
     normalize_clipper_style,
+    resolve_media_sequence,
     validate_effect_timeline,
 )
 from app.services.media import (
+    assemble_media_sequence,
     extract_audio,
     extract_clip,
     extract_thumbnail,
@@ -327,6 +329,8 @@ def render_video(render_id: str, preview: bool) -> dict | None:
     db = SessionLocal()
     render = db.get(Render, uuid.UUID(render_id))
     destination: Path | None = None
+    sequence_source_path: Path | None = None
+    audio_sequence_source_path: Path | None = None
     width = 0
     height = 0
     try:
@@ -386,29 +390,86 @@ def render_video(render_id: str, preview: bool) -> dict | None:
         subtitle_path = LocalStorageProvider().resolve(
             f"{project.id}/subtitles/{render.id}.ass"
         )
+        style_config = normalize_clipper_style(plan.clipper_style_config, plan.original_hook)
+        video_track_deleted = bool(style_config.get("video_track_deleted"))
+        audio_track_deleted = bool(style_config.get("audio_track_deleted"))
+        if audio_track_deleted or (
+            video_track_deleted and not style_config.get("audio_extracted")
+        ):
+            style_config["audio_settings"] = {
+                **style_config.get("audio_settings", {}),
+                "muted": True,
+            }
+        base_sequence = style_config.get("media_sequence")
+        video_sequence = resolve_media_sequence(
+            style_config.get("video_sequence") or base_sequence,
+            candidate.duration_seconds,
+            style_config.get("media_trim"),
+        )
+        audio_sequence = (
+            resolve_media_sequence(
+                style_config.get("audio_sequence") or video_sequence,
+                candidate.duration_seconds,
+                style_config.get("media_trim"),
+            )
+            if style_config.get("audio_extracted")
+            else video_sequence
+        )
+        media_sequence = video_sequence
+        style_config["video_sequence"] = video_sequence
+        style_config["audio_sequence"] = audio_sequence
+        render_duration = sum(
+            float(item["source_end"]) - float(item["source_start"])
+            for item in media_sequence
+        )
+        source_ranges = [
+            (
+                candidate.start_seconds + float(item["source_start"]),
+                candidate.start_seconds + float(item["source_end"]),
+            )
+            for item in media_sequence
+        ]
+        effective_start = min(start for start, _ in source_ranges)
+        effective_end = max(end for _, end in source_ranges)
         segments = list(
             db.scalars(
                 select(TranscriptSegment)
                 .where(
                     TranscriptSegment.project_id == project.id,
-                    TranscriptSegment.end_seconds > candidate.start_seconds,
-                    TranscriptSegment.start_seconds < candidate.end_seconds,
+                    TranscriptSegment.end_seconds > effective_start,
+                    TranscriptSegment.start_seconds < effective_end,
                 )
                 .order_by(TranscriptSegment.segment_index)
             )
         )
         if project.content_type == "sports" and project.transcript_provider == "mock":
             segments = []
-        cues = transcript_cues(
-            segments,
-            candidate.start_seconds,
-            candidate.end_seconds,
-            max_words=int(
-                normalize_clipper_style(plan.clipper_style_config, plan.original_hook).get(
-                    "caption_max_words", 8
+        cues: list[tuple[float, float, str]] = []
+        cue_offset = 0.0
+        for range_start, range_end in source_ranges:
+            range_cues = transcript_cues(
+                segments,
+                range_start,
+                range_end,
+                max_words=int(style_config.get("caption_max_words", 8)),
+            )
+            cues.extend(
+                (start + cue_offset, end + cue_offset, text)
+                for start, end, text in range_cues
+            )
+            cue_offset += range_end - range_start
+        saved_caption_timeline = style_config.get("caption_timeline") or []
+        if saved_caption_timeline:
+            cues = [
+                (
+                    max(0.0, float(item["start"])),
+                    min(render_duration, float(item["end"])),
+                    str(item["text"]),
                 )
-            ),
-        )
+                for item in saved_caption_timeline
+                if float(item["start"]) < render_duration
+                and min(render_duration, float(item["end"])) > float(item["start"])
+            ]
         source_language = normalize_language(project.transcript_language)
         if cues and source_language != render.subtitle_language:
             translated = translate_texts(
@@ -422,16 +483,15 @@ def render_video(render_id: str, preview: bool) -> dict | None:
             cues = filter_safe_cues(cues)
         if cues:
             write_ass_cues(subtitle_path, cues)
-        style_config = normalize_clipper_style(plan.clipper_style_config, plan.original_hook)
         saved_effect_timeline = validate_effect_timeline(
             style_config.get("effect_timeline"),
-            candidate.duration_seconds,
+            render_duration,
         )
         effect_timeline = saved_effect_timeline or build_effect_timeline(
             style_config,
             segments,
-            candidate.start_seconds,
-            candidate.duration_seconds,
+            effective_start,
+            render_duration,
             candidate.transcript_text,
             plan.original_hook,
             plan.new_angle,
@@ -440,11 +500,56 @@ def render_video(render_id: str, preview: bool) -> dict | None:
         plan.clipper_style_config = style_config
         db.commit()
         keywords = extract_keywords(candidate.transcript_text, plan.original_hook, plan.new_angle)
-        render_start = (
-            0.0
-            if candidate.short_source_clip_path and source_path == Path(candidate.short_source_clip_path)
-            else candidate.start_seconds
+        uses_short_source = bool(
+            candidate.short_source_clip_path
+            and source_path == Path(candidate.short_source_clip_path)
         )
+        original_source_path = source_path
+        if len(media_sequence) > 1:
+            sequence_source_path = destination.with_name(
+                f"{destination.stem}.sequence{destination.suffix}"
+            )
+            sequence_ranges = [
+                (
+                    float(item["source_start"])
+                    if uses_short_source
+                    else candidate.start_seconds + float(item["source_start"]),
+                    float(item["source_end"])
+                    if uses_short_source
+                    else candidate.start_seconds + float(item["source_end"]),
+                )
+                for item in media_sequence
+            ]
+            assemble_media_sequence(source_path, sequence_source_path, sequence_ranges)
+            source_path = sequence_source_path
+            render_start = 0.0
+        else:
+            only_segment = media_sequence[0]
+            render_start = (
+                float(only_segment["source_start"])
+                if uses_short_source
+                else candidate.start_seconds + float(only_segment["source_start"])
+            )
+        if audio_sequence != video_sequence:
+            audio_sequence_source_path = destination.with_name(
+                f"{destination.stem}.audio-sequence{destination.suffix}"
+            )
+            audio_ranges = [
+                (
+                    float(item["source_start"])
+                    if uses_short_source
+                    else candidate.start_seconds + float(item["source_start"]),
+                    float(item["source_end"])
+                    if uses_short_source
+                    else candidate.start_seconds + float(item["source_end"]),
+                )
+                for item in audio_sequence
+            ]
+            assemble_media_sequence(
+                original_source_path,
+                audio_sequence_source_path,
+                audio_ranges,
+            )
         working_destination = destination.with_name(f"{destination.stem}.tmp{destination.suffix}")
         fallback_warning = None
 
@@ -499,29 +604,31 @@ def render_video(render_id: str, preview: bool) -> dict | None:
                     source_path,
                     working_destination,
                     render_start,
-                    candidate.duration_seconds,
+                    render_duration,
                     width,
                     height,
                     render.preset,
                     active_subtitle_path,
+                    style_config,
+                    audio_sequence_source_path,
                 )
             else:
                 render_vertical(
                     source_path,
                     working_destination,
                     render_start,
-                    candidate.duration_seconds,
+                    render_duration,
                     width,
                     height,
                     render.preset,
-                    None,
+                    audio_sequence_source_path,
                     active_subtitle_path,
                     config,
                     (config or {}).get("hook_text", ""),
                     keywords if config else None,
                     (config or {}).get("effect_timeline", []) if config else None,
                 )
-            validate_render_output(working_destination, candidate.duration_seconds)
+            validate_render_output(working_destination, render_duration)
             logger.info(
                 "render_video_attempt_valid",
                 render_id=str(render.id),
@@ -620,7 +727,7 @@ def render_video(render_id: str, preview: bool) -> dict | None:
             raise last_error or AppError(ErrorCode.RENDER_FAILED, "Render gagal.")
 
         working_destination.replace(destination)
-        output_metadata = validate_render_output(destination, candidate.duration_seconds)
+        output_metadata = validate_render_output(destination, render_duration)
         render.status = "completed"
         render.width = width
         render.height = height
@@ -673,6 +780,12 @@ def render_video(render_id: str, preview: bool) -> dict | None:
             db.commit()
         return {"status": "failed", "error": str(exc)}
     finally:
+        if sequence_source_path:
+            with suppress(FileNotFoundError):
+                sequence_source_path.unlink()
+        if audio_sequence_source_path:
+            with suppress(FileNotFoundError):
+                audio_sequence_source_path.unlink()
         db.close()
 
 

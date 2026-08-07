@@ -16,6 +16,7 @@ export type LayoutOutletContext = {
 export function Layout() {
   const location = useLocation();
   const focusMode = location.pathname !== "/";
+  const editorMode = location.pathname.startsWith("/transformations/");
   const [editorToolbar, setEditorToolbar] = useState<EditorToolbarConfig | null>(null);
   const outletContext = useMemo<LayoutOutletContext>(
     () => ({ setEditorToolbar }),
@@ -24,12 +25,18 @@ export function Layout() {
 
   if (focusMode) {
     return (
-      <div className="min-h-screen bg-[#f7f8fc] text-slate-900">
-        <header className="sticky top-0 z-50 border-b border-slate-200 bg-white/95 shadow-sm backdrop-blur">
+      <div className={editorMode ? "editor-shell min-h-screen bg-[#101214] text-zinc-100" : "min-h-screen bg-[#f7f8fc] text-slate-900"}>
+        <header className={`editor-topbar sticky top-0 z-50 border-b backdrop-blur ${
+          editorMode
+            ? "border-zinc-800 bg-[#17191c]/95 shadow-lg shadow-black/20"
+            : "border-slate-200 bg-white/95 shadow-sm"
+        }`}>
           <div className="flex h-16 items-center gap-3 px-4 sm:px-7">
             <Link
               to="/"
-              className="flex shrink-0 items-center gap-2 font-bold text-slate-700 hover:text-violet-700"
+              className={`flex shrink-0 items-center gap-2 font-bold ${
+                editorMode ? "text-zinc-300 hover:text-cyan-300" : "text-slate-700 hover:text-violet-700"
+              }`}
             >
               <span className="text-2xl leading-none">{"<"}</span>
               <span className="hidden sm:inline">Kembali ke beranda</span>
@@ -37,13 +44,13 @@ export function Layout() {
             {editorToolbar && (
               <div className="min-w-0 flex-1 text-center sm:text-left">
                 <div className="flex min-w-0 items-center justify-center gap-2 sm:justify-start">
-                  <p className="min-w-0 truncate text-sm font-black text-slate-950 sm:text-base">
+                  <p className={`min-w-0 truncate text-sm font-black sm:text-base ${editorMode ? "text-zinc-100" : "text-slate-950"}`}>
                     {editorToolbar.title}
                   </p>
                   {editorToolbar.badge}
                 </div>
                 {editorToolbar.meta && (
-                  <p className="mt-0.5 truncate text-[11px] font-semibold text-slate-500 sm:text-xs">
+                  <p className={`mt-0.5 truncate text-[11px] font-semibold sm:text-xs ${editorMode ? "text-zinc-500" : "text-slate-500"}`}>
                     {editorToolbar.meta}
                   </p>
                 )}
@@ -62,12 +69,12 @@ export function Layout() {
                 </details>
               )}
               <Link to="/" className="hidden text-lg font-black tracking-tight sm:block">
-                <span className="text-violet-600">XA</span> AutoClip
+                <span className={editorMode ? "text-cyan-400" : "text-violet-600"}>XA</span> AutoClip
               </Link>
             </div>
           </div>
         </header>
-        <main className="mx-auto max-w-[1540px] px-4 py-7 sm:px-7 lg:px-10">
+        <main className={editorMode ? "editor-main w-full p-2" : "mx-auto max-w-[1540px] px-4 py-7 sm:px-7 lg:px-10"}>
           <Outlet context={outletContext} />
         </main>
       </div>

@@ -13,6 +13,13 @@ MAX_HOOK_WORDS = 10
 MAX_KEYWORDS = 3
 VALID_EFFECT_TYPES = {"hook_text", "punch_zoom", "keyword_popup", "pattern_interrupt"}
 
+DEFAULT_AUDIO_SETTINGS: dict[str, Any] = {
+    "volume": 1.0,
+    "muted": False,
+    "fade_in": 0.0,
+    "fade_out": 0.0,
+}
+
 IMPORTANT_EFFECT_KEYWORDS = (
     "penting",
     "ternyata",
@@ -106,6 +113,24 @@ DEFAULT_STYLE: dict[str, Any] = {
     "keyword_popup_enabled": False,
     "style_intensity": "low",
     "effect_timeline": [],
+    "audio_settings": DEFAULT_AUDIO_SETTINGS,
+    "media_trim": {"start": 0.0, "end": None},
+    "media_split_points": [],
+    "media_sequence": [],
+    "video_sequence": [],
+    "audio_sequence": [],
+    "audio_extracted": False,
+    "video_track_deleted": False,
+    "audio_track_deleted": False,
+    "editor_state_version": 0,
+    "video_sequence_initialized": False,
+    "audio_sequence_initialized": False,
+    "caption_timeline_initialized": False,
+    "effect_timeline_initialized": False,
+    "layer_order": ["caption", "hook", "keyword", "punch", "pattern", "video", "audio"],
+    "additional_audio_assets": [],
+    "additional_audio_tracks": [],
+    "caption_timeline": [],
 }
 
 PRESET_DEFAULTS: dict[ClipperStylePreset, dict[str, Any]] = {
@@ -209,6 +234,166 @@ def normalize_clipper_style(config: dict | None, hook_fallback: str = "") -> dic
         normalized["style_intensity"] = "low"
     timeline = normalized.get("effect_timeline")
     normalized["effect_timeline"] = timeline if isinstance(timeline, list) else []
+    normalized["audio_settings"] = normalize_audio_settings(normalized.get("audio_settings"))
+    normalized["media_trim"] = normalize_media_trim(normalized.get("media_trim"))
+    split_points = normalized.get("media_split_points")
+    normalized["media_split_points"] = sorted(
+        {
+            round(float(point), 2)
+            for point in (split_points if isinstance(split_points, list) else [])
+            if isinstance(point, int | float) and float(point) > 0
+        }
+    )
+    normalized["media_sequence"] = normalize_media_sequence(normalized.get("media_sequence"))
+    normalized["video_sequence"] = normalize_media_sequence(normalized.get("video_sequence"))
+    normalized["audio_sequence"] = normalize_media_sequence(normalized.get("audio_sequence"))
+    normalized["audio_extracted"] = bool(normalized.get("audio_extracted", False))
+    normalized["video_track_deleted"] = bool(normalized.get("video_track_deleted", False))
+    normalized["audio_track_deleted"] = bool(normalized.get("audio_track_deleted", False))
+    try:
+        editor_state_version = int(normalized.get("editor_state_version") or 0)
+    except (TypeError, ValueError):
+        editor_state_version = 0
+    normalized["editor_state_version"] = 1 if editor_state_version >= 1 else 0
+    for initialized_key in (
+        "video_sequence_initialized",
+        "audio_sequence_initialized",
+        "caption_timeline_initialized",
+        "effect_timeline_initialized",
+    ):
+        normalized[initialized_key] = bool(normalized.get(initialized_key, False))
+    valid_layers = ["caption", "hook", "keyword", "punch", "pattern", "video", "audio"]
+    configured_layers = normalized.get("layer_order")
+    layer_order: list[str] = []
+    if isinstance(configured_layers, list):
+        for layer in configured_layers:
+            if layer in valid_layers and layer not in layer_order:
+                layer_order.append(layer)
+    normalized["layer_order"] = layer_order + [
+        layer for layer in valid_layers if layer not in layer_order
+    ]
+    assets = normalized.get("additional_audio_assets")
+    tracks = normalized.get("additional_audio_tracks")
+    normalized["additional_audio_assets"] = assets if isinstance(assets, list) else []
+    normalized["additional_audio_tracks"] = tracks if isinstance(tracks, list) else []
+    normalized["caption_timeline"] = normalize_caption_timeline(
+        normalized.get("caption_timeline")
+    )
+    return normalized
+
+
+def normalize_audio_settings(value: Any) -> dict[str, Any]:
+    settings = value if isinstance(value, dict) else {}
+    try:
+        volume = float(settings.get("volume", 1.0))
+    except (TypeError, ValueError):
+        volume = 1.0
+    try:
+        fade_in = float(settings.get("fade_in", 0.0))
+    except (TypeError, ValueError):
+        fade_in = 0.0
+    try:
+        fade_out = float(settings.get("fade_out", 0.0))
+    except (TypeError, ValueError):
+        fade_out = 0.0
+    return {
+        "volume": round(max(0.0, min(volume, 2.0)), 2),
+        "muted": bool(settings.get("muted", False)),
+        "fade_in": round(max(0.0, min(fade_in, 5.0)), 2),
+        "fade_out": round(max(0.0, min(fade_out, 5.0)), 2),
+    }
+
+
+def normalize_media_trim(value: Any) -> dict[str, float | None]:
+    trim = value if isinstance(value, dict) else {}
+    try:
+        start = max(0.0, float(trim.get("start", 0.0)))
+    except (TypeError, ValueError):
+        start = 0.0
+    raw_end = trim.get("end")
+    try:
+        end = max(0.0, float(raw_end)) if raw_end is not None else None
+    except (TypeError, ValueError):
+        end = None
+    return {"start": round(start, 2), "end": round(end, 2) if end is not None else None}
+
+
+def resolve_media_trim(value: Any, duration_seconds: float) -> tuple[float, float]:
+    duration = max(0.1, float(duration_seconds or 0.0))
+    trim = normalize_media_trim(value)
+    start = min(float(trim["start"] or 0.0), max(0.0, duration - 0.1))
+    end = duration if trim["end"] is None else min(float(trim["end"]), duration)
+    if end <= start:
+        end = min(duration, start + 0.1)
+    return round(start, 2), round(end, 2)
+
+
+def normalize_media_sequence(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(value[:200]):
+        if not isinstance(item, dict):
+            continue
+        try:
+            source_start = max(0.0, float(item.get("source_start", 0.0)))
+            source_end = max(0.0, float(item.get("source_end", 0.0)))
+        except (TypeError, ValueError):
+            continue
+        if source_end - source_start < 0.1:
+            continue
+        normalized.append(
+            {
+                "id": str(item.get("id") or f"media-{index}")[:80],
+                "source_start": round(source_start, 3),
+                "source_end": round(source_end, 3),
+            }
+        )
+    return normalized
+
+
+def resolve_media_sequence(
+    value: Any,
+    duration_seconds: float,
+    fallback_trim: Any = None,
+) -> list[dict[str, Any]]:
+    duration = max(0.1, float(duration_seconds or 0.0))
+    resolved: list[dict[str, Any]] = []
+    for item in normalize_media_sequence(value):
+        start = min(float(item["source_start"]), max(0.0, duration - 0.1))
+        end = min(float(item["source_end"]), duration)
+        if end - start < 0.1:
+            continue
+        resolved.append({**item, "source_start": round(start, 3), "source_end": round(end, 3)})
+    if resolved:
+        return resolved
+    start, end = resolve_media_trim(fallback_trim, duration)
+    return [{"id": "media-0", "source_start": start, "source_end": end}]
+
+
+def normalize_caption_timeline(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(value[:500]):
+        if not isinstance(item, dict):
+            continue
+        try:
+            start = max(0.0, float(item.get("start", 0.0)))
+            end = max(0.0, float(item.get("end", 0.0)))
+        except (TypeError, ValueError):
+            continue
+        text = normalize_indonesian_text(str(item.get("text") or ""))[:200].strip()
+        if not text or end - start < 0.05:
+            continue
+        normalized.append(
+            {
+                "id": str(item.get("id") or f"caption-{index}")[:80],
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "text": text,
+            }
+        )
     return normalized
 
 
