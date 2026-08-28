@@ -1,10 +1,12 @@
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from time import perf_counter
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
+import structlog
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
@@ -27,12 +29,15 @@ from app.models import (
 from app.providers.ai.factory import get_ai_provider
 from app.providers.storage.local import LocalStorageProvider
 from app.schemas.api import (
+    BlankManualEditorRead,
     CandidatePatch,
     CandidateRead,
     CandidateSelectionRead,
     CandidateTitlePatch,
+    EditorMediaAssetRead,
     HookTextRead,
     JobRead,
+    ManualEditorRead,
     OriginalityRead,
     ProjectClipRead,
     ProjectCreate,
@@ -54,9 +59,14 @@ from app.services.clipper_style import (
     generate_hook_text_for_clip,
     is_generic_hook,
     normalize_clipper_style,
+    normalize_video_framing,
 )
-from app.services.media import probe_media
+from app.services.download_filename import filename_from_path, sanitize_download_filename
+from app.services.media import layout_mode, probe_media
 from app.services.originality import assess
+from app.services.render_cache import read_render_cache_metadata, render_fingerprint
+from app.services.render_plan import build_editor_render_plan
+from app.services.render_result import same_file_path, verify_render_file_binding
 from app.services.source_context import (
     content_title_from_filename,
     source_mismatch_warning,
@@ -68,10 +78,22 @@ from app.services.source_metadata import (
     validate_public_url,
 )
 from app.services.titles import generate_candidate_copy, needs_candidate_copy_refresh
+from app.services.usage_audit import estimate_ai_usage
 from app.services.video_download import download_page_video
 from app.tasks import process_project, render_video
 
 router = APIRouter(prefix="/api")
+logger = structlog.get_logger()
+
+PROCESSING_PROJECT_STATUSES = frozenset(
+    {
+        ProjectStatus.EXTRACTING_METADATA,
+        ProjectStatus.EXTRACTING_AUDIO,
+        ProjectStatus.TRANSCRIBING,
+        ProjectStatus.SEGMENTING,
+        ProjectStatus.GENERATING_CANDIDATES,
+    }
+)
 
 
 def require(model, db: Session, item_id: uuid.UUID):
@@ -113,6 +135,44 @@ def transition(project: Project, target: ProjectStatus) -> None:
     project.status = target
 
 
+def begin_source_recovery(project: Project) -> None:
+    if project.status == ProjectStatus.FAILED:
+        logger.info(
+            "source_recovery_relink_started",
+            project_id=str(project.id),
+            recovery_method="upload_or_source_url",
+        )
+        project.status = ProjectStatus.UPLOADING
+        return
+    transition(project, ProjectStatus.UPLOADING)
+
+
+def is_stale_processing_project(
+    project: Project,
+    latest_job: ProcessingJob | None,
+    candidate_count: int,
+    timeout_minutes: int,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    if ProjectStatus(project.status) not in PROCESSING_PROJECT_STATUSES:
+        return False
+    if candidate_count > 0:
+        return False
+    activity_times = [project.updated_at]
+    if latest_job:
+        activity_times.append(latest_job.updated_at)
+    last_activity = max(_as_utc(value) for value in activity_times if value)
+    stale_before = _as_utc(now or datetime.now(UTC)) - timedelta(
+        minutes=max(1, timeout_minutes)
+    )
+    return last_activity <= stale_before
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
 def project_summary(project: Project, db: Session) -> dict:
     source = get_source_asset(db, project.id)
     top_clips = list(
@@ -135,6 +195,15 @@ def project_summary(project: Project, db: Session) -> dict:
     ]:
         if path_text and Path(path_text).is_file():
             storage_size += Path(path_text).stat().st_size
+    manual_transformation_id = db.scalar(
+        select(TransformationPlan.id)
+        .join(ClipCandidate, TransformationPlan.candidate_id == ClipCandidate.id)
+        .where(
+            TransformationPlan.project_id == project.id,
+            ClipCandidate.category == "manual_editor",
+        )
+        .order_by(TransformationPlan.created_at.desc())
+    )
     return {
         "id": project.id,
         "title": project.title,
@@ -149,6 +218,11 @@ def project_summary(project: Project, db: Session) -> dict:
         "total_top_clips": len(top_clips),
         "final_clips_count": final_count or 0,
         "storage_size_estimate": storage_size,
+        "manual_editor_url": (
+            f"/transformations/{manual_transformation_id}"
+            if manual_transformation_id
+            else None
+        ),
     }
 
 
@@ -238,7 +312,7 @@ async def upload_source(
     db: Session = Depends(get_db),
 ):
     project = require(Project, db, project_id)
-    transition(project, ProjectStatus.UPLOADING)
+    begin_source_recovery(project)
     db.commit()
     path: Path | None = None
     try:
@@ -282,7 +356,7 @@ def import_source_url(
     db: Session = Depends(get_db),
 ):
     project = require(Project, db, project_id)
-    transition(project, ProjectStatus.UPLOADING)
+    begin_source_recovery(project)
     db.commit()
     path: Path | None = None
     current_url = str(payload.url)
@@ -459,8 +533,74 @@ async def upload_creator_video(
 @router.post("/projects/{project_id}/process", response_model=JobRead, status_code=202)
 def start_processing(project_id: uuid.UUID, db: Session = Depends(get_db)):
     project = require(Project, db, project_id)
+    latest_job = db.scalar(
+        select(ProcessingJob)
+        .where(ProcessingJob.project_id == project_id)
+        .order_by(ProcessingJob.created_at.desc())
+    )
+    candidate_count = db.scalar(
+        select(func.count(ClipCandidate.id)).where(
+            ClipCandidate.project_id == project_id
+        )
+    ) or 0
+    timeout_minutes = max(1, get_settings().processing_stale_timeout_minutes)
+    stale_processing = is_stale_processing_project(
+        project,
+        latest_job,
+        int(candidate_count),
+        timeout_minutes,
+    )
+    if stale_processing:
+        previous_status = str(project.status)
+        previous_updated_at = project.updated_at
+        active_jobs = list(
+            db.scalars(
+                select(ProcessingJob).where(
+                    ProcessingJob.project_id == project_id,
+                    ProcessingJob.status.in_(["queued", "running"]),
+                )
+            )
+        )
+        for stale_job in active_jobs:
+            stale_job.status = "failed"
+            stale_job.error_code = "STALE_PROCESSING_RECOVERED"
+            stale_job.error_message = "Job stale digantikan oleh job recovery baru."
+            stale_job.completed_at = datetime.now(UTC)
+        project.status = ProjectStatus.UPLOADED
+        job = ProcessingJob(
+            project_id=project_id,
+            job_type="full_pipeline",
+            status="queued",
+            progress=0,
+            current_step="Menunggu pemulihan proses",
+        )
+        db.add(job)
+        db.commit()
+        logger.warning(
+            "stale_processing_project_recovered",
+            project_id=str(project.id),
+            previous_status=previous_status,
+            previous_job_id=str(latest_job.id) if latest_job else None,
+            new_job_id=str(job.id),
+            updated_at=(
+                previous_updated_at.isoformat() if previous_updated_at else None
+            ),
+            timeout_minutes=timeout_minutes,
+        )
+        process_project.delay(str(project_id), str(job.id))
+        return job
+    if ProjectStatus(project.status) in PROCESSING_PROJECT_STATUSES:
+        raise HTTPException(status_code=409, detail="Proyek masih diproses.")
     if project.status != ProjectStatus.UPLOADED:
         raise HTTPException(status_code=409, detail="Video belum siap diproses.")
+    active_job = db.scalar(
+        select(ProcessingJob).where(
+            ProcessingJob.project_id == project_id,
+            ProcessingJob.status.in_(["queued", "running"]),
+        )
+    )
+    if active_job:
+        raise HTTPException(status_code=409, detail="Proyek sedang diproses.")
     job = ProcessingJob(project_id=project_id, job_type="full_pipeline")
     db.add(job)
     db.commit()
@@ -469,7 +609,11 @@ def start_processing(project_id: uuid.UUID, db: Session = Depends(get_db)):
 
 
 @router.post("/projects/{project_id}/reprocess", response_model=JobRead, status_code=202)
-def reprocess_project(project_id: uuid.UUID, db: Session = Depends(get_db)):
+def reprocess_project(
+    project_id: uuid.UUID,
+    force_reprocess: bool = False,
+    db: Session = Depends(get_db),
+):
     project = require(Project, db, project_id)
     if (
         get_settings().transcription_provider == "mock"
@@ -495,7 +639,7 @@ def reprocess_project(project_id: uuid.UUID, db: Session = Depends(get_db)):
     job = ProcessingJob(project_id=project_id, job_type="full_pipeline")
     db.add(job)
     db.commit()
-    process_project.delay(str(project_id), str(job.id))
+    process_project.delay(str(project_id), str(job.id), force_reprocess)
     return job
 
 
@@ -507,6 +651,17 @@ def project_status(project_id: uuid.UUID, db: Session = Depends(get_db)):
         .where(ProcessingJob.project_id == project_id)
         .order_by(ProcessingJob.created_at.desc())
     )
+    candidate_count = db.scalar(
+        select(func.count(ClipCandidate.id)).where(
+            ClipCandidate.project_id == project_id
+        )
+    ) or 0
+    stale_processing = is_stale_processing_project(
+        project,
+        job,
+        int(candidate_count),
+        max(1, get_settings().processing_stale_timeout_minutes),
+    )
     return {
         "project_id": project.id,
         "job_id": job.id if job else None,
@@ -515,6 +670,8 @@ def project_status(project_id: uuid.UUID, db: Session = Depends(get_db)):
         "current_step": job.current_step if job else "Belum diproses",
         "error_code": job.error_code if job else None,
         "error_message": job.error_message if job else None,
+        "is_stale": stale_processing,
+        "recovery_available": stale_processing,
     }
 
 
@@ -763,7 +920,23 @@ def get_or_create_transformation(
         source_asset.original_filename if source_asset else None,
         declaration.source_title,
     )
-    generated = get_ai_provider().transformation(
+    transformation_started = perf_counter()
+    transformation_provider = get_ai_provider()
+    logger.info(
+        "ai_call_started",
+        ai_call_type="transformation_generation",
+        provider=transformation_provider.__class__.__name__,
+        model=get_settings().ai_model or "default",
+        project_id=str(project.id),
+        candidate_id=str(candidate.id),
+        retry_count=0,
+        **estimate_ai_usage(
+            "transformation_generation",
+            transformation_provider.__class__.__name__,
+            get_settings().ai_model or "default",
+        ),
+    )
+    generated = transformation_provider.transformation(
         candidate,
         purpose,
         audience,
@@ -798,6 +971,21 @@ def get_or_create_transformation(
         include_source_context=not mismatch_warning,
     )
     db.add(plan)
+    logger.info(
+        "ai_call_completed",
+        ai_call_type="transformation_generation",
+        provider=transformation_provider.__class__.__name__,
+        model=get_settings().ai_model or "default",
+        project_id=str(project.id),
+        candidate_id=str(candidate.id),
+        request_duration_ms=round((perf_counter() - transformation_started) * 1000),
+        cache_hit=False,
+        **estimate_ai_usage(
+            "transformation_generation",
+            transformation_provider.__class__.__name__,
+            get_settings().ai_model or "default",
+        ),
+    )
     if project.status == ProjectStatus.CANDIDATES_READY:
         transition(project, ProjectStatus.TRANSFORMATION_DRAFT)
     elif project.status not in {
@@ -808,6 +996,333 @@ def get_or_create_transformation(
         project.status = ProjectStatus.TRANSFORMATION_DRAFT
     db.commit()
     return plan, True
+
+
+def create_manual_editor_resources(
+    project: Project,
+    source_asset: MediaAsset,
+    db: Session,
+) -> tuple[ClipCandidate, TransformationPlan, float]:
+    source_path = Path(source_asset.storage_path)
+    if not source_path.is_file():
+        raise HTTPException(
+            status_code=409,
+            detail="File video sumber tidak ditemukan. Upload atau link ulang video terlebih dahulu.",
+        )
+
+    metadata = probe_media(source_path)
+    duration = round(float(metadata.duration), 3)
+    source_asset.duration_seconds = duration
+    source_asset.width = metadata.width
+    source_asset.height = metadata.height
+    source_asset.frame_rate = metadata.frame_rate
+    source_asset.audio_sample_rate = metadata.audio_sample_rate
+
+    candidate = db.scalar(
+        select(ClipCandidate)
+        .where(
+            ClipCandidate.project_id == project.id,
+            ClipCandidate.category == "manual_editor",
+        )
+        .order_by(ClipCandidate.created_at.desc())
+    )
+    if not candidate:
+        candidate = ClipCandidate(
+            project_id=project.id,
+            start_seconds=0,
+            end_seconds=duration,
+            duration_seconds=duration,
+            transcript_text="",
+            suggested_title="Video Utama",
+            suggested_hook="",
+            summary="Video utama untuk mode edit manual.",
+            category="manual_editor",
+            hook_score=0,
+            context_score=0,
+            information_score=0,
+            emotion_score=0,
+            fluency_score=0,
+            duration_score=0,
+            discussion_score=0,
+            viral_potential_score=0,
+            reasons_json=["Diimpor langsung ke editor"],
+            risks_json=[],
+            rank=1,
+            selected=True,
+            short_source_clip_path=str(source_path),
+            file_missing=False,
+        )
+        db.add(candidate)
+        db.flush()
+    else:
+        candidate.end_seconds = duration
+        candidate.duration_seconds = duration
+        candidate.short_source_clip_path = str(source_path)
+        candidate.file_missing = False
+        candidate.selected = True
+
+    plan = db.scalar(
+        select(TransformationPlan)
+        .where(TransformationPlan.candidate_id == candidate.id)
+        .order_by(TransformationPlan.created_at.desc())
+    )
+    if not plan:
+        sequence = [{"id": "manual-video-1", "source_start": 0.0, "source_end": duration}]
+        style_config = default_clipper_style("clean_podcast")
+        style_config.update(
+            {
+                "manual_editor_mode": True,
+                "editor_state_version": 1,
+                "video_sequence_initialized": True,
+                "audio_sequence_initialized": True,
+                "caption_timeline_initialized": True,
+                "effect_timeline_initialized": True,
+                "video_sequence": sequence,
+                "audio_sequence": [],
+                "media_sequence": sequence,
+                "media_trim": {"start": 0.0, "end": duration},
+                "audio_extracted": False,
+                "video_track_deleted": False,
+                "audio_track_deleted": False,
+                "caption_timeline": [],
+                "effect_timeline": [],
+                "hook_text": "",
+                "hook_text_enabled": False,
+                "keyword_popup_enabled": False,
+                "punch_zoom_enabled": False,
+                "pattern_interrupt_enabled": False,
+                "layer_order": ["caption", "hook", "keyword", "video"],
+                "track_order": [
+                    "caption",
+                    "hook",
+                    "keyword",
+                    "video",
+                    "audio",
+                    "punch",
+                    "pattern",
+                ],
+                "additional_audio_assets": [],
+                "additional_audio_tracks": [],
+            }
+        )
+        plan = TransformationPlan(
+            project_id=project.id,
+            candidate_id=candidate.id,
+            purpose="other",
+            new_angle="Edit manual video utama.",
+            audience="Editor manual",
+            original_hook="",
+            commentary_script="",
+            conclusion="",
+            engagement_question="",
+            social_caption="",
+            clipper_style_config=style_config,
+            needs_fact_verification=False,
+            status="draft",
+            storyboard=[],
+        )
+        db.add(plan)
+        db.flush()
+        logger.info(
+            "manual_editor_editor_state_created",
+            project_id=str(project.id),
+            candidate_id=str(candidate.id),
+            transformation_id=str(plan.id),
+            duration=duration,
+        )
+
+    project.status = ProjectStatus.TRANSFORMATION_DRAFT
+    project.transcript_provider = "manual_skipped"
+    project.transcript_language = None
+    db.commit()
+    return candidate, plan, duration
+
+
+@router.post(
+    "/projects/{project_id}/manual-editor",
+    response_model=ManualEditorRead,
+    status_code=201,
+)
+def create_manual_editor(
+    project_id: uuid.UUID,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    project = require(Project, db, project_id)
+    source_asset = get_source_asset(db, project.id)
+    if not source_asset:
+        raise HTTPException(status_code=409, detail="Upload atau link video sumber terlebih dahulu.")
+
+    existing_candidate = db.scalar(
+        select(ClipCandidate).where(
+            ClipCandidate.project_id == project.id,
+            ClipCandidate.category == "manual_editor",
+        )
+    )
+    candidate, plan, duration = create_manual_editor_resources(project, source_asset, db)
+    response.status_code = 200 if existing_candidate else 201
+    logger.info(
+        "manual_editor_project_created",
+        project_id=str(project.id),
+        candidate_id=str(candidate.id),
+        transformation_id=str(plan.id),
+        reused=bool(existing_candidate),
+    )
+    logger.info(
+        "manual_editor_source_ready",
+        project_id=str(project.id),
+        source_asset_id=str(source_asset.id),
+        source_path=source_asset.storage_path,
+        duration=duration,
+    )
+    logger.info(
+        "manual_editor_ai_skipped",
+        project_id=str(project.id),
+        transcription_skipped=True,
+        candidate_generation_skipped=True,
+        openai_skipped=True,
+        groq_skipped=True,
+    )
+    return {
+        "project_id": project.id,
+        "candidate_id": candidate.id,
+        "transformation_id": plan.id,
+        "editor_url": f"/transformations/{plan.id}",
+        "status": "ready_for_edit",
+        "duration": duration,
+        "source_asset_id": source_asset.id,
+        "source_filename": source_asset.original_filename,
+    }
+
+
+def create_blank_manual_editor_resources(
+    project: Project,
+    db: Session,
+) -> tuple[ClipCandidate, TransformationPlan, float]:
+    style_config = default_clipper_style("clean_podcast")
+    style_config.update(
+        {
+            "manual_editor_mode": True,
+            "editor_state_version": 1,
+            "video_sequence_initialized": True,
+            "audio_sequence_initialized": True,
+            "caption_timeline_initialized": True,
+            "effect_timeline_initialized": True,
+            "video_sequence": [],
+            "audio_sequence": [],
+            "media_sequence": [],
+            "media_trim": {"start": 0.0, "end": None},
+            "audio_extracted": False,
+            "video_track_deleted": False,
+            "audio_track_deleted": False,
+            "caption_timeline": [],
+            "effect_timeline": [],
+            "hook_text": "",
+            "hook_text_enabled": False,
+            "keyword_popup_enabled": False,
+            "punch_zoom_enabled": False,
+            "pattern_interrupt_enabled": False,
+            "layer_order": [
+                "caption",
+                "hook",
+                "keyword",
+                "punch",
+                "pattern",
+                "video",
+                "audio",
+            ],
+            "track_order": [
+                "caption",
+                "hook",
+                "keyword",
+                "video",
+                "audio",
+                "punch",
+                "pattern",
+            ],
+            "additional_audio_assets": [],
+            "additional_audio_tracks": [],
+            "editor_image_assets": [],
+        }
+    )
+    candidate = ClipCandidate(
+        project_id=project.id,
+        start_seconds=0,
+        end_seconds=0,
+        duration_seconds=0,
+        transcript_text="",
+        suggested_title="Editor Manual",
+        suggested_hook="",
+        summary="Editor manual langsung dari beranda.",
+        category="manual_editor",
+        hook_score=0,
+        context_score=0,
+        information_score=0,
+        emotion_score=0,
+        fluency_score=0,
+        duration_score=0,
+        discussion_score=0,
+        viral_potential_score=0,
+        reasons_json=["Dibuat langsung sebagai editor manual"],
+        risks_json=[],
+        rank=1,
+        selected=True,
+        short_source_clip_path=None,
+        file_missing=False,
+    )
+    db.add(candidate)
+    db.flush()
+    plan = TransformationPlan(
+        project_id=project.id,
+        candidate_id=candidate.id,
+        purpose="other",
+        new_angle="Edit manual video utama.",
+        audience="Editor manual",
+        original_hook="",
+        commentary_script="",
+        conclusion="",
+        engagement_question="",
+        social_caption="",
+        clipper_style_config=style_config,
+        needs_fact_verification=False,
+        status="draft",
+        storyboard=[],
+    )
+    db.add(plan)
+    db.commit()
+    logger.info(
+        "manual_editor_blank_created",
+        project_id=str(project.id),
+        candidate_id=str(candidate.id),
+        transformation_id=str(plan.id),
+    )
+    return candidate, plan, 0.0
+
+
+@router.post(
+    "/projects/manual-editor/blank",
+    response_model=BlankManualEditorRead,
+    status_code=200,
+)
+def create_blank_manual_editor(db: Session = Depends(get_db)):
+    project = Project(
+        title="Editor Manual",
+        description=None,
+        content_type="podcast",
+        status=ProjectStatus.TRANSFORMATION_DRAFT,
+        transcript_provider="manual_skipped",
+        transcript_language=None,
+        deleted_at=None,
+    )
+    db.add(project)
+    db.commit()
+    _candidate, plan, _duration = create_blank_manual_editor_resources(project, db)
+    return {
+        "project_id": project.id,
+        "transformation_id": plan.id,
+        "editor_url": f"/transformations/{plan.id}",
+        "status": "transformation_draft",
+    }
 
 
 @router.post("/candidates/{candidate_id}/select", response_model=CandidateSelectionRead)
@@ -857,7 +1372,9 @@ def get_transformation(transformation_id: uuid.UUID, db: Session = Depends(get_d
         plan.clipper_style_config or default_clipper_style("clean_podcast"),
         plan.original_hook,
     )
-    if is_generic_hook(current_config.get("hook_text")):
+    if not current_config.get("manual_editor_mode") and is_generic_hook(
+        current_config.get("hook_text")
+    ):
         current_config["hook_text"] = generate_hook_text_for_clip(
             candidate.transcript_text,
             candidate.suggested_title,
@@ -919,6 +1436,180 @@ def transformation_audio_asset(
         ".m4a": "audio/mp4",
     }[matches[0].suffix.lower()]
     return FileResponse(matches[0], media_type=media_type)
+
+
+def _serialize_editor_asset(transformation_id: uuid.UUID, asset: MediaAsset) -> EditorMediaAssetRead:
+    kind = (asset.asset_type or "video").replace("editor_", "")
+    return EditorMediaAssetRead(
+        asset_id=str(asset.id),
+        kind=kind,
+        name=asset.original_filename,
+        url=f"/api/transformations/{transformation_id}/media/{asset.id}",
+        duration_seconds=asset.duration_seconds,
+        width=asset.width,
+        height=asset.height,
+        size_bytes=asset.size_bytes,
+        mime_type=asset.mime_type or "application/octet-stream",
+    )
+
+
+@router.get("/transformations/{transformation_id}/media", response_model=list[EditorMediaAssetRead])
+def list_transformation_media(transformation_id: uuid.UUID, db: Session = Depends(get_db)):
+    plan = require(TransformationPlan, db, transformation_id)
+    assets = list(
+        db.scalars(
+            select(MediaAsset).where(
+                MediaAsset.project_id == plan.project_id,
+                MediaAsset.asset_type.like("editor_%"),
+            )
+        )
+    )
+    return [_serialize_editor_asset(transformation_id, asset) for asset in assets]
+
+
+@router.post(
+    "/transformations/{transformation_id}/media",
+    response_model=EditorMediaAssetRead,
+    status_code=201,
+)
+async def upload_transformation_media(
+    transformation_id: uuid.UUID,
+    file: UploadFile = File(...),
+    kind: str = Form("video"),
+    db: Session = Depends(get_db),
+):
+    plan = require(TransformationPlan, db, transformation_id)
+    if kind not in {"video", "audio", "image"}:
+        raise HTTPException(status_code=400, detail="Jenis media tidak didukung.")
+    path, size, _checksum, stored_name = await LocalStorageProvider().save_media_upload(
+        plan.project_id, file, kind
+    )
+    duration = None
+    width = None
+    height = None
+    if kind in {"video", "audio"}:
+        try:
+            metadata = probe_media(path)
+            duration = float(metadata.duration) if metadata.duration else None
+            width = metadata.width
+            height = metadata.height
+        except Exception as exc:
+            logger.warning(
+                "transformation_media_probe_failed",
+                transformation_id=str(transformation_id),
+                kind=kind,
+                error=str(exc),
+            )
+    asset = MediaAsset(
+        project_id=plan.project_id,
+        asset_type=f"editor_{kind}",
+        original_filename=Path(file.filename or "media").name,
+        stored_filename=stored_name,
+        storage_path=str(path),
+        mime_type=(file.content_type or "application/octet-stream"),
+        size_bytes=size,
+        duration_seconds=duration,
+        width=width,
+        height=height,
+        checksum="",
+    )
+    db.add(asset)
+    db.commit()
+    db.refresh(asset)
+    return _serialize_editor_asset(transformation_id, asset)
+
+
+@router.get("/transformations/{transformation_id}/media/{asset_id}")
+def transformation_media_asset(
+    transformation_id: uuid.UUID,
+    asset_id: uuid.UUID,
+    db: Session = Depends(get_db),
+):
+    plan = require(TransformationPlan, db, transformation_id)
+    asset = db.get(MediaAsset, asset_id)
+    if not asset or asset.project_id != plan.project_id or not asset.asset_type.startswith("editor_"):
+        raise HTTPException(status_code=404, detail="Aset media tidak tersedia.")
+    media_path = Path(asset.storage_path)
+    if not media_path.is_file():
+        raise HTTPException(status_code=404, detail="File media tidak tersedia.")
+    return FileResponse(media_path, media_type=asset.mime_type or "application/octet-stream")
+
+
+@router.post("/transformations/{transformation_id}/media/{asset_id}/add-to-timeline")
+def add_media_to_timeline(
+    transformation_id: uuid.UUID,
+    asset_id: uuid.UUID,
+    db: Session = Depends(get_db),
+):
+    plan = require(TransformationPlan, db, transformation_id)
+    asset = db.get(MediaAsset, asset_id)
+    if not asset or asset.project_id != plan.project_id or not asset.asset_type.startswith("editor_"):
+        raise HTTPException(status_code=404, detail="Aset media tidak tersedia.")
+    kind = asset.asset_type.replace("editor_", "")
+    current_config = dict(plan.clipper_style_config or {})
+    current_config["manual_editor_mode"] = True
+
+    if kind == "video":
+        candidate = require(ClipCandidate, db, plan.candidate_id)
+        candidate.short_source_clip_path = asset.storage_path
+        duration = max(0.1, float(asset.duration_seconds or 0.1))
+        candidate.duration_seconds = duration
+        sequence = [
+            {
+                "id": "manual-video-1",
+                "source_start": 0.0,
+                "source_end": round(duration, 3),
+            }
+        ]
+        current_config.update(
+            video_sequence=sequence,
+            media_sequence=sequence,
+            media_trim={"start": 0.0, "end": round(duration, 3)},
+            video_sequence_initialized=True,
+            audio_sequence_initialized=True,
+            video_track_deleted=False,
+        )
+    elif kind == "audio":
+        assets = list(current_config.get("additional_audio_assets") or [])
+        assets.append(
+            {
+                "id": str(asset.id),
+                "name": asset.original_filename,
+                "mime_type": asset.mime_type,
+                "size_bytes": asset.size_bytes,
+                "duration_seconds": asset.duration_seconds or 0,
+            }
+        )
+        current_config["additional_audio_assets"] = assets
+        tracks = list(current_config.get("additional_audio_tracks") or [])
+        audio_duration = max(0.1, float(asset.duration_seconds or 0.1))
+        tracks.append(
+            {
+                "id": f"additional-audio-{asset.id}",
+                "asset_id": str(asset.id),
+                "label": "Backsound",
+                "kind": "backsound",
+                "start": 0.0,
+                "end": round(audio_duration, 3),
+                "volume": 1,
+            }
+        )
+        current_config["additional_audio_tracks"] = tracks
+    else:
+        assets = list(current_config.get("editor_image_assets") or [])
+        assets.append(
+            {
+                "id": str(asset.id),
+                "name": asset.original_filename,
+                "url": f"/api/transformations/{transformation_id}/media/{asset.id}",
+                "kind": "image",
+            }
+        )
+        current_config["editor_image_assets"] = assets
+
+    plan.clipper_style_config = current_config
+    db.commit()
+    return plan
 
 
 @router.get(
@@ -1034,7 +1725,24 @@ def regenerate_transformation(
         source_asset.original_filename if source_asset else None,
         declaration.source_title,
     )
-    generated = get_ai_provider().transformation(
+    transformation_started = perf_counter()
+    transformation_provider = get_ai_provider()
+    logger.info(
+        "ai_call_started",
+        ai_call_type="transformation_generation",
+        provider=transformation_provider.__class__.__name__,
+        model=get_settings().ai_model or "default",
+        project_id=str(project.id),
+        candidate_id=str(candidate.id),
+        transformation_id=str(plan.id),
+        retry_count=0,
+        **estimate_ai_usage(
+            "transformation_generation",
+            transformation_provider.__class__.__name__,
+            get_settings().ai_model or "default",
+        ),
+    )
+    generated = transformation_provider.transformation(
         candidate,
         plan.purpose,
         plan.audience,
@@ -1054,6 +1762,22 @@ def regenerate_transformation(
         candidate,
         caption_content_title(declaration, source_asset),
         include_source_context=not mismatch_warning,
+    )
+    logger.info(
+        "ai_call_completed",
+        ai_call_type="transformation_generation",
+        provider=transformation_provider.__class__.__name__,
+        model=get_settings().ai_model or "default",
+        project_id=str(project.id),
+        candidate_id=str(candidate.id),
+        transformation_id=str(plan.id),
+        request_duration_ms=round((perf_counter() - transformation_started) * 1000),
+        cache_hit=False,
+        **estimate_ai_usage(
+            "transformation_generation",
+            transformation_provider.__class__.__name__,
+            get_settings().ai_model or "default",
+        ),
     )
     db.execute(
         delete(OriginalityReport).where(
@@ -1096,6 +1820,7 @@ def patch_transformation(
     db: Session = Depends(get_db),
 ):
     plan = require(TransformationPlan, db, transformation_id)
+    previous_style_config = plan.clipper_style_config or {}
     changes = payload.model_dump(exclude_unset=True)
     if "clipper_style_config" in changes:
         style_config = normalize_clipper_style(
@@ -1114,6 +1839,21 @@ def patch_transformation(
     for key, value in changes.items():
         setattr(plan, key, value)
     if affects_output:
+        next_style_config = changes.get("clipper_style_config", previous_style_config)
+        previous_framing = normalize_video_framing(previous_style_config.get("video_framing"))
+        next_framing = normalize_video_framing(next_style_config.get("video_framing"))
+        framing_changed = previous_framing != next_framing
+        logger.info(
+            "render_cache_invalidated",
+            message=(
+                "render invalidated because video_framing changed"
+                if framing_changed
+                else "render invalidated because transformation output changed"
+            ),
+            transformation_id=str(transformation_id),
+            previous_video_framing=previous_framing,
+            video_framing=next_framing,
+        )
         db.execute(
             delete(OriginalityReport).where(
                 OriginalityReport.transformation_plan_id == transformation_id
@@ -1264,6 +2004,7 @@ def queue_render(
 ):
     plan = require(TransformationPlan, db, transformation_id)
     project = require(Project, db, plan.project_id)
+    candidate = require(ClipCandidate, db, plan.candidate_id)
     settings = get_settings()
     render_width = settings.preview_width if preview else settings.final_width
     render_height = settings.preview_height if preview else settings.final_height
@@ -1273,6 +2014,9 @@ def queue_render(
             Render.transformation_plan_id == plan.id,
             Render.status.in_(["queued", "running"]),
             Render.width == render_width,
+            Render.height == render_height,
+            Render.preset == payload.preset,
+            Render.subtitle_language == payload.subtitle_language,
         )
         .order_by(Render.created_at.desc())
     )
@@ -1281,17 +2025,205 @@ def queue_render(
             status_code=409,
             detail="Render preview sedang berjalan." if preview else "Render final sedang berjalan.",
         )
-    completed_render = db.scalar(
-        select(Render)
-        .where(
-            Render.transformation_plan_id == plan.id,
-            Render.status == "completed",
-            Render.preview_path.is_not(None) if preview else Render.output_path.is_not(None),
-        )
-        .order_by(Render.created_at.desc())
+    editor_render_plan = build_editor_render_plan(
+        plan.clipper_style_config,
+        candidate_duration=candidate.duration_seconds,
+        hook_fallback=plan.original_hook,
     )
-    if completed_render and not preview:
-        return completed_render
+    render_style_config = editor_render_plan.style_config
+    logger.info(
+        "export_render_plan_audit",
+        transformation_id=str(plan.id),
+        candidate_id=str(candidate.id),
+        render_id=None,
+        editor_state_found=editor_render_plan.editor_state_found,
+        video_framing=render_style_config.get("video_framing"),
+        video_sequence_count=len(editor_render_plan.video_sequence),
+        audio_sequence_count=len(editor_render_plan.audio_sequence),
+        caption_timeline_count=len(editor_render_plan.caption_timeline),
+        first_caption_text_from_editor_state=(
+            editor_render_plan.caption_timeline[0].get("text")
+            if editor_render_plan.caption_timeline
+            else None
+        ),
+        caption_initialized=editor_render_plan.caption_timeline_initialized,
+        editor_state_version=render_style_config.get("editor_state_version", 0),
+        effect_timeline_count=len(editor_render_plan.effect_timeline),
+        template=payload.preset,
+        layout=layout_mode(payload.preset),
+        style=render_style_config.get("clipper_style_preset"),
+        resolution=f"{render_width}x{render_height}",
+        output_path=None,
+    )
+    logger.info(
+        "render_element_contract_audit",
+        phase="queue_render",
+        transformation_id=str(plan.id),
+        candidate_id=str(candidate.id),
+        render_id=None,
+        template=payload.preset,
+        resolution=f"{render_width}x{render_height}",
+        **editor_render_plan.element_audit.log_fields(),
+    )
+    if editor_render_plan.element_audit.unsupported_export_elements:
+        logger.warning(
+            "render_contains_unsupported_export_elements",
+            transformation_id=str(plan.id),
+            candidate_id=str(candidate.id),
+            unsupported_export_elements=list(
+                editor_render_plan.element_audit.unsupported_export_elements
+            ),
+            unsupported_export_reasons=(
+                editor_render_plan.element_audit.unsupported_reasons
+            ),
+        )
+    voiceover_assets = list(
+        db.scalars(
+            select(MediaAsset)
+            .where(
+                MediaAsset.project_id == project.id,
+                MediaAsset.asset_type == "voiceover",
+            )
+            .order_by(MediaAsset.created_at.desc())
+        )
+    )
+    voiceover_asset = voiceover_assets[0] if voiceover_assets else None
+    audio_library = LocalStorageProvider().resolve(f"{project.id}/audio-library")
+    additional_audio_identity = []
+    for track in render_style_config.get("additional_audio_tracks", []):
+        if not isinstance(track, dict):
+            continue
+        asset_id = str(track.get("asset_id") or "")
+        matches = [
+            path
+            for path in audio_library.glob(f"{asset_id}.*")
+            if path.suffix.lower() in {".mp3", ".wav", ".m4a"}
+        ]
+        additional_audio_identity.append(
+            {
+                "asset_id": asset_id,
+                "path": str(matches[0]) if matches else None,
+                "start": track.get("start", 0),
+                "end": track.get("end"),
+                "volume": track.get("volume", 1),
+            }
+        )
+    audio_identity = {
+        "voiceover": {
+            "asset_id": str(voiceover_asset.id) if voiceover_asset else None,
+            "path": voiceover_asset.storage_path if voiceover_asset else None,
+            "checksum": voiceover_asset.checksum if voiceover_asset else None,
+            "start": render_style_config.get("voiceover_start", 0),
+            "end": render_style_config.get("voiceover_end"),
+        },
+        "additional_audio": additional_audio_identity,
+    }
+    cache_lookup_started_at = perf_counter()
+    expected_fingerprint = render_fingerprint(
+        render_style_config,
+        preset=payload.preset,
+        subtitle_language=payload.subtitle_language,
+        width=render_width,
+        height=render_height,
+        frame_rate=30,
+        preview=preview,
+        audio_identity=audio_identity,
+    )
+    fingerprint_short = expected_fingerprint[:12]
+    completed_renders = list(
+        db.scalars(
+            select(Render)
+            .where(
+                Render.transformation_plan_id == plan.id,
+                Render.status == "completed",
+                Render.preset == payload.preset,
+                Render.subtitle_language == payload.subtitle_language,
+                Render.width == render_width,
+                Render.height == render_height,
+                Render.preview_path.is_not(None)
+                if preview
+                else Render.output_path.is_not(None),
+            )
+            .order_by(Render.created_at.desc())
+        )
+    )
+    current_framing = normalize_video_framing(render_style_config.get("video_framing"))
+    cache_miss_reason = "no_completed_render"
+    for completed_render in completed_renders:
+        cached_path_value = (
+            completed_render.preview_path if preview else completed_render.output_path
+        )
+        cached_path = Path(cached_path_value) if cached_path_value else None
+        if not cached_path or not cached_path.is_file():
+            cache_miss_reason = "cached_output_missing"
+            continue
+        cache_metadata = read_render_cache_metadata(cached_path)
+        if cache_metadata and cache_metadata.get("fingerprint") == expected_fingerprint:
+            try:
+                verify_render_file_binding(
+                    cached_path,
+                    preview=preview,
+                    forbidden_source_paths=(candidate.short_source_clip_path,),
+                )
+            except AppError as exc:
+                logger.error(
+                    "cached_render_file_binding_invalid",
+                    render_id=str(completed_render.id),
+                    render_output_path=str(cached_path),
+                    error=exc.message,
+                )
+                cache_miss_reason = "cached_output_binding_invalid"
+                continue
+            cache_lookup_duration = perf_counter() - cache_lookup_started_at
+            logger.info(
+                "using_cached_render",
+                message="using cached render",
+                render_id=str(completed_render.id),
+                cached_render_id=str(completed_render.id),
+                cached_output_path=str(cached_path),
+                transformation_id=str(plan.id),
+                preset=payload.preset,
+                resolution=f"{render_width}x{render_height}",
+                video_framing=current_framing,
+                fingerprint=fingerprint_short,
+                cache_lookup_duration=round(cache_lookup_duration, 3),
+            )
+            return render_payload(completed_render, db)
+        framing_changed = bool(
+            cache_metadata
+            and cache_metadata.get("video_framing") != current_framing
+        )
+        logger.info(
+            "render_cache_invalidated",
+            message=(
+                "render invalidated because video_framing changed"
+                if framing_changed
+                else "render invalidated because render inputs changed"
+            ),
+            cached_render_id=str(completed_render.id),
+            transformation_id=str(plan.id),
+            cached_fingerprint=(cache_metadata or {}).get("fingerprint"),
+            expected_fingerprint=expected_fingerprint,
+            cached_video_framing=(cache_metadata or {}).get("video_framing"),
+            video_framing=current_framing,
+            preset=payload.preset,
+            resolution=f"{render_width}x{render_height}",
+        )
+        cache_miss_reason = (
+            "video_framing_changed" if framing_changed else "render_inputs_changed"
+        )
+    logger.info(
+        "cache_miss",
+        transformation_id=str(plan.id),
+        candidate_id=str(candidate.id),
+        reason=cache_miss_reason,
+        completed_render_count=len(completed_renders),
+        fingerprint=fingerprint_short,
+        cache_lookup_duration=round(perf_counter() - cache_lookup_started_at, 3),
+        preset=payload.preset,
+        resolution=f"{render_width}x{render_height}",
+        video_framing=current_framing,
+    )
     report = db.scalar(
         select(OriginalityReport)
         .where(OriginalityReport.transformation_plan_id == plan.id)
@@ -1333,15 +2265,67 @@ def queue_render(
     )
     db.add(render)
     db.commit()
+    logger.info(
+        "export_render_queued",
+        transformation_id=str(plan.id),
+        candidate_id=str(candidate.id),
+        render_id=str(render.id),
+        editor_state_found=editor_render_plan.editor_state_found,
+        video_framing=render_style_config.get("video_framing"),
+        video_sequence_count=len(editor_render_plan.video_sequence),
+        audio_sequence_count=len(editor_render_plan.audio_sequence),
+        caption_timeline_count=len(editor_render_plan.caption_timeline),
+        effect_timeline_count=len(editor_render_plan.effect_timeline),
+        template=payload.preset,
+        resolution=f"{render_width}x{render_height}",
+    )
     render_video.delay(str(render.id), preview)
-    return render
+    return render_payload(render, db)
 
 
-def render_payload(render: Render) -> dict:
-    has_file = bool(render.output_path or render.preview_path)
+def _render_source_paths(render: Render, db: Session) -> tuple[str | None, str | None]:
+    plan = db.get(TransformationPlan, render.transformation_plan_id)
+    candidate = db.get(ClipCandidate, plan.candidate_id) if plan else None
+    source = db.scalar(
+        select(MediaAsset).where(
+            MediaAsset.project_id == render.project_id,
+            MediaAsset.asset_type == "source_video",
+        )
+    )
+    return (
+        candidate.short_source_clip_path if candidate else None,
+        source.storage_path if source else None,
+    )
+
+
+def render_payload(render: Render, db: Session | None = None) -> dict:
+    path_value = render.output_path or render.preview_path
+    response_status = render.status
+    response_error = render.error_message if render.status == "failed" else None
+    has_verified_file = False
+    if render.status == "completed":
+        try:
+            verify_render_file_binding(
+                path_value,
+                preview=not bool(render.output_path),
+                forbidden_source_paths=_render_source_paths(render, db) if db else (),
+            )
+            has_verified_file = True
+        except AppError as exc:
+            response_status = "failed"
+            response_error = exc.message
+            logger.error(
+                "render_result_binding_invalid",
+                render_id=str(render.id),
+                render_output_path=path_value,
+                error=exc.message,
+            )
+    output_url = (
+        f"/api/renders/{render.id}/download" if has_verified_file else None
+    )
     return {
         "id": render.id,
-        "status": render.status,
+        "status": response_status,
         "preset": render.preset,
         "subtitle_language": render.subtitle_language,
         "width": render.width,
@@ -1349,9 +2333,9 @@ def render_payload(render: Render) -> dict:
         "frame_rate": render.frame_rate,
         "duration_seconds": render.duration_seconds,
         "file_size_bytes": render.file_size_bytes,
-        "error_message": render.error_message if render.status == "failed" else None,
-        "warning_message": render.error_message if render.status == "completed" else None,
-        "output_url": f"/api/renders/{render.id}/download" if render.status == "completed" and has_file else None,
+        "error_message": response_error,
+        "warning_message": render.error_message if response_status == "completed" else None,
+        "output_url": output_url,
     }
 
 
@@ -1409,7 +2393,16 @@ def create_final_render_alias(
 
 @router.get("/renders/{render_id}", response_model=RenderRead)
 def get_render(render_id: uuid.UUID, db: Session = Depends(get_db)):
-    return render_payload(require(Render, db, render_id))
+    render = require(Render, db, render_id)
+    payload = render_payload(render, db)
+    logger.info(
+        "render_status_poll",
+        render_id=str(render.id),
+        status=payload["status"],
+        render_output_path=render.output_path or render.preview_path,
+        render_download_url=payload["output_url"],
+    )
+    return payload
 
 
 @router.get(
@@ -1425,13 +2418,60 @@ def latest_render(transformation_id: uuid.UUID, db: Session = Depends(get_db)):
     )
     if not render:
         raise HTTPException(status_code=404, detail="Render belum tersedia.")
-    return render_payload(render)
+    return render_payload(render, db)
 
 
 @router.get("/renders/{render_id}/download")
-def download_render(render_id: uuid.UUID, db: Session = Depends(get_db)):
+def download_render(
+    render_id: uuid.UUID,
+    output_filename: str | None = None,
+    db: Session = Depends(get_db),
+):
     render = require(Render, db, render_id)
-    path = render.output_path or render.preview_path
-    if render.status != "completed" or not path or not Path(path).is_file():
+    plan = db.get(TransformationPlan, render.transformation_plan_id)
+    candidate = db.get(ClipCandidate, plan.candidate_id) if plan else None
+    project = db.get(Project, render.project_id)
+    path_value = render.output_path or render.preview_path
+    source_paths = _render_source_paths(render, db)
+    same_as_source = bool(
+        path_value
+        and any(source and same_file_path(path_value, source) for source in source_paths)
+    )
+    logger.info(
+        "render_download_audit",
+        download_render_id=str(render.id),
+        download_file_path=path_value,
+        render_output_path=render.output_path,
+        render_preview_path=render.preview_path,
+        path_same_as_source_or_candidate=same_as_source,
+    )
+    if render.status != "completed":
         raise HTTPException(status_code=409, detail="File render belum tersedia.")
-    return FileResponse(path, media_type="video/mp4", filename=f"autoclip-{render.id}.mp4")
+    try:
+        path = verify_render_file_binding(
+            path_value,
+            preview=not bool(render.output_path),
+            forbidden_source_paths=source_paths,
+        )
+    except AppError as exc:
+        logger.error(
+            "render_download_binding_rejected",
+            download_render_id=str(render.id),
+            download_file_path=path_value,
+            error=exc.message,
+        )
+        raise HTTPException(status_code=409, detail=exc.message) from exc
+    download_filename = sanitize_download_filename(
+        output_filename,
+        candidate.suggested_title if candidate else None,
+        project.title if project else None,
+        filename_from_path(path.name),
+        f"autoclip-{render.id}",
+    )
+    logger.info(
+        "render_download_filename",
+        download_render_id=str(render.id),
+        requested_filename=output_filename,
+        download_filename=download_filename,
+    )
+    return FileResponse(path, media_type="video/mp4", filename=download_filename)

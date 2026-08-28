@@ -30,6 +30,7 @@ def test_normalize_language_names():
 
 
 def test_translate_texts_preserves_order(monkeypatch):
+    events = []
     monkeypatch.setattr(
         "app.services.translation.get_settings",
         lambda: SimpleNamespace(
@@ -41,6 +42,10 @@ def test_translate_texts_preserves_order(monkeypatch):
         "app.services.translation.httpx.post",
         lambda *args, **kwargs: FakeResponse(),
     )
+    monkeypatch.setattr(
+        "app.services.translation.logger.info",
+        lambda event, **fields: events.append((event, fields)),
+    )
 
     result = translate_texts(
         ["Serangan datang dari kanan.", "Bola menjadi gol."],
@@ -51,3 +56,6 @@ def test_translate_texts_preserves_order(monkeypatch):
         "The attack comes from the right.",
         "It becomes a goal.",
     ]
+    assert events[0][0] == "subtitle_translation_ai_call"
+    assert events[1][1]["ai_call_type"] == "subtitle_translation"
+    assert events[-1][0] == "ai_call_completed"

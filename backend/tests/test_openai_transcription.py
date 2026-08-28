@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import app.providers.transcription.openai as openai_transcription
 from app.providers.transcription.openai import OpenAITranscriptionProvider
+from app.tasks import should_reuse_transcript
 
 
 class FakeResponse:
@@ -17,6 +18,12 @@ class FakeResponse:
                 {"start": 4.0, "end": 8.5, "text": "Serangan datang dari sisi kanan."},
             ],
         }
+
+
+def test_transcription_reuse_guard_only_reuses_existing_segments_without_force():
+    assert should_reuse_transcript(3, False) is True
+    assert should_reuse_transcript(3, True) is False
+    assert should_reuse_transcript(0, False) is False
 
 
 def test_openai_transcription_returns_timestamped_segments(tmp_path, monkeypatch):

@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api } from "../api/client";
+import { useBlankManualEditor } from "../hooks/useBlankManualEditor";
 import type { Project } from "../types";
 
 const statusLabels: Record<string, string> = {
@@ -34,6 +35,7 @@ function formatSize(value?: number) {
 
 export function DashboardPage() {
   const client = useQueryClient();
+  const blankEditor = useBlankManualEditor();
   const projects = useQuery({
     queryKey: ["projects"],
     queryFn: () => api<Project[]>("/api/projects"),
@@ -49,18 +51,25 @@ export function DashboardPage() {
         <div className="grid items-center gap-8 lg:grid-cols-[minmax(0,1fr)_360px]">
           <div>
             <p className="font-semibold uppercase tracking-[0.25em] text-cyan-400">
-              AI clipping studio
+              Video editing workspace
             </p>
             <h1 className="mt-3 max-w-4xl text-4xl font-black leading-tight sm:text-5xl">
-              Satu video panjang, banyak klip siap publikasi.
+              Edit video cepat dalam satu workspace.
             </h1>
             <p className="mt-4 max-w-2xl text-zinc-300">
-              Upload video, biarkan engine mencari momen terbaik, lalu edit
-              subtitle, caption, framing, dan hasil akhir dalam satu workspace.
+              Upload video, atur potongan, caption, audio, dan export langsung dari editor.
             </p>
             <div className="mt-6 flex flex-wrap gap-3">
-              <Link className="btn px-6 py-3" to="/projects/new">
-                Buat klip dari video
+              <button
+                className="btn px-6 py-3"
+                disabled={blankEditor.isPending}
+                onClick={() => blankEditor.mutate()}
+                type="button"
+              >
+                {blankEditor.isPending ? "Menyiapkan editor..." : "Mulai Edit"}
+              </button>
+              <Link className="btn-secondary px-6 py-3" to="/projects/new?mode=autoclip">
+                Buat AutoClip
               </Link>
               <a className="btn-secondary px-6 py-3" href="#recent-projects">
                 Lihat proyek
@@ -69,13 +78,13 @@ export function DashboardPage() {
           </div>
           <div className="studio-card p-5">
             <p className="text-xs font-bold uppercase tracking-[0.2em] text-zinc-500">
-              Workflow otomatis
+              Workflow editor
             </p>
             <div className="mt-4 space-y-3">
               {[
-                ["01", "Paste link dan upload video"],
-                ["02", "Pilih klip"],
-                ["03", "Editing klip terpilih"],
+                ["01", "Upload atau paste link video"],
+                ["02", "Atur timeline dan elemen"],
+                ["03", "Export hasil edit"],
               ].map(([number, label]) => (
                 <div
                   className="flex items-center gap-3 rounded-xl bg-zinc-950/80 p-3"
@@ -92,6 +101,33 @@ export function DashboardPage() {
         </div>
       </section>
 
+      <section className="grid gap-3 md:grid-cols-2" aria-label="Pilihan workflow">
+        <Link
+          className="border-l-4 border-emerald-400 bg-zinc-900 px-5 py-4 transition hover:bg-zinc-800"
+          to="/projects/new?mode=manual"
+          onClick={(event) => {
+            event.preventDefault();
+            blankEditor.mutate();
+          }}
+        >
+          <h2 className="font-black">Edit Video Sendiri</h2>
+          <p className="mt-1 text-sm text-zinc-400">
+            Upload/link video dan langsung masuk editor tanpa AI.
+          </p>
+          <span className="mt-3 inline-block text-sm font-bold text-emerald-300">Mulai edit</span>
+        </Link>
+        <Link
+          className="border-l-4 border-cyan-400 bg-zinc-900 px-5 py-4 transition hover:bg-zinc-800"
+          to="/projects/new?mode=autoclip"
+        >
+          <h2 className="font-black">AutoClip Video Panjang</h2>
+          <p className="mt-1 text-sm text-zinc-400">
+            Temukan momen terbaik otomatis dari video panjang.
+          </p>
+          <span className="mt-3 inline-block text-sm font-bold text-cyan-300">Buat AutoClip</span>
+        </Link>
+      </section>
+
       <div id="recent-projects" className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <p className="text-sm font-bold text-cyan-400">Workspace</p>
@@ -102,8 +138,12 @@ export function DashboardPage() {
       {projects.isLoading && <p>Memuat proyek...</p>}
       {projects.error && <p className="text-red-300">{projects.error.message}</p>}
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-        {projects.data?.map((project) => (
-          <article key={project.id} className="studio-card p-5 transition hover:border-zinc-600">
+        {projects.data?.map((project) => {
+          const manualMode = project.transcript_provider === "manual_skipped";
+          const openUrl = manualMode && project.manual_editor_url
+            ? project.manual_editor_url
+            : `/jobs/${project.id}/clips`;
+          return <article key={project.id} className="studio-card p-5 transition hover:border-zinc-600">
             <div className="flex items-start justify-between gap-4">
               <div>
                 <div className="mb-4 flex aspect-video items-center justify-center rounded-xl bg-gradient-to-br from-zinc-800 to-zinc-950 text-3xl font-black text-cyan-400">
@@ -115,26 +155,28 @@ export function DashboardPage() {
                 </p>
               </div>
               <span className="rounded-full bg-zinc-800 px-3 py-1 text-xs text-cyan-300">
-                {statusLabels[project.status] || project.status}
+                {manualMode ? "Mode edit manual" : statusLabels[project.status] || project.status}
               </span>
             </div>
             <p className="mt-4 line-clamp-2 min-h-10 text-sm text-zinc-400">
               {project.description || "Tanpa deskripsi"}
             </p>
             <div className="mt-5 flex gap-3 border-t border-zinc-800 pt-4">
-              <Link className="btn flex-1" to={`/jobs/${project.id}/clips`}>Buka</Link>
+              <Link className="btn flex-1" to={openUrl}>
+                {manualMode ? "Buka editor" : "Buka"}
+              </Link>
               <button className="btn-secondary" onClick={() => remove.mutate(project.id)}>
                 Hapus
               </button>
             </div>
             <div className="mt-4 grid grid-cols-2 gap-2 border-t border-zinc-800 pt-4 text-xs text-zinc-400">
               <span>Durasi: {formatDuration(project.original_duration)}</span>
-              <span>Top clips: {project.total_top_clips || 0}/5</span>
+              <span>{manualMode ? "Mode: Manual" : `Top clips: ${project.total_top_clips || 0}/5`}</span>
               <span>Final: {project.final_clips_count || 0}</span>
               <span>Storage: {formatSize(project.storage_size_estimate)}</span>
             </div>
-          </article>
-        ))}
+          </article>;
+        })}
       </div>
       {!projects.isLoading && projects.data?.length === 0 && (
         <div className="panel text-center">

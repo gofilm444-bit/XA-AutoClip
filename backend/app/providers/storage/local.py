@@ -102,6 +102,42 @@ class LocalStorageProvider:
             raise
         return destination, size, digest.hexdigest(), stored_name
 
+    async def save_media_upload(
+        self,
+        project_id: uuid.UUID,
+        upload: UploadFile,
+        kind: str = "video",
+    ) -> tuple[Path, int, str, str]:
+        extensions = MEDIA_KIND_EXTENSIONS.get(kind)
+        mime_types = MEDIA_KIND_MIME.get(kind)
+        if not extensions or not mime_types:
+            raise AppError(ErrorCode.UNSUPPORTED_FORMAT, "Jenis media tidak didukung.")
+        original = Path(upload.filename or "media").name
+        extension = Path(original).suffix.lower()
+        mime_type = (upload.content_type or "").lower()
+        if extension not in extensions or mime_type not in mime_types:
+            raise AppError(ErrorCode.UNSUPPORTED_FORMAT, "Format media tidak didukung.")
+        stored_name = stored_upload_name(extension)
+        relative = f"{project_id}/media/{stored_name}"
+        destination = self.resolve(relative)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with destination.open("wb") as target:
+                while chunk := await upload.read(CHUNK_SIZE):
+                    size += len(chunk)
+                    if size > get_settings().max_upload_size_bytes:
+                        raise AppError(ErrorCode.FILE_TOO_LARGE, "Ukuran file melebihi batas.")
+                    digest.update(chunk)
+                    target.write(chunk)
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+        finally:
+            await upload.close()
+        return destination, size, digest.hexdigest(), stored_name
+
     def delete_project(self, project_id: uuid.UUID) -> None:
         project_dir = self.resolve(str(project_id))
         if not project_dir.exists():
@@ -112,3 +148,24 @@ class LocalStorageProvider:
             elif child.is_dir():
                 child.rmdir()
         project_dir.rmdir()
+
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+IMAGE_MIME_TYPES = {
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+    "image/bmp",
+    "image/x-ms-bmp",
+}
+MEDIA_KIND_EXTENSIONS: dict[str, set[str]] = {
+    "video": ALLOWED_EXTENSIONS,
+    "audio": AUDIO_EXTENSIONS,
+    "image": IMAGE_EXTENSIONS,
+}
+MEDIA_KIND_MIME: dict[str, set[str]] = {
+    "video": ALLOWED_MIME_TYPES,
+    "audio": AUDIO_MIME_TYPES,
+    "image": IMAGE_MIME_TYPES,
+}

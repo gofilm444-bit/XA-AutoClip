@@ -39,4 +39,5 @@ class MockTranscriptionProvider:
             segments=segments,
             provider_name="mock",
             model_name="deterministic-id-v1",
+            text=" ".join(segment.text for segment in segments),
         )

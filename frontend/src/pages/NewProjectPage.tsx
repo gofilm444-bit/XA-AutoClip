@@ -1,9 +1,10 @@
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useForm } from "react-hook-form";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { z } from "zod";
 import { api, upload } from "../api/client";
+import { useBlankManualEditor } from "../hooks/useBlankManualEditor";
 import { WorkflowSteps } from "../components/WorkflowSteps";
 import type { Project } from "../types";
 
@@ -15,6 +16,15 @@ type SourceMetadata = {
   site_name: string | null;
   thumbnail_url: string | null;
   is_direct_media: boolean;
+};
+
+type ManualEditorResult = {
+  project_id: string;
+  candidate_id: string;
+  transformation_id: string;
+  editor_url: string;
+  status: string;
+  duration: number;
 };
 
 const schema = z
@@ -55,6 +65,10 @@ function fileSize(size: number) {
 
 export function NewProjectPage() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const autoClipEntry = searchParams.get("mode") === "autoclip";
+  const manualEditor = useBlankManualEditor();
+  const startedBlankRef = useRef(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const [progress, setProgress] = useState(0);
   const [submissionStage, setSubmissionStage] = useState("");
@@ -64,7 +78,15 @@ export function NewProjectPage() {
   const [dragging, setDragging] = useState(false);
   const [language, setLanguage] = useState("auto");
   const [contentType, setContentType] = useState<"podcast" | "sports">("podcast");
-  const [getAiClips, setGetAiClips] = useState(true);
+  const [getAiClips, setGetAiClips] = useState(autoClipEntry);
+  const manualEditorMode = !getAiClips;
+
+  useEffect(() => {
+    if (manualEditorMode && !startedBlankRef.current) {
+      startedBlankRef.current = true;
+      manualEditor.mutate();
+    }
+  }, [manualEditorMode, manualEditor]);
   const form = useForm<FormData>({
     resolver: zodResolver(schema),
     defaultValues: {
@@ -152,8 +174,10 @@ export function NewProjectPage() {
             source_description: sourceDescription,
             source_url: values.source_url || null,
             license_type: null,
-            intended_use: "Analisis dan komentar substantif dengan kontribusi kreator.",
-            transformation_purpose: "analysis",
+            intended_use: getAiClips
+              ? "Analisis dan komentar substantif dengan kontribusi kreator."
+              : "Penyuntingan manual video oleh pengguna.",
+            transformation_purpose: getAiClips ? "analysis" : "other",
             user_acknowledged: true,
           },
         }),
@@ -173,8 +197,15 @@ export function NewProjectPage() {
       if (getAiClips) {
         setSubmissionStage("Memulai analisis AI...");
         await api(`/api/projects/${project.id}/process`, { method: "POST" });
+        navigate(`/projects/${project.id}`);
+      } else {
+        setSubmissionStage("Menyiapkan editor manual...");
+        const manualEditor = await api<ManualEditorResult>(
+          `/api/projects/${project.id}/manual-editor`,
+          { method: "POST" },
+        );
+        navigate(manualEditor.editor_url);
       }
-      navigate(`/projects/${project.id}`);
     } catch (error) {
       setServerError(error instanceof Error ? error.message : "Proyek gagal dibuat.");
       setSubmissionStage("");
@@ -199,13 +230,46 @@ export function NewProjectPage() {
           );
         })}
       >
+        <fieldset className="mb-6 grid gap-3 sm:grid-cols-2">
+          <legend className="sr-only">Pilih mode proyek</legend>
+          <button
+            type="button"
+            className={`border-l-4 px-4 py-3 text-left transition ${
+              manualEditorMode
+                ? "border-emerald-500 bg-emerald-50 text-slate-950"
+                : "border-slate-300 bg-white text-slate-600 hover:bg-slate-50"
+            }`}
+            onClick={() => setGetAiClips(false)}
+          >
+            <strong className="block">Edit Video Sendiri</strong>
+            <span className="mt-1 block text-xs">Tanpa AI - langsung editor</span>
+          </button>
+          <button
+            type="button"
+            className={`border-l-4 px-4 py-3 text-left transition ${
+              getAiClips
+                ? "border-violet-500 bg-violet-50 text-slate-950"
+                : "border-slate-300 bg-white text-slate-600 hover:bg-slate-50"
+            }`}
+            onClick={() => setGetAiClips(true)}
+          >
+            <strong className="block">AutoClip Video Panjang</strong>
+            <span className="mt-1 block text-xs">AI mencari kandidat klip terbaik</span>
+          </button>
+        </fieldset>
         {!inputReady ? (
           <div className="space-y-5 pt-8">
             <div className="text-center">
-              <p className="text-sm font-bold text-violet-600">Tahap 1</p>
-              <h1 className="mt-2 text-3xl font-black">Masukkan video Anda</h1>
+              <p className="text-sm font-bold text-violet-600">
+                {manualEditorMode ? "Tanpa AI - langsung editor" : "AutoClip dengan AI"}
+              </p>
+              <h1 className="mt-2 text-3xl font-black">
+                {manualEditorMode ? "Edit Video Sendiri" : "Masukkan video panjang"}
+              </h1>
               <p className="mt-2 text-slate-500">
-                Tempel link YouTube atau upload file video yang akan dibuat menjadi klip.
+                {manualEditorMode
+                  ? "Upload atau tempel link video untuk langsung masuk editor tanpa AI."
+                  : "Tempel link atau upload video. AI akan mencari kandidat klip terbaik."}
               </p>
             </div>
 
@@ -270,7 +334,7 @@ export function NewProjectPage() {
           </div>
         ) : (
           <div className="mx-auto max-w-2xl space-y-4 pt-10">
-            <div>
+            {getAiClips && <div>
               <p className="mb-3 text-sm font-bold text-slate-600">Jenis video</p>
               <div className="grid gap-3 sm:grid-cols-2">
                 <button
@@ -302,7 +366,7 @@ export function NewProjectPage() {
                   </span>
                 </button>
               </div>
-            </div>
+            </div>}
 
             <div className="rounded-2xl bg-slate-100 p-4">
               <div className="flex items-center gap-4">
@@ -411,7 +475,7 @@ export function NewProjectPage() {
               </div>
             </div>
 
-            <label className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white p-4">
+            {getAiClips && <label className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white p-4">
               <span className="text-sm font-black text-violet-600">AUTO</span>
               <span className="flex-1 font-semibold">
                 {contentType === "sports" ? "Bahasa komentator" : "Bahasa video"}
@@ -425,9 +489,9 @@ export function NewProjectPage() {
                 <option value="id">Bahasa Indonesia</option>
                 <option value="en">English</option>
               </select>
-            </label>
+            </label>}
 
-            <button
+            {getAiClips && <button
               type="button"
               className="flex w-full items-center gap-3 rounded-2xl border border-slate-200 bg-white p-4 text-left"
             >
@@ -438,18 +502,22 @@ export function NewProjectPage() {
                   : "Upload file subtitle"}
               </span>
               <span className="ml-auto text-sm text-slate-400">Opsional</span>
-            </button>
+            </button>}
 
-            <label className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white p-4">
-              <span className="text-sm font-black text-violet-600">AI</span>
-              <span className="flex-1 font-semibold">Buat klip dengan AI</span>
-              <input
-                type="checkbox"
-                className="size-6 w-6 accent-violet-600"
-                checked={getAiClips}
-                onChange={(event) => setGetAiClips(event.target.checked)}
-              />
-            </label>
+            <div className={`border-l-4 p-4 text-sm ${
+              manualEditorMode
+                ? "border-emerald-500 bg-emerald-50 text-emerald-900"
+                : "border-violet-500 bg-violet-50 text-violet-900"
+            }`}>
+              <strong className="block">
+                {manualEditorMode ? "Tanpa AI - langsung editor" : "AutoClip dengan AI"}
+              </strong>
+              <span className="mt-1 block">
+                {manualEditorMode
+                  ? "Video langsung disiapkan sebagai media utama di timeline editor."
+                  : "Video diproses untuk transkripsi dan pencarian kandidat klip terbaik."}
+              </span>
+            </div>
 
             <p className="rounded-xl bg-amber-50 p-3 text-xs text-amber-800">
               Dengan memproses video, Anda menyatakan memiliki hak atau alasan
@@ -463,13 +531,17 @@ export function NewProjectPage() {
             )}
             <button
               className="btn w-full py-4 text-lg"
-              disabled={form.formState.isSubmitting || !getAiClips}
+              disabled={form.formState.isSubmitting}
             >
               {form.formState.isSubmitting
                 ? submissionStage || "Memproses..."
-                : selectedFile
-                  ? "Upload dan buat klip"
-                  : "Unduh dan buat klip"}
+                : getAiClips
+                  ? selectedFile
+                    ? "Upload dan buat klip"
+                    : "Unduh dan buat klip"
+                  : selectedFile
+                    ? "Upload dan buka editor"
+                    : "Unduh dan buka editor"}
             </button>
           </div>
         )}

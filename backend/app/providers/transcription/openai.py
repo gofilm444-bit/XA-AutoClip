@@ -63,6 +63,7 @@ class OpenAITranscriptionProvider:
             segments=segments,
             provider_name="openai",
             model_name=model,
+            text=" ".join(segment.text for segment in segments),
         )
 
 

@@ -1,9 +1,12 @@
 import json
+import math
+import re
 import subprocess
 import unicodedata
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import structlog
@@ -12,11 +15,35 @@ from app.core.config import get_settings
 from app.core.errors import AppError, ErrorCode
 from app.services.clipper_style import (
     normalize_audio_settings,
+    normalize_video_framing,
     sanitize_keyword_text,
     validate_effect_timeline,
 )
+from app.services.hook_safe_area import resolve_hook_safe_area
+from app.services.render_plan import resolve_hook_render_model
+from app.services.text_styles import (
+    ExportTextStyle,
+    ffmpeg_color,
+    resolve_export_text_style,
+    resolve_hook_export_style,
+    transform_export_text,
+)
 
 logger = structlog.get_logger()
+
+
+def _caption_subtitle_filter(subtitle_path: Path | None) -> str:
+    if not subtitle_path:
+        return ""
+    escaped_subtitle = str(subtitle_path).replace("\\", "/").replace(":", "\\:")
+    return f",subtitles='{escaped_subtitle}'"
+
+
+def _ffmpeg_speed(stderr: str | None) -> str | None:
+    if not stderr:
+        return None
+    matches = re.findall(r"\bspeed=\s*([^\s]+)", stderr)
+    return matches[-1] if matches else None
 
 
 @dataclass(frozen=True)
@@ -29,7 +56,17 @@ class MediaMetadata:
     has_audio: bool
 
 
+@dataclass(frozen=True)
+class AudioMixSource:
+    path: Path
+    start: float = 0.0
+    end: float | None = None
+    volume: float = 1.0
+    label: str = "audio"
+
+
 def _run(command: list[str], error_code: ErrorCode) -> subprocess.CompletedProcess[str]:
+    started_at = perf_counter()
     try:
         logger.info("media_command_start", command=command)
         result = subprocess.run(
@@ -43,11 +80,17 @@ def _run(command: list[str], error_code: ErrorCode) -> subprocess.CompletedProce
             "media_command_completed",
             command=command,
             returncode=result.returncode,
+            duration_seconds=round(perf_counter() - started_at, 3),
+            ffmpeg_speed=_ffmpeg_speed(result.stderr) if command and command[0] == "ffmpeg" else None,
             stderr=result.stderr[-4000:] if result.stderr else "",
         )
         return result
     except subprocess.TimeoutExpired as exc:
-        logger.warning("media_command_timeout", command=command)
+        logger.warning(
+            "media_command_timeout",
+            command=command,
+            duration_seconds=round(perf_counter() - started_at, 3),
+        )
         raise AppError(ErrorCode.JOB_TIMEOUT, "Proses media melewati batas waktu.") from exc
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         detail = ""
@@ -58,11 +101,22 @@ def _run(command: list[str], error_code: ErrorCode) -> subprocess.CompletedProce
                 "media_command_failed",
                 command=command,
                 returncode=exc.returncode,
+                duration_seconds=round(perf_counter() - started_at, 3),
+                ffmpeg_speed=(
+                    _ffmpeg_speed(exc.stderr)
+                    if command and command[0] == "ffmpeg"
+                    else None
+                ),
                 stdout=exc.stdout[-4000:] if exc.stdout else "",
                 stderr=exc.stderr[-4000:] if exc.stderr else "",
             )
         else:
-            logger.warning("media_command_missing", command=command, error=str(exc))
+            logger.warning(
+                "media_command_missing",
+                command=command,
+                error=str(exc),
+                duration_seconds=round(perf_counter() - started_at, 3),
+            )
         raise AppError(
             error_code,
             f"Proses media gagal. Periksa format dan codec file.{detail}",
@@ -107,6 +161,18 @@ def probe_media(path: Path) -> MediaMetadata:
         audio_sample_rate=int(audio["sample_rate"]) if audio and audio.get("sample_rate") else None,
         has_audio=audio is not None,
     )
+
+
+def probe_audio_duration(path: Path) -> float:
+    payload = probe_media_json(path)
+    audio = next(
+        (stream for stream in payload.get("streams", []) if stream.get("codec_type") == "audio"),
+        None,
+    )
+    duration = float(payload.get("format", {}).get("duration") or (audio or {}).get("duration") or 0)
+    if duration <= 0:
+        raise AppError(ErrorCode.MEDIA_PROBE_FAILED, "Durasi audio tidak valid.")
+    return duration
 
 
 def extract_audio(source: Path, destination: Path, has_audio: bool) -> None:
@@ -283,34 +349,32 @@ def _ffmpeg_text(text: str) -> str:
     )
 
 
-def _trim_words(text: str, max_words: int) -> str:
-    words = text.replace("\n", " ").split()
-    return " ".join(words[:max_words]).strip(" .,;:")
-
-
-def _wrap_overlay_text(text: str, width: int, fontsize: int, max_lines: int = 2) -> str:
-    words = _trim_words(text, 10).split()
-    if not words:
-        return ""
-    max_chars = max(12, min(28, int((width * 0.8) / max(fontsize * 0.52, 1))))
-    lines: list[str] = []
-    current = ""
-    for word in words:
-        candidate = f"{current} {word}".strip()
-        if current and len(candidate) > max_chars:
-            lines.append(current)
-            current = word
-            if len(lines) == max_lines - 1:
-                break
-        else:
-            current = candidate
-    if current and len(lines) < max_lines:
-        lines.append(current)
-    return "\n".join(lines[:max_lines])
-
-
 def _keyword_overlay_text(text: str) -> str:
     return sanitize_keyword_text(text.replace("_", " "), max_words=2)
+
+
+def _drawtext_style_options(style: ExportTextStyle, width: int) -> str:
+    scale = max(1.0, width / 540.0)
+    border_width = max(0, round(style.outline_width * 2 * scale))
+    shadow_offset = max(0, round(style.shadow_offset * scale))
+    font_name = f"{style.font_name} Bold" if style.bold else style.font_name
+    options = (
+        f"font='{_ffmpeg_text(font_name)}':"
+        f"fontcolor={ffmpeg_color(style.text_color)}:"
+        f"bordercolor={ffmpeg_color(style.outline_color)}:"
+        f"borderw={border_width}:"
+        f"shadowcolor={ffmpeg_color(style.shadow_color or '#000000')}:"
+        f"shadowx={shadow_offset}:shadowy={shadow_offset}:"
+    )
+    if style.background_color:
+        box_border = max(6, round(width * 0.015))
+        options += (
+            f"box=1:boxcolor={ffmpeg_color(style.background_color, style.background_opacity)}:"
+            f"boxborderw={box_border}:"
+        )
+    else:
+        options += "box=0:"
+    return options
 
 
 def layout_mode(preset: str) -> str:
@@ -333,41 +397,115 @@ def _style_filter_suffix(
     if not style_config:
         return ""
     suffix = ""
-    hook_events = [
-        event
-        for event in validate_effect_timeline(effect_timeline or [], 99999)
-        if event.get("type") == "hook_text" and event.get("text")
-    ]
-    if style_config.get("hook_text_enabled") and (hook_text or hook_events):
-        hook_fontsize = max(30, int(width * 0.07))
-        hook_border = max(10, int(width * 0.025))
-        hook_items = hook_events or [
-            {"start": 0.0, "end": 3.0, "text": hook_text}
-        ]
-        for event in hook_items[:2]:
-            hook_lines = _wrap_overlay_text(str(event.get("text") or hook_text), width, hook_fontsize)
-            if not hook_lines:
-                continue
-            start = float(event.get("start") or 0.0)
-            end = float(event.get("end") or 3.0)
-            suffix += (
-                ",drawtext="
-                f"text='{_ffmpeg_text(hook_lines)}':"
-                "x=max(w*0.10\\,(w-text_w)/2):y=h*0.10:"
-                f"fontsize={hook_fontsize}:fontcolor=white:"
-                "line_spacing=8:"
-                "box=1:boxcolor=black@0.45:"
-                f"boxborderw={hook_border}:"
-                f"enable='between(t,{start},{end})'"
+    validated_effects = validate_effect_timeline(effect_timeline or [], 99999)
+    hook_model = resolve_hook_render_model(style_config, validated_effects, hook_text)
+    logger.info(
+        "hook_render_decision",
+        hook_render_source=hook_model.source if hook_model else "none",
+        hook_event_count=hook_model.hook_event_count if hook_model else 0,
+        hook_selected_event_id=hook_model.event_id if hook_model else None,
+        hook_overlay_duplicate_suppressed=bool(
+            hook_model and hook_model.duplicate_suppressed
+        ),
+        hook_legacy_fallback_disabled=bool(
+            hook_model and hook_model.source == "editor_state"
+        ),
+    )
+    if hook_model and hook_model.duplicate_suppressed:
+        logger.info(
+            "hook_overlay_duplicate_suppressed",
+            hook_render_source=hook_model.source,
+            hook_event_count=hook_model.hook_event_count,
+            hook_selected_event_id=hook_model.event_id,
+        )
+        logger.info(
+            "hook_legacy_duplicate_suppressed",
+            hook_export_style_source=hook_model.source,
+            editor_state_version=style_config.get("editor_state_version", 0),
+            effect_timeline_initialized=style_config.get(
+                "effect_timeline_initialized",
+                False,
+            ),
+        )
+    if hook_model:
+        hook_size = str(style_config.get("hook_text_size") or "normal")
+        hook_fontsize = max(
+            26,
+            int(width * (0.065 if hook_size == "large" else 0.055)),
+        )
+        hook_position = str(style_config.get("hook_text_position") or "safe_top")
+        hook_style, hook_style_binding, hook_style_fallbacks = (
+            resolve_hook_export_style(style_config)
+        )
+        raw_hook_text = " ".join(hook_model.text.split())
+        styled_hook_text = transform_export_text(raw_hook_text, hook_style)
+        hook_safe_area = resolve_hook_safe_area(
+            hook_position,
+            hook_fontsize,
+            styled_hook_text,
+            width,
+            height,
+        )
+        if styled_hook_text:
+            start = hook_model.start
+            end = hook_model.end
+            line_height = round(hook_safe_area.font_size_px * 1.12)
+            for line_index, line in enumerate(hook_safe_area.lines):
+                line_y = hook_safe_area.top_px + line_index * line_height
+                suffix += (
+                    ",drawtext="
+                    f"text='{_ffmpeg_text(line)}':"
+                    "x=max(w*0.09\\,min((w-text_w)/2\\,w*0.91-text_w)):"
+                    f"y={line_y}:"
+                    f"fontsize={hook_safe_area.font_size_px}:"
+                    f"{_drawtext_style_options(hook_style, width)}"
+                    f"enable='between(t,{start},{end})'"
+                )
+            logger.info(
+                "hook_text_safe_layout_export_applied",
+                preset=hook_style.key,
+                font_name=hook_style.font_name,
+                position=hook_position,
+                hook_safe_width=hook_safe_area.safe_width_px,
+                hook_text_width_estimated=hook_safe_area.text_width_estimated,
+                hook_wrap_applied=hook_safe_area.wrap_applied,
+                hook_horizontal_clamped=hook_safe_area.horizontal_clamped,
+                hook_wrapped_text_preview=hook_safe_area.wrapped_text[:160],
+                hook_line_count=hook_safe_area.line_count,
+                hook_truncated=hook_safe_area.truncated,
+                hook_font_size_requested=hook_fontsize,
+                hook_font_size_resolved=hook_safe_area.font_size_px,
+                hook_font_size_clamped_reason=(
+                    hook_safe_area.font_size_clamped_reason
+                ),
+                hook_clamped_to_safe_area=hook_safe_area.clamped,
+                hook_render_source=hook_model.source,
+                hook_export_style_source=hook_style_binding,
+                hook_style_binding=hook_style_binding,
+                hook_export_preset=hook_style.key,
+                hook_export_position=hook_position,
+                hook_export_font_size=hook_safe_area.font_size_px,
+                hook_export_color=hook_style.text_color,
+                hook_export_background={
+                    "color": hook_style.background_color,
+                    "opacity": hook_style.background_opacity,
+                },
+                hook_export_text_preview=raw_hook_text[:120],
+                hook_export_style_fallback=list(hook_style_fallbacks) or None,
+                hook_event_count=hook_model.hook_event_count,
+                hook_selected_event_id=hook_model.event_id,
+                hook_legacy_fallback_disabled=hook_model.source == "editor_state",
             )
     popup_events = [
         event
-        for event in validate_effect_timeline(effect_timeline or [], 99999)
+        for event in validated_effects
         if event.get("type") == "keyword_popup" and event.get("text")
     ]
-    if style_config.get("keyword_popup_enabled"):
-        keyword_fontsize = max(28, int(width * 0.075))
-        keyword_border = max(8, int(width * 0.018))
+    if popup_events or style_config.get("keyword_popup_enabled"):
+        keyword_fontsize = max(24, int(width * 0.055))
+        keyword_style = resolve_export_text_style(
+            style_config.get("keyword_text_style_preset") or "yellow_viral"
+        )
         if popup_events:
             keyword_items = [
                 (
@@ -386,15 +524,22 @@ def _style_filter_suffix(
             keyword_text = _keyword_overlay_text(keyword)
             if not keyword_text:
                 continue
+            keyword_text = transform_export_text(keyword_text, keyword_style)
             suffix += (
                 ",drawtext="
                 f"text='{_ffmpeg_text(keyword_text)}':"
                 "x=max(w*0.12\\,(w-text_w)/2):y=h*0.68:"
-                f"fontsize={keyword_fontsize}:fontcolor=yellow:"
-                "box=1:boxcolor=black@0.42:"
-                f"boxborderw={keyword_border}:"
+                f"fontsize={keyword_fontsize}:"
+                f"{_drawtext_style_options(keyword_style, width)}"
                 f"enable='between(t,{start},{end})'"
             )
+        logger.info(
+            "keyword_text_style_export_applied",
+            preset=keyword_style.key,
+            font_name=keyword_style.font_name,
+            event_count=min(3, len(keyword_items)),
+            font_size=keyword_fontsize,
+        )
     return suffix
 
 
@@ -512,6 +657,99 @@ def _audio_filter(style_config: dict[str, Any] | None, duration: float) -> str:
     return ",".join(filters)
 
 
+def _audio_mix_filter(
+    source_count: int,
+    master_duration: float,
+    starts: list[float],
+    ends: list[float | None],
+    volumes: list[float],
+) -> str:
+    if source_count <= 0:
+        return (
+            f"anullsrc=r=48000:cl=stereo,atrim=duration={master_duration:.3f},"
+            "asetpts=PTS-STARTPTS[finalaudio]"
+        )
+    labels: list[str] = []
+    for index in range(source_count):
+        input_label = f"[{index}:a]"
+        output_label = f"[mix{index}]"
+        delay = max(0.0, float(starts[index]))
+        volume = max(0.0, min(2.0, float(volumes[index])))
+        source_duration = max(
+            0.01,
+            min(
+                master_duration - delay,
+                (float(ends[index]) if ends[index] is not None else master_duration) - delay,
+            ),
+        )
+        filters = [
+            f"atrim=duration={source_duration:.3f}",
+            "asetpts=PTS-STARTPTS",
+            f"volume={volume:.3f}",
+        ]
+        if delay > 0:
+            filters.append(f"adelay={delay * 1000:.0f}:all=1")
+        filters.extend(
+            [
+                f"atrim=duration={master_duration:.3f}",
+                "asetpts=PTS-STARTPTS",
+            ]
+        )
+        labels.append(output_label)
+        yield_filter = f"{input_label}{','.join(filters)}{output_label}"
+        if index == 0:
+            graph = yield_filter
+        else:
+            graph += f";{yield_filter}"
+    joined = "".join(labels)
+    return (
+        f"{graph};{joined}amix=inputs={source_count}:duration=longest:dropout_transition=0,"
+        f"atrim=duration={master_duration:.3f},asetpts=PTS-STARTPTS[finalaudio]"
+    )
+
+
+def _center_crop_filter_chain(
+    width: int,
+    height: int,
+    style_config: dict[str, Any] | None,
+) -> str:
+    framing = normalize_video_framing((style_config or {}).get("video_framing"))
+    scaled_width = max(2, math.ceil(width * framing["scale"] / 2) * 2)
+    scaled_height = max(2, math.ceil(height * framing["scale"] / 2) * 2)
+    crop_x_ratio = 0.5 - framing["x"] / 80.0
+    crop_y_ratio = 0.5 - framing["y"] / 80.0
+    return (
+        f"scale={scaled_width}:{scaled_height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height}:(iw-{width})*{crop_x_ratio:.6f}:"
+        f"(ih-{height})*{crop_y_ratio:.6f},setsar=1"
+    )
+
+
+def _blurred_background_filter_graph(
+    width: int,
+    height: int,
+    style_config: dict[str, Any] | None,
+    output_label: str = "base",
+) -> str:
+    framing = normalize_video_framing((style_config or {}).get("video_framing"))
+    foreground_scale = ""
+    if framing["scale"] > 1.0:
+        foreground_scale = (
+            f",scale=trunc(iw*{framing['scale']:.6f}/2)*2:"
+            f"trunc(ih*{framing['scale']:.6f}/2)*2"
+        )
+    overlay_x = f"(W-w)/2+w*{framing['x'] / 100.0:.6f}"
+    overlay_y = f"(H-h)/2+h*{framing['y'] / 100.0:.6f}"
+    return (
+        f"[0:v]split[bg][fg];"
+        f"[bg]scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},boxblur=20[blur];"
+        f"[fg]scale={width}:{height}:force_original_aspect_ratio=decrease"
+        f"{foreground_scale}[front];"
+        f"[blur][front]overlay={overlay_x}:{overlay_y},setsar=1[{output_label}]"
+    )
+
+
 def render_vertical(
     source: Path,
     destination: Path,
@@ -526,12 +764,14 @@ def render_vertical(
     hook_text: str = "",
     keywords: list[str] | None = None,
     effect_timeline: list[dict[str, Any]] | None = None,
+    audio_mix_sources: list[AudioMixSource] | None = None,
 ) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     subtitle_filter = ""
     if subtitle_path:
         escaped_subtitle = str(subtitle_path).replace("\\", "/").replace(":", "\\:")
         subtitle_filter = f",subtitles='{escaped_subtitle}'"
+    subtitle_filter = _caption_subtitle_filter(subtitle_path)
     style_filter = _style_filter_suffix(
         style_config,
         width,
@@ -541,12 +781,9 @@ def render_vertical(
         effect_timeline,
     )
     output_suffix = f"{style_filter}{subtitle_filter}"
+    video_framing = normalize_video_framing((style_config or {}).get("video_framing"))
     if preset == "center_crop":
-        video_filter = (
-            f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height}:(iw-{width})/2:(ih-{height})/2,"
-            "setsar=1[base]"
-        )
+        video_filter = f"[0:v]{_center_crop_filter_chain(width, height, style_config)}[base]"
     elif preset == "fit_background":
         video_filter = (
             f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
@@ -564,12 +801,7 @@ def render_vertical(
             "[blur][front]overlay=(W-w)/2:H-h-100,setsar=1[base]"
         )
     else:
-        video_filter = (
-            f"[0:v]split[bg][fg];[bg]scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height},boxblur=20[blur];"
-            f"[fg]scale={width}:{height}:force_original_aspect_ratio=decrease[front];"
-            "[blur][front]overlay=(W-w)/2:(H-h)/2,setsar=1[base]"
-        )
+        video_filter = _blurred_background_filter_graph(width, height, style_config)
     base_label = "base"
     if (style_config or {}).get("video_track_deleted"):
         video_filter = (
@@ -592,6 +824,7 @@ def render_vertical(
         layout_mode=layout_mode(preset),
         target_width=width,
         target_height=height,
+        video_framing=video_framing,
         video_filter=video_filter,
         effect_timeline=effect_timeline or [],
         punch_event_count=len(punch_events),
@@ -604,8 +837,11 @@ def render_vertical(
         "-i",
         str(source),
     ]
+    mix_sources = list(audio_mix_sources or [])
     if voiceover:
         command.extend(["-i", str(voiceover)])
+    for audio_source in mix_sources:
+        command.extend(["-i", str(audio_source.path)])
     command.extend(
         [
             "-t",
@@ -616,7 +852,33 @@ def render_vertical(
     )
     command.extend(["-map", "[vout]"])
     audio_filter = _audio_filter(style_config, duration)
-    if voiceover:
+    if mix_sources:
+        input_sources = [
+            AudioMixSource(voiceover, label="base_audio")
+            if voiceover
+            else AudioMixSource(source, label="video_audio")
+        ] + mix_sources
+        starts = [item.start for item in input_sources]
+        ends = [item.end for item in input_sources]
+        volumes = [1.0 for item in input_sources]
+        if style_config:
+            volumes[0] = 1.0
+        volumes[1:] = [item.volume for item in mix_sources]
+        audio_filter_graph = _audio_mix_filter(
+            len(input_sources), duration, starts, ends, volumes
+        )
+        input_offset = 1 if voiceover else 0
+        for index in range(len(input_sources) - 1, -1, -1):
+            audio_filter_graph = audio_filter_graph.replace(
+                f"[{index}:a]", f"[{index + input_offset}:a]"
+            )
+        audio_filter_graph = audio_filter_graph.replace(
+            "[finalaudio]", f",{audio_filter}[finalaudio]"
+        )
+        filter_complex_index = command.index("-filter_complex") + 1
+        command[filter_complex_index] = f"{video_filter};{audio_filter_graph}"
+        command.extend(["-map", "[finalaudio]"])
+    elif voiceover:
         command.extend(
             [
                 "-map",
@@ -660,17 +922,21 @@ def render_clean_vertical(
     subtitle_path: Path | None = None,
     style_config: dict[str, Any] | None = None,
     audio_source: Path | None = None,
+    audio_mix_sources: list[AudioMixSource] | None = None,
 ) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
+    video_framing = normalize_video_framing((style_config or {}).get("video_framing"))
     subtitle_filter = ""
     if subtitle_path:
         escaped_subtitle = str(subtitle_path).replace("\\", "/").replace(":", "\\:")
         subtitle_filter = f",subtitles='{escaped_subtitle}'"
+    subtitle_filter = _caption_subtitle_filter(subtitle_path)
     deleted_video_filter = (
         ",drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill"
         if (style_config or {}).get("video_track_deleted")
         else ""
     )
+    uses_complex_video_filter = False
     if preset == "fit_background":
         video_filter = (
             f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
@@ -679,9 +945,14 @@ def render_clean_vertical(
         )
     elif preset == "center_crop":
         video_filter = (
-            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height}:(iw-{width})/2:(ih-{height})/2,setsar=1"
+            f"{_center_crop_filter_chain(width, height, style_config)}"
             f"{deleted_video_filter}{subtitle_filter}"
+        )
+    elif preset == "blurred_background":
+        uses_complex_video_filter = True
+        video_filter = (
+            f"{_blurred_background_filter_graph(width, height, style_config)};"
+            f"[base]null{deleted_video_filter}{subtitle_filter}[vout]"
         )
     else:
         video_filter = (
@@ -695,6 +966,7 @@ def render_clean_vertical(
         layout_mode=layout_mode(preset),
         target_width=width,
         target_height=height,
+        video_framing=video_framing,
         video_filter=video_filter,
     )
     command = [
@@ -707,33 +979,64 @@ def render_clean_vertical(
     ]
     if audio_source:
         command.extend(["-i", str(audio_source)])
+    mix_sources = list(audio_mix_sources or [])
+    for audio_mix_source in mix_sources:
+        command.extend(["-i", str(audio_mix_source.path)])
+    if mix_sources:
+        input_sources = [
+            AudioMixSource(audio_source, label="base_audio")
+            if audio_source
+            else AudioMixSource(source, label="video_audio")
+        ] + mix_sources
+        audio_filter_graph = _audio_mix_filter(
+            len(input_sources),
+            duration,
+            [item.start for item in input_sources],
+            [item.end for item in input_sources],
+            [1.0, *[item.volume for item in mix_sources]],
+        )
+        input_offset = 1 if audio_source else 0
+        for index in range(len(input_sources) - 1, -1, -1):
+            audio_filter_graph = audio_filter_graph.replace(
+                f"[{index}:a]", f"[{index + input_offset}:a]"
+            )
+        audio_filter_graph = audio_filter_graph.replace(
+            "[finalaudio]", f",{_audio_filter(style_config, duration)}[finalaudio]"
+        )
+        if uses_complex_video_filter:
+            video_filter = f"{video_filter};{audio_filter_graph}"
+        else:
+            video_filter = f"[0:v]{video_filter}[vout];{audio_filter_graph}"
+            uses_complex_video_filter = True
+    video_filter_args = (
+        ["-filter_complex", video_filter, "-map", "[vout]"]
+        if uses_complex_video_filter
+        else ["-vf", video_filter, "-map", "0:v:0"]
+    )
     command.extend(
         [
-        "-t",
-        str(duration),
-        "-vf",
-        video_filter,
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0" if audio_source else "0:a?",
-        "-af",
-        _audio_filter(style_config, duration),
-        "-r",
-        "30",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "160k",
-        "-movflags",
-        "+faststart",
-        str(destination),
+            "-t",
+            str(duration),
+            *video_filter_args,
+            "-map",
+            "[finalaudio]" if mix_sources else ("1:a:0" if audio_source else "0:a?"),
+            "-af",
+            _audio_filter(style_config, duration),
+            "-r",
+            "30",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-movflags",
+            "+faststart",
+            str(destination),
         ]
     )
     _run(command, ErrorCode.RENDER_FAILED)

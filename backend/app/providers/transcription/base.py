@@ -19,6 +19,7 @@ class TranscriptionResult:
     segments: list[TranscriptionSegment]
     provider_name: str
     model_name: str
+    text: str = ""
 
 
 class TranscriptionProvider(Protocol):

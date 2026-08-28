@@ -12,6 +12,7 @@ export type Project = {
   total_top_clips?: number;
   final_clips_count?: number;
   storage_size_estimate?: number;
+  manual_editor_url?: string | null;
 };
 
 export type Candidate = {
@@ -73,13 +74,45 @@ export type Transformation = {
 
 export type ClipperStyleConfig = {
   clipper_style_preset: string;
+  manual_editor_mode?: boolean;
   hook_text: string;
   hook_text_enabled: boolean;
+  hook_text_template?:
+    | "capcut_clean"
+    | "neon_text"
+    | "soft_gradient_text"
+    | "minimal_white"
+    | "yellow_viral"
+    | "elegant_modern"
+    | "headline_bold"
+    | "glass_card"
+    | "breaking_news"
+    | "clean_top"
+    | "highlight_box";
+  hook_text_position?: "safe_top" | "top" | "upper_center";
+  hook_text_size?: "normal" | "large";
+  hook_text_style_preset?: TextStylePresetKey;
+  hook_text_color?: string;
+  hook_text_font_weight?: string | number;
+  hook_text_outline_color?: string;
+  hook_text_outline_width?: number;
+  hook_text_background_color?: string;
+  hook_text_background_opacity?: number;
+  hook_text_font?:
+    | "bold_sans"
+    | "elegant_serif"
+    | "modern_rounded"
+    | "condensed_news"
+    | "playful"
+    | "clean_sans";
+  keyword_text_style_preset?: TextStylePresetKey;
   caption_mode: "short";
   caption_max_words: number;
   caption_max_chars: number;
   caption_style?: {
     preset: string;
+    textPreset?: TextStylePresetKey;
+    displayMode?: "segment" | "karaoke" | "word_by_word";
     fontSize: "small" | "medium" | "large";
     fontWeight: "normal" | "semibold" | "bold";
     position: "bottom" | "center_lower" | "center" | "top";
@@ -134,12 +167,18 @@ export type ClipperStyleConfig = {
   audio_extracted?: boolean;
   video_track_deleted?: boolean;
   audio_track_deleted?: boolean;
+  video_framing?: {
+    x: number;
+    y: number;
+    scale: number;
+  };
   editor_state_version?: number;
   video_sequence_initialized?: boolean;
   audio_sequence_initialized?: boolean;
   caption_timeline_initialized?: boolean;
+  caption_sync_required?: boolean;
   effect_timeline_initialized?: boolean;
-  layer_order?: Array<"caption" | "hook" | "keyword" | "punch" | "pattern" | "video" | "audio">;
+  layer_order?: Array<"caption" | "hook" | "keyword" | "video">;
   track_order?: Array<"caption" | "hook" | "keyword" | "punch" | "pattern" | "video" | "audio">;
   editor_preferences?: {
     timeline_height?: number;
@@ -177,8 +216,65 @@ export type ClipperStyleConfig = {
     end: number;
     text: string;
   }>;
+  editor_image_assets?: Array<{
+    id: string;
+    name: string;
+    url: string;
+    kind: string;
+  }>;
   render_preset?: "blurred_background" | "center_crop" | "fit_background" | "picture_in_picture";
 };
+
+export type EditorMediaAsset = {
+  asset_id: string;
+  kind: "video" | "audio" | "image";
+  name: string;
+  url: string;
+  duration_seconds: number | null;
+  width: number | null;
+  height: number | null;
+  size_bytes: number;
+  mime_type: string;
+};
+
+export type TextStylePresetKey =
+  | "default"
+  | "white_bold_shadow"
+  | "yellow_viral"
+  | "purple_pop"
+  | "black_white"
+  | "clean_white"
+  | "neon_green"
+  | "red_alert"
+  | "orange_highlight"
+  | "blue_creator"
+  | "pink_glow"
+  | "gold_premium"
+  | "minimal_serif"
+  | "modern_sans"
+  | "clean_creator"
+  | "red_news_bar"
+  | "podcast_quote"
+  | "documentary"
+  | "gaming_neon"
+  | "luxury_gold"
+  | "minimal_black"
+  | "white_bubble"
+  | "glass_card"
+  | "meme_impact"
+  | "breaking_news"
+  | "soft_pastel"
+  | "tech_blue"
+  | "horror_story"
+  | "comedy_pop"
+  | "elegant_serif"
+  | "street_bold"
+  | "caption_karaoke"
+  | "clean_subtitle_pro"
+  | "creator_orange"
+  | "authority_blue"
+  | "warning_alert"
+  | "simple_top_label";
 
 export type TransformationContext = {
   project_title: string;

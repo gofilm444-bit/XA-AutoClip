@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  type CSSProperties,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
@@ -11,13 +12,33 @@ import {
   useState,
 } from "react";
 import { Link, useNavigate, useOutletContext, useParams } from "react-router-dom";
-import { api, candidateVideoUrl, downloadUrl, upload, uploadedAudioUrl } from "../api/client";
+import { api, candidateVideoUrl, downloadUrl, mediaUrl, upload, uploadedAudioUrl, uploadMedia } from "../api/client";
 import type { LayoutOutletContext } from "../components/Layout";
 import type {
+  EditorMediaAsset,
   OriginalityReport,
   Transformation,
   TransformationContext,
 } from "../types";
+import { projectCaptionCues } from "../utils/captionProjection";
+import { sanitizeDownloadFilename } from "../utils/downloadFilename";
+import {
+  hasManualEditorTimelineVideo,
+  initialEditorContext,
+  isManualEditorTransformation,
+} from "../utils/manualEditor";
+import {
+  resolveHookPreviewRenderState,
+  resolveHookSafeArea,
+} from "../utils/hookSafeArea";
+import {
+  TEXT_STYLE_PRESETS,
+  getTextStylePreset,
+  normalizeTextStylePreset,
+  resolveHookTextStylePreset,
+  resolveTextOverlayStyle,
+  type TextStylePresetKey,
+} from "../utils/textStylePresets";
 
 type Render = {
   id: string;
@@ -43,11 +64,75 @@ type EffectTimelineEvent = {
   end: number;
   zoom?: number;
   text?: string;
+  title?: string;
+  content?: string;
   effect?: string;
   reason?: string;
 };
 
-type EditorContext = "video" | "audio" | "caption" | "hook" | "keyword" | "effect" | "timeline" | "render";
+type EditorContext = "media" | "video" | "audio" | "caption" | "hook" | "keyword" | "effect" | "timeline" | "render";
+type EditorMediaKind = "video" | "audio" | "image";
+
+const editorMediaInputConfig: Record<
+  EditorMediaKind,
+  { accept: string; label: string }
+> = {
+  video: {
+    accept: ".mp4,.mov,.webm,video/mp4,video/quicktime,video/webm",
+    label: "Import Video",
+  },
+  audio: {
+    accept: ".mp3,.wav,.m4a,audio/mpeg,audio/wav,audio/mp4",
+    label: "Import Audio",
+  },
+  image: {
+    accept: ".png,.jpg,.jpeg,.webp,.gif,image/png,image/jpeg,image/webp",
+    label: "Import Gambar",
+  },
+};
+
+export function EditorMediaImportControls({
+  className = "grid grid-cols-1 gap-2 sm:grid-cols-3",
+  disabled = false,
+  onImport,
+  uploadingKind = null,
+}: {
+  className?: string;
+  disabled?: boolean;
+  onImport: (kind: EditorMediaKind, file: File) => void | Promise<void>;
+  uploadingKind?: EditorMediaKind | null;
+}) {
+  return (
+    <div className={className}>
+      {(Object.keys(editorMediaInputConfig) as EditorMediaKind[]).map((kind) => {
+        const config = editorMediaInputConfig[kind];
+        return (
+          <label className="relative" key={kind}>
+            <span
+              className={`btn-secondary flex min-h-10 w-full cursor-pointer items-center justify-center px-3 py-2 text-center text-xs font-black ${
+                disabled ? "pointer-events-none opacity-50" : ""
+              }`}
+            >
+              {uploadingKind === kind ? "Mengimpor..." : `+ ${config.label}`}
+            </span>
+            <input
+              accept={config.accept}
+              aria-label={`+ ${config.label}`}
+              className="sr-only"
+              disabled={disabled}
+              onChange={(event) => {
+                const file = event.currentTarget.files?.[0];
+                if (file) void onImport(kind, file);
+                event.currentTarget.value = "";
+              }}
+              type="file"
+            />
+          </label>
+        );
+      })}
+    </div>
+  );
+}
 
 type AudioSettings = {
   volume: number;
@@ -55,6 +140,27 @@ type AudioSettings = {
   fade_in: number;
   fade_out: number;
 };
+
+type VideoFraming = {
+  x: number;
+  y: number;
+  scale: number;
+};
+
+const defaultVideoFraming: VideoFraming = { x: 0, y: 0, scale: 1 };
+
+function normalizeVideoFraming(value: unknown): VideoFraming {
+  const raw = value && typeof value === "object" ? (value as Partial<VideoFraming>) : {};
+  const finiteOr = (candidate: unknown, fallback: number) => {
+    const numeric = Number(candidate);
+    return Number.isFinite(numeric) ? numeric : fallback;
+  };
+  return {
+    x: Math.max(-40, Math.min(40, finiteOr(raw.x, defaultVideoFraming.x))),
+    y: Math.max(-40, Math.min(40, finiteOr(raw.y, defaultVideoFraming.y))),
+    scale: Math.max(1, Math.min(2, finiteOr(raw.scale, defaultVideoFraming.scale))),
+  };
+}
 
 type MediaTrim = {
   start: number;
@@ -102,25 +208,36 @@ type AdditionalAudioTrack = {
   volume: number;
 };
 
-type LayerTrack = "caption" | "hook" | "keyword" | "punch" | "pattern" | "video" | "audio";
+type TimelineTrackKey = "caption" | "hook" | "keyword" | "video" | "audio" | "punch" | "pattern";
+type VisualLayerTrack = "caption" | "hook" | "keyword" | "video";
 
-const defaultLayerOrder: LayerTrack[] = [
+const defaultTrackOrder: TimelineTrackKey[] = [
   "caption",
   "hook",
   "keyword",
-  "punch",
-  "pattern",
   "video",
   "audio",
+  "punch",
+  "pattern",
 ];
 
-function normalizeLayerOrder(value: unknown): LayerTrack[] {
+const defaultVisualLayerOrder: VisualLayerTrack[] = ["caption", "hook", "keyword", "video"];
+
+function normalizeOrderedTracks<T extends string>(value: unknown, defaults: readonly T[]): T[] {
   const configured = Array.isArray(value) ? value : [];
   const order = configured.filter(
-    (track, index): track is LayerTrack =>
-      defaultLayerOrder.includes(track as LayerTrack) && configured.indexOf(track) === index,
+    (track, index): track is T =>
+      defaults.includes(track as T) && configured.indexOf(track) === index,
   );
-  return [...order, ...defaultLayerOrder.filter((track) => !order.includes(track))];
+  return [...order, ...defaults.filter((track) => !order.includes(track))];
+}
+
+function normalizeTrackOrder(value: unknown): TimelineTrackKey[] {
+  return normalizeOrderedTracks(value, defaultTrackOrder);
+}
+
+function normalizeVisualLayerOrder(value: unknown): VisualLayerTrack[] {
+  return normalizeOrderedTracks(value, defaultVisualLayerOrder);
 }
 
 type TimelineItem = {
@@ -169,8 +286,51 @@ type CaptionStylePreset =
   | "yellow_pop"
   | "minimal_lower_third"
   | "karaoke_preview";
+type CaptionDisplayMode = "segment" | "karaoke" | "word_by_word";
+type HookTextTemplate =
+  | "capcut_clean"
+  | "neon_text"
+  | "soft_gradient_text"
+  | "minimal_white"
+  | "yellow_viral"
+  | "elegant_modern"
+  | "headline_bold"
+  | "glass_card"
+  | "breaking_news"
+  | "clean_top"
+  | "highlight_box";
+type HookTextPosition = "safe_top" | "top" | "upper_center";
+type HookTextSize = "normal" | "large";
+type HookTextFont =
+  | "bold_sans"
+  | "elegant_serif"
+  | "modern_rounded"
+  | "condensed_news"
+  | "playful"
+  | "clean_sans";
+type HookTemplateDefinition = {
+  value: HookTextTemplate;
+  label: string;
+  description: string;
+  containerClass: string;
+  textClass: string;
+  widthClass: string;
+  paddingClass: string;
+  lineClampClass: string;
+  badge?: string;
+  badgeClass?: string;
+  textShadow?: string;
+};
+type HookFontDefinition = {
+  value: HookTextFont;
+  label: string;
+  description: string;
+  fontFamily: string;
+};
 type CaptionStyleConfig = {
   preset: CaptionStylePreset;
+  textPreset: TextStylePresetKey;
+  displayMode: CaptionDisplayMode;
   fontSize: "small" | "medium" | "large";
   fontWeight: "normal" | "semibold" | "bold";
   position: "bottom" | "center_lower" | "center" | "top";
@@ -184,13 +344,224 @@ type CaptionStyleConfig = {
   maxChars: number;
   karaokeEnabled: boolean;
 };
+const MAX_CAPTION_WORDS = 5;
+const DEFAULT_CAPTION_TARGET_WORDS = 4;
 
-const presetOptions: Array<{ value: RenderPreset; label: string }> = [
-  { value: "blurred_background", label: "Latar buram" },
-  { value: "center_crop", label: "Potong tengah" },
-  { value: "fit_background", label: "Video penuh" },
-  { value: "picture_in_picture", label: "Picture in picture" },
+const presetOptions: Array<{ value: RenderPreset; label: string; description: string }> = [
+  {
+    value: "blurred_background",
+    label: "Latar buram",
+    description: "Video utuh dengan latar blur vertikal.",
+  },
+  {
+    value: "center_crop",
+    label: "Potong tengah",
+    description: "Memenuhi frame 9:16 dengan crop fokus tengah.",
+  },
+  {
+    value: "fit_background",
+    label: "Video penuh",
+    description: "Seluruh frame asli terlihat dengan mode contain.",
+  },
+  {
+    value: "picture_in_picture",
+    label: "Picture in picture",
+    description: "Video tampil sebagai inset di atas latar.",
+  },
 ];
+
+const hookTextTemplates: HookTemplateDefinition[] = [
+  {
+    value: "capcut_clean",
+    label: "CapCut Clean",
+    description: "Teks modern tanpa box untuk penggunaan umum.",
+    containerClass: "text-white",
+    textClass: "font-bold",
+    widthClass: "left-[11%] right-[11%]",
+    paddingClass: "px-1 py-1",
+    lineClampClass: "line-clamp-3",
+    textShadow: "0 2px 4px rgba(0,0,0,0.9)",
+  },
+  {
+    value: "neon_text",
+    label: "Neon Text",
+    description: "Cyan terang dengan glow tipis tanpa panel.",
+    containerClass: "text-cyan-300",
+    textClass: "font-bold",
+    widthClass: "left-[12%] right-[12%]",
+    paddingClass: "px-1 py-1",
+    lineClampClass: "line-clamp-3",
+    textShadow: "0 0 5px rgba(34,211,238,0.85), 0 2px 3px rgba(0,0,0,0.9)",
+  },
+  {
+    value: "soft_gradient_text",
+    label: "Soft Gradient Text",
+    description: "Aksen warna lembut untuk konten kreatif.",
+    containerClass: "text-white",
+    textClass: "bg-gradient-to-r from-fuchsia-200 via-white to-cyan-200 bg-clip-text font-bold text-transparent",
+    widthClass: "left-[11%] right-[11%]",
+    paddingClass: "px-1 py-1",
+    lineClampClass: "line-clamp-3",
+  },
+  {
+    value: "minimal_white",
+    label: "Minimal White",
+    description: "Putih minimal dengan shadow sangat ringan.",
+    containerClass: "text-white",
+    textClass: "font-semibold",
+    widthClass: "left-[13%] right-[13%]",
+    paddingClass: "px-1 py-1",
+    lineClampClass: "line-clamp-3",
+    textShadow: "0 1px 3px rgba(0,0,0,0.85)",
+  },
+  {
+    value: "yellow_viral",
+    label: "Yellow Viral",
+    description: "Kuning cerah tanpa box untuk hook singkat.",
+    containerClass: "text-yellow-300",
+    textClass: "font-black",
+    widthClass: "left-[12%] right-[12%]",
+    paddingClass: "px-1 py-1",
+    lineClampClass: "line-clamp-2",
+    textShadow: "0 2px 3px rgba(0,0,0,0.95)",
+  },
+  {
+    value: "elegant_modern",
+    label: "Elegant Modern",
+    description: "Teks lembut untuk tema formal dan premium.",
+    containerClass: "text-rose-100",
+    textClass: "font-semibold",
+    widthClass: "left-[13%] right-[13%]",
+    paddingClass: "px-1 py-1",
+    lineClampClass: "line-clamp-3",
+    textShadow: "0 2px 4px rgba(0,0,0,0.8)",
+  },
+  {
+    value: "headline_bold",
+    label: "Headline Bold",
+    description: "Headline tebal tanpa box berat.",
+    containerClass: "bg-black/25 text-white shadow-md",
+    textClass: "font-black uppercase",
+    widthClass: "left-[10%] right-[10%]",
+    paddingClass: "px-3 py-2",
+    lineClampClass: "line-clamp-3",
+    textShadow: "0 2px 5px rgba(0,0,0,0.95)",
+  },
+  {
+    value: "glass_card",
+    label: "Glass Card",
+    description: "Panel kaca ringan dan modern.",
+    containerClass: "border border-white/30 bg-white/15 text-white shadow-lg backdrop-blur-md",
+    textClass: "font-bold",
+    widthClass: "left-[10%] right-[10%]",
+    paddingClass: "px-3 py-2",
+    lineClampClass: "line-clamp-3",
+    textShadow: "0 2px 4px rgba(0,0,0,0.8)",
+  },
+  {
+    value: "breaking_news",
+    label: "Breaking News",
+    description: "Merah tegas untuk informasi penting.",
+    containerClass: "border-l-2 border-red-200 bg-red-700/95 text-white shadow-md",
+    textClass: "font-black uppercase",
+    widthClass: "left-[13%] right-[13%]",
+    paddingClass: "px-2.5 py-1.5",
+    lineClampClass: "line-clamp-2",
+    badge: "BREAKING",
+    badgeClass: "mb-0.5 text-[7px] leading-none tracking-wide opacity-85",
+  },
+  {
+    value: "clean_top",
+    label: "Clean Top",
+    description: "Minimal, tenang, dan mudah dibaca.",
+    containerClass: "bg-black/40 text-white shadow-md",
+    textClass: "font-semibold",
+    widthClass: "left-[12%] right-[12%]",
+    paddingClass: "px-2.5 py-1.5",
+    lineClampClass: "line-clamp-3",
+  },
+  {
+    value: "highlight_box",
+    label: "Highlight Box",
+    description: "Box kuning untuk poin utama.",
+    containerClass: "bg-yellow-300/95 text-slate-950 shadow-md",
+    textClass: "font-black",
+    widthClass: "left-[11%] right-[11%]",
+    paddingClass: "px-3 py-2",
+    lineClampClass: "line-clamp-3",
+  },
+];
+
+const hookTextFonts: HookFontDefinition[] = [
+  {
+    value: "bold_sans",
+    label: "Bold Sans",
+    description: "Kuat untuk konten umum dan viral.",
+    fontFamily: '"Arial Black", Arial, Helvetica, sans-serif',
+  },
+  {
+    value: "elegant_serif",
+    label: "Elegant Serif",
+    description: "Formal, editorial, dan elegan.",
+    fontFamily: 'Georgia, "Times New Roman", serif',
+  },
+  {
+    value: "modern_rounded",
+    label: "Modern Rounded",
+    description: "Ramah dengan bentuk huruf modern.",
+    fontFamily: '"Arial Rounded MT Bold", "Trebuchet MS", Arial, sans-serif',
+  },
+  {
+    value: "condensed_news",
+    label: "Condensed News",
+    description: "Padat untuk headline dan berita.",
+    fontFamily: '"Arial Narrow", Impact, "Segoe UI", sans-serif',
+  },
+  {
+    value: "playful",
+    label: "Playful",
+    description: "Santai untuk konten kreatif.",
+    fontFamily: '"Segoe Print", "Comic Sans MS", "Trebuchet MS", cursive',
+  },
+  {
+    value: "clean_sans",
+    label: "Clean Sans",
+    description: "Minimal dan mudah dibaca.",
+    fontFamily: '"Segoe UI", Inter, Arial, sans-serif',
+  },
+];
+
+function normalizeHookTextTemplate(value: unknown): HookTextTemplate {
+  return hookTextTemplates.some((template) => template.value === value)
+    ? (value as HookTextTemplate)
+    : "capcut_clean";
+}
+
+function normalizeHookTextFont(value: unknown): HookTextFont {
+  return hookTextFonts.some((font) => font.value === value)
+    ? (value as HookTextFont)
+    : "clean_sans";
+}
+
+function hookOverlayTextSizeClass(
+  text: string,
+  requestedSize: HookTextSize,
+  template: HookTextTemplate,
+) {
+  const wordCount = text.trim().split(/\s+/).filter(Boolean).length;
+  const characterCount = text.trim().length;
+  const isLong = characterCount > 52 || wordCount > 10;
+  const isMedium = characterCount > 36 || wordCount > 7;
+
+  if (template === "breaking_news") {
+    if (isLong) return "text-[10px] md:text-xs";
+    if (isMedium) return "text-xs md:text-sm";
+    return requestedSize === "large" ? "text-sm md:text-base" : "text-xs md:text-sm";
+  }
+  if (isLong) return "text-xs md:text-sm";
+  if (isMedium) return "text-sm md:text-base";
+  return requestedSize === "large" ? "text-base md:text-lg" : "text-sm md:text-base";
+}
 
 const defaultAudioSettings: AudioSettings = {
   volume: 1,
@@ -259,16 +630,18 @@ const captionStylePresets: Array<{
     description: "Putih rapi untuk podcast.",
     config: {
       preset: "clean_white",
+      textPreset: "default",
+      displayMode: "segment",
       fontSize: "medium",
       fontWeight: "semibold",
-      position: "bottom",
+      position: "center_lower",
       textColor: "#FFFFFF",
       highlightColor: "#FFD400",
-      outlineEnabled: true,
+      outlineEnabled: false,
       shadowEnabled: true,
       backgroundEnabled: false,
       backgroundOpacity: 0.55,
-      maxWords: 8,
+      maxWords: DEFAULT_CAPTION_TARGET_WORDS,
       maxChars: 45,
       karaokeEnabled: false,
     },
@@ -279,6 +652,8 @@ const captionStylePresets: Array<{
     description: "Tebal dan kuat.",
     config: {
       preset: "tiktok_bold",
+      textPreset: "default",
+      displayMode: "segment",
       fontSize: "large",
       fontWeight: "bold",
       position: "center_lower",
@@ -288,7 +663,7 @@ const captionStylePresets: Array<{
       shadowEnabled: true,
       backgroundEnabled: false,
       backgroundOpacity: 0.55,
-      maxWords: 8,
+      maxWords: DEFAULT_CAPTION_TARGET_WORDS,
       maxChars: 45,
       karaokeEnabled: false,
     },
@@ -299,16 +674,18 @@ const captionStylePresets: Array<{
     description: "Box aman untuk visual ramai.",
     config: {
       preset: "box_caption",
+      textPreset: "default",
+      displayMode: "segment",
       fontSize: "medium",
       fontWeight: "semibold",
-      position: "bottom",
+      position: "center_lower",
       textColor: "#FFFFFF",
       highlightColor: "#FFD400",
       outlineEnabled: false,
       shadowEnabled: false,
       backgroundEnabled: true,
       backgroundOpacity: 0.62,
-      maxWords: 8,
+      maxWords: DEFAULT_CAPTION_TARGET_WORDS,
       maxChars: 45,
       karaokeEnabled: false,
     },
@@ -319,6 +696,8 @@ const captionStylePresets: Array<{
     description: "Kuning ekspresif.",
     config: {
       preset: "yellow_pop",
+      textPreset: "default",
+      displayMode: "segment",
       fontSize: "large",
       fontWeight: "bold",
       position: "center_lower",
@@ -328,7 +707,7 @@ const captionStylePresets: Array<{
       shadowEnabled: true,
       backgroundEnabled: false,
       backgroundOpacity: 0.55,
-      maxWords: 8,
+      maxWords: DEFAULT_CAPTION_TARGET_WORDS,
       maxChars: 45,
       karaokeEnabled: false,
     },
@@ -339,16 +718,18 @@ const captionStylePresets: Array<{
     description: "Kecil dan tidak dominan.",
     config: {
       preset: "minimal_lower_third",
+      textPreset: "default",
+      displayMode: "segment",
       fontSize: "small",
       fontWeight: "normal",
-      position: "bottom",
+      position: "center_lower",
       textColor: "#F8FAFC",
       highlightColor: "#CBD5E1",
       outlineEnabled: false,
       shadowEnabled: true,
       backgroundEnabled: false,
       backgroundOpacity: 0.45,
-      maxWords: 8,
+      maxWords: DEFAULT_CAPTION_TARGET_WORDS,
       maxChars: 45,
       karaokeEnabled: false,
     },
@@ -359,6 +740,8 @@ const captionStylePresets: Array<{
     description: "Highlight kata simulasi.",
     config: {
       preset: "karaoke_preview",
+      textPreset: "default",
+      displayMode: "karaoke",
       fontSize: "medium",
       fontWeight: "bold",
       position: "center_lower",
@@ -368,7 +751,7 @@ const captionStylePresets: Array<{
       shadowEnabled: true,
       backgroundEnabled: false,
       backgroundOpacity: 0.55,
-      maxWords: 8,
+      maxWords: DEFAULT_CAPTION_TARGET_WORDS,
       maxChars: 45,
       karaokeEnabled: true,
     },
@@ -592,15 +975,12 @@ function isValidKeyword(text: string) {
   return words.some((word) => word.length >= 3 || /\d/.test(word));
 }
 
-function getSafeSubtitlePreview(text: string) {
+function getCaptionPreviewText(text: string) {
   const cleaned = text
     .replace(/^\[\d{2}:\d{2}\]\s*/, "")
     .replace(/\s+/g, " ")
     .trim();
-  if (!cleaned) return null;
-  if (cleaned.length > 45) return null;
-  if (cleaned.split(/\s+/).length > 8) return null;
-  return cleaned;
+  return cleaned || null;
 }
 
 function normalizeCaptionStyleConfig(value: unknown): CaptionStyleConfig {
@@ -619,10 +999,19 @@ function normalizeCaptionStyleConfig(value: unknown): CaptionStyleConfig {
   const position: CaptionStyleConfig["position"] = ["bottom", "center_lower", "center", "top"].includes(String(raw.position))
     ? (raw.position as CaptionStyleConfig["position"])
     : presetConfig.position;
+  const displayMode: CaptionDisplayMode = ["segment", "karaoke", "word_by_word"].includes(
+    String(raw.displayMode),
+  )
+    ? (raw.displayMode as CaptionDisplayMode)
+    : raw.karaokeEnabled
+      ? "karaoke"
+      : presetConfig.displayMode;
   return {
     ...presetConfig,
     ...raw,
     preset,
+    textPreset: normalizeTextStylePreset(raw.textPreset),
+    displayMode,
     fontSize,
     fontWeight,
     position,
@@ -639,21 +1028,33 @@ function normalizeCaptionStyleConfig(value: unknown): CaptionStyleConfig {
       0,
       Math.min(0.85, Number(raw.backgroundOpacity ?? presetConfig.backgroundOpacity)),
     ),
-    maxWords: Math.max(1, Math.min(8, Number(raw.maxWords || presetConfig.maxWords))),
+    maxWords: Math.max(
+      3,
+      Math.min(MAX_CAPTION_WORDS, Number(raw.maxWords || presetConfig.maxWords)),
+    ),
     maxChars: Math.max(10, Math.min(45, Number(raw.maxChars || presetConfig.maxChars))),
-    karaokeEnabled: Boolean(raw.karaokeEnabled ?? presetConfig.karaokeEnabled),
+    karaokeEnabled: displayMode === "karaoke",
   };
 }
 
 function captionPositionClass(position: CaptionStyleConfig["position"]) {
   if (position === "top") return "top-[10%]";
   if (position === "center") return "top-1/2 -translate-y-1/2";
-  if (position === "center_lower") return "bottom-[24%]";
+  if (position === "center_lower") return "bottom-[16%]";
   return "bottom-[10%]";
 }
 
-function captionSizeClass(fontSize: CaptionStyleConfig["fontSize"]) {
-  if (fontSize === "large") return "text-lg md:text-xl";
+function captionSizeClass(
+  fontSize: CaptionStyleConfig["fontSize"],
+  preset?: CaptionStylePreset,
+  wordCount = 0,
+) {
+  if (wordCount > 12) return "text-[10px] md:text-xs";
+  if (wordCount > 8) return "text-xs md:text-sm";
+  if (wordCount > MAX_CAPTION_WORDS) return "text-sm";
+  if (preset === "tiktok_bold") return "text-base md:text-lg";
+  if (preset === "yellow_pop") return "text-base md:text-lg";
+  if (fontSize === "large") return "text-base md:text-lg";
   if (fontSize === "small") return "text-xs md:text-sm";
   return "text-sm md:text-base";
 }
@@ -664,11 +1065,89 @@ function captionWeightClass(fontWeight: CaptionStyleConfig["fontWeight"]) {
   return "font-semibold";
 }
 
+function captionTextShadow(style: CaptionStyleConfig) {
+  if (style.preset === "tiktok_bold") {
+    return "-1.25px -1.25px 0 #000, 1.25px -1.25px 0 #000, -1.25px 1.25px 0 #000, 1.25px 1.25px 0 #000, 0 3px 8px rgba(0,0,0,0.72)";
+  }
+  if (style.preset === "yellow_pop") {
+    return "-1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, 0 3px 8px rgba(0,0,0,0.68)";
+  }
+  return [
+    style.outlineEnabled
+      ? "0 1px 2px #000, 1px 0 1px #000, -1px 0 1px #000, 0 -1px 1px #000"
+      : "",
+    style.shadowEnabled ? "0 4px 10px rgba(0,0,0,0.55)" : "",
+  ]
+    .filter(Boolean)
+    .join(", ");
+}
+
 function activeCaptionCue(
-  cues: Array<{ start: number; end: number; text: string }>,
+  cues: Array<{ id?: string; start: number; end: number; text: string }>,
   currentTime: number,
 ) {
-  return cues.find((cue) => currentTime >= cue.start && currentTime <= cue.end);
+  const boundaryTolerance = 0.04;
+  return cues.reduce<(typeof cues)[number] | undefined>((active, cue) => {
+    const inRange =
+      currentTime >= cue.start - boundaryTolerance &&
+      currentTime < cue.end + boundaryTolerance;
+    if (!inRange) return active;
+    if (!active || cue.start > active.start) return cue;
+    return active;
+  }, undefined);
+}
+
+function captionWords(text: string) {
+  return String(text || "").trim().match(/\S+/g) || [];
+}
+
+function uniqueCaptionPartId(baseId: string, partNumber: number, usedIds: Set<string>) {
+  const base = `${baseId}-part-${partNumber}`;
+  let candidate = base;
+  let suffix = 2;
+  while (usedIds.has(candidate)) {
+    candidate = `${base}-${suffix}`;
+    suffix += 1;
+  }
+  usedIds.add(candidate);
+  return candidate;
+}
+
+function reflowCaptionCue(
+  cue: EditableCaptionCue,
+  usedIds: Set<string>,
+  maxWords = DEFAULT_CAPTION_TARGET_WORDS,
+) {
+  const words = captionWords(cue.text);
+  if (words.length <= maxWords) {
+    usedIds.add(cue.id);
+    return [{ ...cue }];
+  }
+
+  const chunks: string[][] = [];
+  for (let index = 0; index < words.length; index += maxWords) {
+    chunks.push(words.slice(index, index + maxWords));
+  }
+  const duration = Math.max(0, cue.end - cue.start);
+  let consumedWords = 0;
+  return chunks.map((chunk, index) => {
+    const chunkStart = cue.start + duration * (consumedWords / words.length);
+    consumedWords += chunk.length;
+    const chunkEnd = index === chunks.length - 1
+      ? cue.end
+      : cue.start + duration * (consumedWords / words.length);
+    const id = index === 0
+      ? cue.id
+      : uniqueCaptionPartId(cue.id, index + 1, usedIds);
+    usedIds.add(id);
+    return {
+      ...cue,
+      id,
+      start: Number(chunkStart.toFixed(3)),
+      end: Number(chunkEnd.toFixed(3)),
+      text: chunk.join(" "),
+    };
+  });
 }
 
 function safeHookPreview(text: string) {
@@ -947,7 +1426,11 @@ function TimelineTrack({
             <div
               key={item.id}
               className={`absolute top-1/2 h-4 -translate-y-1/2 rounded-md px-2 text-[10px] font-black leading-4 shadow-sm ${
-                item.active ? "ring-1 ring-white ring-offset-1 ring-offset-[#22252a]" : ""
+                item.id === selectedItemId || item.eventId === selectedItemId
+                  ? "z-20 ring-2 ring-cyan-300 ring-offset-1 ring-offset-[#22252a]"
+                  : item.active
+                    ? "ring-1 ring-white ring-offset-1 ring-offset-[#22252a]"
+                    : ""
               } ${item.editable ? "cursor-move" : item.selectable ? "cursor-pointer" : ""} ${item.colorClass}`}
               style={{
                 left: eventLeft(item.start, duration),
@@ -1028,6 +1511,7 @@ function TimelineTrack({
 function PresetVideo({
   src,
   preset,
+  framing = defaultVideoFraming,
   controls = false,
   audioMuted = false,
   audioVolume = 1,
@@ -1041,6 +1525,7 @@ function PresetVideo({
 }: {
   src: string;
   preset: RenderPreset;
+  framing?: VideoFraming;
   controls?: boolean;
   audioMuted?: boolean;
   audioVolume?: number;
@@ -1052,6 +1537,20 @@ function PresetVideo({
   onLoadedMetadata?: (currentTime: number) => void;
   onSeeked?: (currentTime: number) => void;
 }) {
+  const safeFraming = normalizeVideoFraming(framing);
+  const cropFocusX = 50 - safeFraming.x;
+  const cropFocusY = 50 - safeFraming.y;
+  const centerCropFramingStyle: CSSProperties = {
+    objectPosition: `${cropFocusX}% ${cropFocusY}%`,
+    transform: `scale(${safeFraming.scale})`,
+    transformOrigin: `${cropFocusX}% ${cropFocusY}%`,
+    transition: "object-position 120ms ease-out, transform 120ms ease-out",
+  };
+  const containedForegroundFramingStyle: CSSProperties = {
+    transform: `translate3d(${safeFraming.x}%, ${safeFraming.y}%, 0) scale(${safeFraming.scale})`,
+    transformOrigin: "center center",
+    transition: "transform 120ms ease-out",
+  };
   const playbackProps = {
     onPlay,
     onPause,
@@ -1073,6 +1572,7 @@ function PresetVideo({
         preload="metadata"
         ref={videoRef}
         src={src}
+        style={centerCropFramingStyle}
         {...playbackProps}
       />
     );
@@ -1109,6 +1609,7 @@ function PresetVideo({
         preload="metadata"
         ref={videoRef}
         src={src}
+        style={preset === "blurred_background" ? containedForegroundFramingStyle : undefined}
         {...playbackProps}
       />
     </div>
@@ -1146,6 +1647,14 @@ export function TransformationPage() {
   const [editorTheme, setEditorTheme] = useState<"dark" | "light">(() =>
     window.localStorage.getItem("autoclip-editor-theme") === "light" ? "light" : "dark",
   );
+  const [editorMediaUploading, setEditorMediaUploading] = useState(false);
+  const [editorMediaUploadKind, setEditorMediaUploadKind] = useState<
+    "video" | "audio" | "image" | null
+  >(null);
+  const editorMediaQuery = useQuery({
+    queryKey: ["editor-media", transformationId],
+    queryFn: () => api<EditorMediaAsset[]>(`/api/transformations/${transformationId}/media`),
+  });
   const [selectedEditorContext, setSelectedEditorContext] = useState<EditorContext>("video");
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   const [selectedCaptionId, setSelectedCaptionId] = useState<string | null>(null);
@@ -1160,6 +1669,7 @@ export function TransformationPage() {
   const [exportFrameRate, setExportFrameRate] = useState<"30" | "source">("30");
   const [exportFilename, setExportFilename] = useState("");
   const [exportAwaitingHd, setExportAwaitingHd] = useState(false);
+  const [exportRenderId, setExportRenderId] = useState<string | null>(null);
   const [exportValidatedRenderId, setExportValidatedRenderId] = useState<string | null>(null);
   const [exportSubmissionStage, setExportSubmissionStage] = useState<"saving" | "preparing" | null>(null);
   const [exportWasClosedDuringTask, setExportWasClosedDuringTask] = useState(false);
@@ -1192,7 +1702,11 @@ export function TransformationPage() {
   } | null>(null);
   const previewVideoRef = useRef<HTMLVideoElement | null>(null);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+  const previewTimeRef = useRef(0);
+  const previewClockFrameRef = useRef<number | null>(null);
+  const previewClockLastUpdateRef = useRef(0);
   const timelineDraggingRef = useRef(false);
+  previewTimeRef.current = previewTime;
   const timelineResizeRef = useRef<{
     pointerId: number;
     startHeight: number;
@@ -1223,7 +1737,13 @@ export function TransformationPage() {
   const redoStackRef = useRef<Transformation[]>([]);
   const historyGroupRef = useRef<string | null>(null);
   const hydratedPreferencesRef = useRef<string | null>(null);
+  const initializedManualContextRef = useRef<string | null>(null);
   const latestEditorSnapshotFingerprintRef = useRef("");
+  const saveRequestSequenceRef = useRef(0);
+  const latestSaveRequestIdRef = useRef(0);
+  const saveInFlightRef = useRef(0);
+  const [saveInFlightCount, setSaveInFlightCount] = useState(0);
+  const [saveFailureMessage, setSaveFailureMessage] = useState("");
   const [historyRevision, setHistoryRevision] = useState(0);
 
   const cloneTransformation = (value: Transformation) => structuredClone(value);
@@ -1306,6 +1826,13 @@ export function TransformationPage() {
   useEffect(() => {
     if (plan.data) {
       setDraft(plan.data);
+      if (
+        initialEditorContext(plan.data) === "media" &&
+        initializedManualContextRef.current !== plan.data.id
+      ) {
+        setSelectedEditorContext("media");
+        initializedManualContextRef.current = plan.data.id;
+      }
       if (isRenderPreset(plan.data.clipper_style_config?.render_preset)) {
         setPreset(plan.data.clipper_style_config.render_preset);
       }
@@ -1429,11 +1956,26 @@ export function TransformationPage() {
 
   function buildEditorStateSnapshot() {
     if (!draft) throw new Error("Data transformasi belum tersedia.");
-    const serializeSequence = (sequence: MediaSequenceSegment[]) => sequence.map((segment) => ({
-      id: segment.id,
-      source_start: Number(segment.sourceStart.toFixed(3)),
-      source_end: Number(segment.sourceEnd.toFixed(3)),
-    }));
+    const roundTime = (value: number, fallback = 0) =>
+      Number((Number.isFinite(value) ? value : fallback).toFixed(3));
+    const serializeSequence = (sequence: MediaSequenceSegment[]) => sequence
+      .filter(
+        (segment) =>
+          Number.isFinite(segment.sourceStart) &&
+          Number.isFinite(segment.sourceEnd) &&
+          segment.sourceEnd > segment.sourceStart,
+      )
+      .map((segment) => ({
+        id: String(segment.id),
+        source_start: roundTime(segment.sourceStart),
+        source_end: roundTime(segment.sourceEnd),
+      }));
+    const serializedVideoSequence = serializeSequence(videoSequence);
+    const serializedAudioSequence = audioExtracted ? serializeSequence(audioSequence) : [];
+    const legacyMediaTrim = normalizeMediaTrim(
+      draft.clipper_style_config?.media_trim,
+      context.data?.clip_duration_seconds || 0.1,
+    );
 
     // TODO: setiap fitur editor baru harus menambahkan field kanoniknya di snapshot ini.
     // Manual Save dan autosave memakai objek yang sama, sehingga tidak boleh membuat payload paralel.
@@ -1444,25 +1986,34 @@ export function TransformationPage() {
       audio_sequence_initialized: true,
       caption_timeline_initialized: true,
       effect_timeline_initialized: true,
-      video_sequence: serializeSequence(videoSequence),
-      audio_sequence: audioExtracted ? serializeSequence(audioSequence) : [],
-      media_sequence: serializeSequence(videoSequence),
+      video_sequence: serializedVideoSequence,
+      audio_sequence: serializedAudioSequence,
+      media_sequence: serializedVideoSequence,
+      media_trim: legacyMediaTrim,
       audio_extracted: audioExtracted,
       video_track_deleted: videoTrackDeleted || videoSequence.length === 0,
       audio_track_deleted: audioExtracted && (audioTrackDeleted || audioSequence.length === 0),
+      video_framing: { ...videoFraming },
       caption_timeline: editableCaptionCues.map((cue) => ({
-        id: cue.id,
-        start: Number(cue.start.toFixed(3)),
-        end: Number(cue.end.toFixed(3)),
-        text: cue.text,
+        id: String(cue.id),
+        start: roundTime(cue.start),
+        end: roundTime(cue.end, roundTime(cue.start) + 0.1),
+        text: String(cue.text || ""),
       })),
-      effect_timeline: editableEffectTimeline.map((event) => ({ ...event })),
-      layer_order: layerOrder,
-      track_order: layerOrder,
+      caption_style: captionStyle,
+      caption_max_words: captionStyle.maxWords,
+      caption_max_chars: captionStyle.maxChars,
+      effect_timeline: editableEffectTimeline.map((event) => ({
+        ...event,
+        start: roundTime(event.start),
+        end: roundTime(event.end, roundTime(event.start) + 0.1),
+      })),
+      layer_order: [...visualLayerOrder],
+      track_order: [...trackOrder],
       audio_settings: audioSettings,
-      additional_audio_assets: additionalAudioAssets,
-      additional_audio_tracks: additionalAudioTracks,
-      audio_tracks: additionalAudioTracks,
+      additional_audio_assets: [...additionalAudioAssets],
+      additional_audio_tracks: [...additionalAudioTracks],
+      audio_tracks: [...additionalAudioTracks],
       editor_preferences: {
         timeline_height: Math.round(timelineHeight),
         timeline_zoom: timelineZoom,
@@ -1474,81 +2025,100 @@ export function TransformationPage() {
   async function persistDraft(options: { saveTitle?: boolean } = {}) {
     if (!draft) throw new Error("Data transformasi belum tersedia.");
     const { saveTitle = true } = options;
-    const originalDuration = context.data?.clip_duration_seconds || 0;
     const persistedStyleConfig = buildEditorStateSnapshot();
     const snapshotFingerprint = JSON.stringify(persistedStyleConfig);
-    const savedTrim = normalizeMediaTrim(
-      persistedStyleConfig.media_trim,
-      originalDuration,
-    );
-    const savedSequence = normalizeMediaSequence(
-      persistedStyleConfig.video_sequence,
-      originalDuration,
-    );
-    const duration = savedSequence.length
-      ? savedSequence.reduce((total, segment) => total + segment.sourceEnd - segment.sourceStart, 0)
-      : Math.max(0, savedTrim.end - savedTrim.start);
-    const events = Array.isArray(persistedStyleConfig.effect_timeline)
-      ? persistedStyleConfig.effect_timeline
-      : [];
-    for (const event of events) {
-      if (!["hook_text", "punch_zoom", "keyword_popup", "pattern_interrupt"].includes(event.type)) {
-        throw new Error("Timeline efek berisi tipe event yang tidak valid.");
+    const requestId = ++saveRequestSequenceRef.current;
+    latestSaveRequestIdRef.current = requestId;
+    saveInFlightRef.current += 1;
+    setSaveInFlightCount(saveInFlightRef.current);
+    setSaveFailure(false);
+    setSaveFailureMessage("");
+
+    try {
+      if (saveTitle) {
+        const cleanTitle = uploadTitle.trim();
+        if (cleanTitle.length < 5) {
+          throw new Error("Judul video minimal 5 karakter.");
+        }
+        const savedCandidate = await api<{ suggested_title: string }>(
+          `/api/candidates/${draft.candidate_id}/title`,
+          {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ suggested_title: cleanTitle }),
+          },
+        );
+        setUploadTitle(savedCandidate.suggested_title);
+        client.setQueryData<TransformationContext>(
+          ["transformation-context", transformationId],
+          (current) =>
+            current
+              ? { ...current, candidate_title: savedCandidate.suggested_title }
+              : current,
+        );
       }
-      if (event.start < 0 || event.end > duration || event.end <= event.start) {
-        throw new Error("Timeline efek berisi waktu event yang tidak valid.");
-      }
-      const bounds = eventDurationBounds(event.type);
-      const eventDuration = event.end - event.start;
-      if (eventDuration < bounds.min || eventDuration > bounds.max) {
-        throw new Error(`Durasi event ${event.type} tidak valid.`);
-      }
-      if (event.type === "keyword_popup" && !isValidKeyword(event.text || "")) {
-        throw new Error("Keyword pop-up belum valid. Gunakan 1-4 kata bermakna.");
-      }
-    }
-    if (saveTitle) {
-      const cleanTitle = uploadTitle.trim();
-      if (cleanTitle.length < 5) {
-        throw new Error("Judul video minimal 5 karakter.");
-      }
-      const savedCandidate = await api<{ suggested_title: string }>(
-        `/api/candidates/${draft.candidate_id}/title`,
+
+      const payload = {
+        purpose: draft.purpose,
+        audience: draft.audience,
+        new_angle: draft.new_angle,
+        original_hook: draft.original_hook,
+        commentary_script: draft.commentary_script,
+        conclusion: draft.conclusion,
+        engagement_question: draft.engagement_question,
+        social_caption: draft.social_caption,
+        storyboard: draft.storyboard,
+        clipper_style_config: persistedStyleConfig,
+      };
+      const saved = await api<Transformation>(
+        `/api/transformations/${transformationId}`,
         {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ suggested_title: cleanTitle }),
+          body: JSON.stringify(payload),
         },
       );
-      setUploadTitle(savedCandidate.suggested_title);
-      client.setQueryData<TransformationContext>(
-        ["transformation-context", transformationId],
-        (current) =>
-          current
-            ? { ...current, candidate_title: savedCandidate.suggested_title }
-            : current,
-      );
+      const isCurrent =
+        latestSaveRequestIdRef.current === requestId &&
+        latestEditorSnapshotFingerprintRef.current === snapshotFingerprint;
+      if (isCurrent) {
+        setSaveFailure(false);
+        setSaveFailureMessage("");
+        setDraft(saved);
+        client.setQueryData(["transformation", transformationId], saved);
+      }
+      return { saved, isCurrent, requestId, snapshotFingerprint };
+    } catch (saveError) {
+      const rawMessage = saveError instanceof Error
+        ? saveError.message
+        : "Terjadi kesalahan yang tidak diketahui saat menyimpan editor.";
+      const message = typeof rawMessage === "string" && rawMessage
+        ? rawMessage
+        : "Terjadi kesalahan yang tidak diketahui saat menyimpan editor.";
+      const isCurrent =
+        latestSaveRequestIdRef.current === requestId &&
+        latestEditorSnapshotFingerprintRef.current === snapshotFingerprint;
+      console.error("[XA AutoClip] Gagal menyimpan editor", {
+        transformationId,
+        requestId,
+        saveTitle,
+        isCurrent,
+        message,
+        error: saveError,
+      });
+      if (isCurrent) {
+        setSaveFailure(true);
+        setSaveFailureMessage(message);
+      }
+      throw saveError;
+    } finally {
+      saveInFlightRef.current = Math.max(0, saveInFlightRef.current - 1);
+      setSaveInFlightCount(saveInFlightRef.current);
     }
-    const saved = await api<Transformation>(
-      `/api/transformations/${transformationId}`,
-      {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...draft, clipper_style_config: persistedStyleConfig }),
-      },
-    );
-    const isCurrent = latestEditorSnapshotFingerprintRef.current === snapshotFingerprint;
-    if (isCurrent) {
-      setSaveFailure(false);
-      setDraft(saved);
-      client.setQueryData(["transformation", transformationId], saved);
-    }
-    return { saved, isCurrent, snapshotFingerprint };
   }
 
   const save = useMutation({
     mutationFn: () => persistDraft(),
-    onMutate: () => setSaveFailure(false),
     onSuccess: ({ isCurrent }) => {
       if (isCurrent) {
         setEditorDirty(false);
@@ -1556,11 +2126,9 @@ export function TransformationPage() {
         setMessage("Perubahan berhasil disimpan.");
       }
     },
-    onError: () => setSaveFailure(true),
   });
   const autosave = useMutation({
     mutationFn: () => persistDraft({ saveTitle: false }),
-    onMutate: () => setSaveFailure(false),
     onSuccess: ({ isCurrent }) => {
       if (isCurrent) {
         setEditorDirty(false);
@@ -1568,19 +2136,19 @@ export function TransformationPage() {
         setMessage("Perubahan tersimpan otomatis.");
       }
     },
-    onError: () => setSaveFailure(true),
   });
   const triggerAutosave = autosave.mutate;
   useEffect(() => {
     if (!draft || !context.data || (!editorDirty && !timelineDirty)) return undefined;
-    if (save.isPending || autosave.isPending) return undefined;
+    if (saveInFlightCount > 0) return undefined;
     const timer = window.setTimeout(() => {
       const interactionActive = Boolean(
         eventDrag ||
         mediaResizePreview ||
         mediaResizeRef.current ||
         timedItemResizeRef.current ||
-        timelineResizeRef.current,
+        timelineResizeRef.current ||
+        timelineDraggingRef.current,
       );
       if (interactionActive) {
         setAutosaveWakeRevision((revision) => revision + 1);
@@ -1598,7 +2166,7 @@ export function TransformationPage() {
     editorTheme,
     eventDrag,
     mediaResizePreview,
-    save.isPending,
+    saveInFlightCount,
     timelineDirty,
     timelineHeight,
     timelineZoom,
@@ -1705,6 +2273,14 @@ export function TransformationPage() {
   });
   const queueRender = useMutation({
     mutationFn: async (preview: boolean) => {
+      setExportRenderId(null);
+      setExportValidatedRenderId(null);
+      console.info("[XA AutoClip] export_ui_request", {
+        transformationId,
+        preview,
+        preset,
+        resolution: preview ? "540x960" : "1080x1920",
+      });
       setExportSubmissionStage("saving");
       await persistDraft();
       setExportSubmissionStage("preparing");
@@ -1723,10 +2299,20 @@ export function TransformationPage() {
     onSuccess: (data) => {
       setExportSubmissionStage(null);
       setRender(data);
+      setExportRenderId(data.id);
+      console.info("[XA AutoClip] export_ui_result", {
+        render_id: data.id,
+        status: data.status,
+        render_download_url: data.output_url || null,
+      });
       setEditorDirty(false);
       setRenderDirty(false);
       setTimelineDirty(false);
-      setMessage("Export masuk antrean.");
+      setMessage(
+        data.status === "completed"
+          ? "Menggunakan hasil export tersimpan."
+          : "Export masuk antrean.",
+      );
     },
     onError: () => {
       setExportSubmissionStage(null);
@@ -1739,7 +2325,7 @@ export function TransformationPage() {
       api(`/api/projects/${draft?.project_id}/reprocess`, { method: "POST" }),
     onSuccess: () => navigate(`/projects/${draft?.project_id}`),
   });
-  const monitoredRenderId = render?.id || (
+  const monitoredRenderId = exportRenderId || render?.id || (
     latestRender.data && ["queued", "running"].includes(latestRender.data.status)
       ? latestRender.data.id
       : undefined
@@ -1756,7 +2342,21 @@ export function TransformationPage() {
   });
   const renderStatusData = renderStatus.data;
   useEffect(() => {
-    const current = renderStatusData || render || latestRender.data;
+    if (!renderStatusData || renderStatusData.id !== exportRenderId) return;
+    console.info("[XA AutoClip] render_status_poll", {
+      render_id: renderStatusData.id,
+      status: renderStatusData.status,
+      render_download_url: renderStatusData.output_url || null,
+    });
+  }, [exportRenderId, renderStatusData]);
+  useEffect(() => {
+    const current = exportRenderId
+      ? renderStatusData?.id === exportRenderId
+        ? renderStatusData
+        : render?.id === exportRenderId
+          ? render
+          : undefined
+      : undefined;
     if (!current) return;
     if (current.status === "completed") {
       if (exportAwaitingHd && current.width < 1000 && !queueRender.isPending) {
@@ -1788,16 +2388,20 @@ export function TransformationPage() {
     }
   }, [
     exportAwaitingHd,
+    exportRenderId,
     exportResolution,
     exportValidatedRenderId,
-    latestRender.data,
     queueRender,
     render,
     renderStatusData,
   ]);
 
   const toolbarActiveRender = renderStatus.data || render || latestRender.data;
-  const toolbarTranscriptionReady = context.data ? !context.data.transcription_is_demo : false;
+  const toolbarManualEditorMode = isManualEditorTransformation(draft);
+  const toolbarManualHasVideo = hasManualEditorTimelineVideo(draft);
+  const toolbarTranscriptionReady = context.data
+    ? toolbarManualEditorMode || !context.data.transcription_is_demo
+    : false;
   const toolbarRenderedPreviewAvailable =
     !renderDirty &&
     toolbarActiveRender?.status === "completed" &&
@@ -1811,10 +2415,18 @@ export function TransformationPage() {
     draft &&
     context.data &&
     toolbarTranscriptionReady &&
+    (!toolbarManualEditorMode || toolbarManualHasVideo) &&
     !queueRender.isPending &&
-    !save.isPending &&
-    !autosave.isPending,
+    saveInFlightCount === 0,
   );
+  const exportDisabledReason =
+    toolbarManualEditorMode && !toolbarManualHasVideo
+      ? "Import media dulu sebelum export"
+      : !toolbarTranscriptionReady
+        ? "Transkripsi sumber belum siap."
+        : saveInFlightCount > 0
+          ? "Tunggu perubahan selesai disimpan."
+          : undefined;
   const toolbarExportBusy = ["queued", "running"].includes(toolbarActiveRender?.status || "");
   useEffect(() => {
     if (toolbarExportBusy && toolbarActiveRender?.id) {
@@ -1840,7 +2452,7 @@ export function TransformationPage() {
     editorDirty ||
     timelineDirty ||
     Boolean(context.data && uploadTitle.trim() !== context.data.candidate_title);
-  const isSavingEditor = save.isPending || autosave.isPending;
+  const isSavingEditor = saveInFlightCount > 0;
   const editorSaveStatus = isSavingEditor
     ? "saving"
     : saveFailure
@@ -1860,6 +2472,9 @@ export function TransformationPage() {
     saved: "bg-emerald-50 text-emerald-700",
     failed: "bg-red-50 text-red-700",
   }[editorSaveStatus];
+  const editorSaveStatusTitle = saveFailure
+    ? saveFailureMessage || "Penyimpanan gagal. Perubahan lokal tetap dipertahankan."
+    : editorSaveStatusLabel;
   const openExportModal = useCallback(() => {
     const baseName = (uploadTitle || context.data?.candidate_title || "XA AutoClip")
       .replace(/[<>:"/\\|?*]+/g, " ")
@@ -1883,23 +2498,34 @@ export function TransformationPage() {
       return undefined;
     }
 
-    const title = uploadTitle || context.data.project_title;
-    const meta = `${formatTime(context.data.clip_start_seconds)} - ${formatTime(
-      context.data.clip_end_seconds,
-    )} / ${formatTime(context.data.clip_duration_seconds)}`;
+    const title = toolbarManualEditorMode
+      ? "Editor Manual"
+      : uploadTitle || context.data.project_title;
+    const meta = toolbarManualEditorMode
+      ? formatTime(context.data.clip_duration_seconds)
+      : `${formatTime(context.data.clip_start_seconds)} - ${formatTime(
+          context.data.clip_end_seconds,
+        )} / ${formatTime(context.data.clip_duration_seconds)}`;
     const badge = (
-      <span className={`shrink-0 rounded-full px-2 py-1 text-[10px] font-black uppercase ${editorSaveStatusClass}`}>
+      <span
+        className={`shrink-0 rounded-full px-2 py-1 text-[10px] font-black uppercase ${editorSaveStatusClass}`}
+        title={editorSaveStatusTitle}
+      >
         {editorSaveStatusLabel}
       </span>
     );
     const actions = (
       <>
-        <Link className="btn-secondary px-3 py-2 text-sm" to={`/jobs/${draft.project_id}/clips`}>
-          Kembali ke Klip
-        </Link>
+        {!toolbarManualEditorMode && (
+          <Link className="btn-secondary px-3 py-2 text-sm" to={`/jobs/${draft.project_id}/clips`}>
+            Kembali ke Klip
+          </Link>
+        )}
         <button
           className="btn px-3 py-2 text-sm"
+          disabled={!canStartExport}
           onClick={openExportModal}
+          title={exportDisabledReason}
           type="button"
         >
           Export
@@ -1908,15 +2534,19 @@ export function TransformationPage() {
     );
     const compactActions = (
       <>
-        <Link
-          className="btn-secondary block w-full px-3 py-2 text-center text-sm"
-          to={`/jobs/${draft.project_id}/clips`}
-        >
-          Kembali ke Klip
-        </Link>
+        {!toolbarManualEditorMode && (
+          <Link
+            className="btn-secondary block w-full px-3 py-2 text-center text-sm"
+            to={`/jobs/${draft.project_id}/clips`}
+          >
+            Kembali ke Klip
+          </Link>
+        )}
         <button
           className="btn w-full px-3 py-2 text-sm"
+          disabled={!canStartExport}
           onClick={openExportModal}
+          title={exportDisabledReason}
           type="button"
         >
           Export
@@ -1937,8 +2567,12 @@ export function TransformationPage() {
     draft,
     editorSaveStatusClass,
     editorSaveStatusLabel,
+    editorSaveStatusTitle,
+    exportDisabledReason,
     layout,
     openExportModal,
+    canStartExport,
+    toolbarManualEditorMode,
     uploadTitle,
   ]);
 
@@ -1947,6 +2581,13 @@ export function TransformationPage() {
   }
 
   const activeRender = renderStatus.data || render || latestRender.data;
+  const exportResultRender = exportRenderId
+    ? renderStatus.data?.id === exportRenderId
+      ? renderStatus.data
+      : render?.id === exportRenderId
+        ? render
+        : undefined
+    : undefined;
   const transcriptionReady = !context.data.transcription_is_demo;
   const set = (key: keyof Transformation, value: unknown) => {
     recordEditorHistory(draft, `field:${String(key)}`);
@@ -2008,9 +2649,11 @@ export function TransformationPage() {
     setRender(undefined);
     setStyle("render_preset", value);
   };
+  const currentSaveError = saveFailure
+    ? save.error || autosave.error || new Error(saveFailureMessage || "Gagal menyimpan editor.")
+    : null;
   const error =
-    save.error ||
-    autosave.error ||
+    currentSaveError ||
     regenerate.error ||
     regenerateCaption.error ||
     regenerateHook.error ||
@@ -2029,19 +2672,38 @@ export function TransformationPage() {
     ...(draft.clipper_style_config || {}),
     caption_style: normalizeCaptionStyleConfig(draft.clipper_style_config?.caption_style),
   };
+  const manualEditorMode = isManualEditorTransformation(draft);
   const savedEditorStateVersion = Number(styleConfig.editor_state_version || 0);
   const editorStateInitialized = savedEditorStateVersion >= 1;
-  const layerOrder = normalizeLayerOrder(styleConfig.layer_order || styleConfig.track_order);
-  const moveLayerTrack = (track: LayerTrack, direction: -1 | 1) => {
-    const index = layerOrder.indexOf(track);
+  const trackOrder = normalizeTrackOrder(styleConfig.track_order);
+  const visualLayerOrder = normalizeVisualLayerOrder(styleConfig.layer_order);
+  const videoFraming = normalizeVideoFraming(styleConfig.video_framing);
+  const setVideoFraming = (changes: Partial<VideoFraming>) => {
+    const nextFraming = normalizeVideoFraming({ ...videoFraming, ...changes });
+    setExportValidatedRenderId(null);
+    setExportAwaitingHd(false);
+    console.info("[XA AutoClip] render invalidated because video_framing changed", {
+      transformationId,
+      previous: videoFraming,
+      next: nextFraming,
+    });
+    setStyle("video_framing", {
+      x: Number(nextFraming.x.toFixed(2)),
+      y: Number(nextFraming.y.toFixed(2)),
+      scale: Number(nextFraming.scale.toFixed(2)),
+    });
+  };
+  const moveTimelineTrack = (track: TimelineTrackKey, direction: -1 | 1) => {
+    const index = trackOrder.indexOf(track);
     const targetIndex = index + direction;
-    if (index < 0 || targetIndex < 0 || targetIndex >= layerOrder.length) return;
-    const nextOrder = [...layerOrder];
+    if (index < 0 || targetIndex < 0 || targetIndex >= trackOrder.length) return;
+    const nextOrder = [...trackOrder];
     [nextOrder[index], nextOrder[targetIndex]] = [nextOrder[targetIndex], nextOrder[index]];
     setTimelineDirty(true);
-    setStyle("layer_order", nextOrder);
+    setStyle("track_order", nextOrder);
   };
-  const visualLayerZIndex = (track: LayerTrack) => 20 + layerOrder.length - layerOrder.indexOf(track);
+  const visualLayerZIndex = (track: VisualLayerTrack) =>
+    20 + visualLayerOrder.length - visualLayerOrder.indexOf(track);
   const additionalAudioAssets = (Array.isArray(styleConfig.additional_audio_assets)
     ? styleConfig.additional_audio_assets
     : []) as AdditionalAudioAsset[];
@@ -2135,7 +2797,13 @@ export function TransformationPage() {
   const timelineContentScale =
     timelineZoom * (timelineScaleDuration / Math.max(0.1, originalClipDuration));
   const sourceMediaUrl = candidateVideoUrl(draft.candidate_id);
-  const sourceClipUrl = sourceMediaUrl;
+  const latestImportedVideo = [...(editorMediaQuery.data || [])]
+    .reverse()
+    .find((asset) => asset.kind === "video");
+  const sourceClipUrl =
+    manualEditorMode && latestImportedVideo
+      ? mediaUrl(transformationId, latestImportedVideo.asset_id)
+      : sourceMediaUrl;
   const renderedPreviewAvailable =
     !renderDirty &&
     activeRender?.status === "completed" &&
@@ -2170,6 +2838,63 @@ export function TransformationPage() {
           }
         : current,
     );
+  };
+  const addEditorMediaToTimeline = async (asset: EditorMediaAsset) => {
+    if (asset.kind === "audio") {
+      const exists = (styleConfig.additional_audio_assets || []).some(
+        (item) => item.id === asset.asset_id,
+      );
+      if (exists) return;
+    }
+    const saved = await api<Transformation>(
+      `/api/transformations/${transformationId}/media/${asset.asset_id}/add-to-timeline`,
+      { method: "POST" },
+    );
+    setDraft(saved);
+    setEditorDirty(true);
+    setTimelineDirty(true);
+    editorMediaQuery.refetch();
+  };
+
+  const importEditorMedia = async (
+    kind: "video" | "audio" | "image",
+    file?: File,
+  ) => {
+    if (!file) return;
+    setEditorMediaUploading(true);
+    setEditorMediaUploadKind(kind);
+    try {
+      const asset = await uploadMedia<EditorMediaAsset>(
+        `/api/transformations/${transformationId}/media`,
+        file,
+        kind,
+      );
+      if (kind === "video") {
+        const saved = await api<Transformation>(
+          `/api/transformations/${transformationId}/media/${asset.asset_id}/add-to-timeline`,
+          { method: "POST" },
+        );
+        setDraft(saved);
+        setEditorDirty(true);
+        setTimelineDirty(true);
+        context.refetch();
+      } else if (kind === "audio") {
+        await addEditorMediaToTimeline(asset);
+      }
+      editorMediaQuery.refetch();
+      setMessage(
+        kind === "image"
+          ? `${asset.name} tersimpan di media.`
+          : `${asset.name} diimpor ke editor.`,
+      );
+    } catch (importError) {
+      setMessage(
+        importError instanceof Error ? importError.message : "Import media gagal.",
+      );
+    } finally {
+      setEditorMediaUploading(false);
+      setEditorMediaUploadKind(null);
+    }
   };
   const handleAdditionalAudioUpload = async (file: File | undefined) => {
     if (!file) return;
@@ -2230,7 +2955,29 @@ export function TransformationPage() {
     setSelectedEditorContext("audio");
     setMessage(`${track.label} ditambahkan pada ${formatTimePrecise(start)}.`);
   };
-  const hookPreview = safeHookPreview(styleConfig.hook_text);
+  const hookFallbackText = safeHookPreview(
+    styleConfig.hook_text || draft.original_hook || context.data.candidate_title || "",
+  );
+  const hookTextTemplate = normalizeHookTextTemplate(styleConfig.hook_text_template);
+  const activeHookTemplate = hookTextTemplates.find(
+    (template) => template.value === hookTextTemplate,
+  ) || hookTextTemplates[0];
+  const hookTextPosition: HookTextPosition =
+    ["safe_top", "top", "upper_center"].includes(String(styleConfig.hook_text_position))
+      ? (styleConfig.hook_text_position as HookTextPosition)
+      : "safe_top";
+  const hookTextSize: HookTextSize = styleConfig.hook_text_size === "large" ? "large" : "normal";
+  const hookTextFont = normalizeHookTextFont(styleConfig.hook_text_font);
+  const activeHookFont = hookTextFonts.find((font) => font.value === hookTextFont) || hookTextFonts[0];
+  const hookTextStylePreset = resolveHookTextStylePreset(
+    hookTextTemplate,
+    styleConfig.hook_text_style_preset,
+  );
+  const keywordTextStylePreset = normalizeTextStylePreset(
+    styleConfig.keyword_text_style_preset ?? "yellow_viral",
+  );
+  const hookUnifiedTextStyle = resolveTextOverlayStyle(hookTextStylePreset);
+  const keywordUnifiedTextStyle = resolveTextOverlayStyle(keywordTextStylePreset);
   const keywordPreview = previewKeywords(
     context.data.candidate_transcript,
     draft.original_hook,
@@ -2265,7 +3012,7 @@ export function TransformationPage() {
     !effectTimeline.some((event) => event.type === "keyword_popup" && event.text);
   const baseEffectTimeline = mediaResizePreview?.events || effectTimeline;
   const configuredEffectTimeline = !effectTimelineInitialized &&
-    styleConfig.hook_text_enabled && hookPreview &&
+    styleConfig.hook_text_enabled && hookFallbackText &&
     !baseEffectTimeline.some((event) => event.type === "hook_text")
     ? [
         {
@@ -2273,27 +3020,16 @@ export function TransformationPage() {
           type: "hook_text",
           start: 0,
           end: Math.min(3, Math.max(1, clipDuration)),
-          text: hookPreview,
+          text: hookFallbackText,
           reason: "default timeline",
         } satisfies EffectTimelineEvent,
         ...baseEffectTimeline,
       ]
     : baseEffectTimeline;
-  const generatedCaptionCues: EditableCaptionCue[] = videoSegments
-    .flatMap((segment) =>
-      (context.data.caption_cues || [])
-        .filter((cue) => cue.end > segment.sourceStart && cue.start < segment.sourceEnd)
-        .map((cue, cueIndex) => ({
-          ...cue,
-          id: `caption-${segment.number}-${cueIndex}`,
-          start: segment.start + Math.max(0, cue.start - segment.sourceStart),
-          end: segment.start + Math.min(
-            segment.sourceEnd - segment.sourceStart,
-            cue.end - segment.sourceStart,
-          ),
-        })),
-    )
-    .filter((cue) => cue.end > cue.start);
+  const generatedCaptionCues: EditableCaptionCue[] = projectCaptionCues(
+    context.data.caption_cues || [],
+    videoSequence,
+  );
   const savedCaptionTimeline = Array.isArray(styleConfig.caption_timeline)
     ? (styleConfig.caption_timeline as EditableCaptionCue[])
         .map((cue, index) => ({
@@ -2302,41 +3038,74 @@ export function TransformationPage() {
           end: Math.max(0, Math.min(clipDuration, Number(cue.end) || 0)),
           text: String(cue.text || "").trim(),
         }))
-        .filter((cue) => cue.text && cue.end > cue.start)
+        .filter((cue) => cue.end > cue.start)
     : [];
   const captionTimelineInitialized = editorStateInitialized ||
     Boolean(styleConfig.caption_timeline_initialized) || savedCaptionTimeline.length > 0;
+  const captionSyncRequired = Boolean(styleConfig.caption_sync_required);
   const editableCaptionCues = captionTimelineInitialized
     ? savedCaptionTimeline
     : generatedCaptionCues;
   const captionStyle = styleConfig.caption_style;
+  const captionUnifiedTextStyle = resolveTextOverlayStyle(captionStyle.textPreset);
   const currentCaptionCue = activeCaptionCue(editableCaptionCues, previewTime);
   const subtitlePreview = currentCaptionCue
-    ? getSafeSubtitlePreview(currentCaptionCue.text)
+    ? getCaptionPreviewText(currentCaptionCue.text)
     : null;
-  const karaokeWords = subtitlePreview ? subtitlePreview.split(/\s+/) : [];
+  const karaokeWords = subtitlePreview ? captionWords(subtitlePreview) : [];
+  const captionPreviewWordCount = karaokeWords.length;
+  const karaokeCueDuration = currentCaptionCue
+    ? Math.max(0, currentCaptionCue.end - currentCaptionCue.start)
+    : 0;
+  const karaokeCueProgress = currentCaptionCue &&
+    previewTime >= currentCaptionCue.start &&
+    previewTime < currentCaptionCue.end
+    ? Math.min(
+        0.999999,
+        Math.max(0, (previewTime - currentCaptionCue.start) / Math.max(0.001, karaokeCueDuration)),
+      )
+    : null;
+  // Estimasi karaoke proporsional dari durasi cue, bukan timing kata transcript asli.
   const karaokeActiveIndex =
-    currentCaptionCue && karaokeWords.length
-      ? Math.min(
-          karaokeWords.length - 1,
-          Math.max(
-            0,
-            Math.floor(
-              ((previewTime - currentCaptionCue.start) /
-                Math.max(0.1, currentCaptionCue.end - currentCaptionCue.start)) *
-                karaokeWords.length,
-            ),
-          ),
-        )
+    karaokeCueProgress !== null && karaokeCueDuration >= 0.35 && karaokeWords.length > 1
+      ? Math.min(karaokeWords.length - 1, Math.floor(karaokeCueProgress * karaokeWords.length))
       : -1;
+  const progressiveWordCount =
+    karaokeCueProgress !== null && karaokeCueDuration >= 0.35 && karaokeWords.length > 1
+      ? Math.min(
+          karaokeWords.length,
+          Math.max(1, Math.floor(karaokeCueProgress * karaokeWords.length) + 1),
+        )
+      : karaokeWords.length;
+  const wordByWordPreview =
+    karaokeCueProgress !== null
+      ? karaokeWords.slice(0, progressiveWordCount).join(" ") || subtitlePreview
+      : null;
+  const captionOverlayText =
+    captionStyle.displayMode === "word_by_word" ? wordByWordPreview : subtitlePreview;
   const editableEffectTimeline = configuredEffectTimeline.map((event, index) => ({
     ...event,
     id: editableEventId(event, index),
   }));
   const selectedEvent =
     editableEffectTimeline.find((event) => event.id === selectedEventId) || null;
-  const liveHookEvent = editableEffectTimeline.find(
-    (event) => event.type === "hook_text" && previewTime >= event.start && previewTime <= event.end,
+  const liveHookEvent = activeHookCue(editableEffectTimeline, previewTime);
+  const liveHookText = hookCueText(liveHookEvent, hookFallbackText);
+  const renderedPreviewIsCleanFallback = Boolean(
+    renderedPreviewUrl &&
+      activeRender?.error_message?.includes("Sebagian efek gaya tidak diterapkan"),
+  );
+  const hookPreviewState = resolveHookPreviewRenderState(
+    Boolean(liveHookEvent && liveHookText),
+    Boolean(renderedPreviewUrl),
+    renderedPreviewIsCleanFallback,
+  );
+  const hookSafeArea = resolveHookSafeArea(
+    hookTextPosition,
+    hookTextSize === "large" ? 48 : 36,
+    liveHookText,
+    540,
+    960,
   );
   latestEditorSnapshotFingerprintRef.current = JSON.stringify(buildEditorStateSnapshot());
   const updateEffectTimeline = (
@@ -2396,7 +3165,7 @@ export function TransformationPage() {
         : type === "punch_zoom"
           ? { ...base, zoom }
           : type === "hook_text"
-            ? { ...base, text: hookPreview || "Hook video" }
+            ? { ...base, text: hookFallbackText || "Hook video" }
             : { ...base, effect: "quick_zoom_shift" };
     updateEffectTimeline([...editableEffectTimeline, event]);
     setSelectedEventId(event.id || null);
@@ -2451,7 +3220,7 @@ export function TransformationPage() {
       start: cue.start,
       end: cue.end,
       label: "",
-      active: previewTime >= cue.start && previewTime <= cue.end,
+      active: currentCaptionCue?.id === cue.id,
       title: `Caption\n${formatTimePrecise(cue.start)}-${formatTimePrecise(cue.end)}\n${cue.text}`,
       colorClass: "bg-violet-500/90 text-white",
     }));
@@ -2459,14 +3228,14 @@ export function TransformationPage() {
   const timelineHookItems: TimelineItem[] = (
     hookEvents.length
       ? hookEvents
-      : !effectTimelineInitialized && styleConfig.hook_text_enabled && hookPreview
+      : !effectTimelineInitialized && styleConfig.hook_text_enabled && hookFallbackText
         ? [
             {
               id: "hook-preview",
               type: "hook_text",
               start: 0,
               end: Math.min(3, Math.max(1, clipDuration)),
-              text: hookPreview,
+              text: hookFallbackText,
             },
           ]
         : []
@@ -2480,7 +3249,7 @@ export function TransformationPage() {
     end: event.end,
     label: "Hook",
     active: previewTime >= event.start && previewTime <= event.end,
-    title: `Hook Text\n${formatTimePrecise(event.start)}-${formatTimePrecise(event.end)}\n${event.text || hookPreview}`,
+    title: `Hook Text\n${formatTimePrecise(event.start)}-${formatTimePrecise(event.end)}\n${hookCueText(event, hookFallbackText)}`,
     colorClass: "bg-cyan-500 text-white",
   }));
   const timelinePunchItems: TimelineItem[] = editableEffectTimeline
@@ -2545,7 +3314,9 @@ export function TransformationPage() {
     }
     const sourceTime = videoTime;
     const currentIndex = videoSegments.findIndex(
-      (segment) => previewTime >= segment.start - 0.05 && previewTime < segment.end - 0.05,
+      (segment) =>
+        previewTimeRef.current >= segment.start - 0.05 &&
+        previewTimeRef.current < segment.end - 0.05,
     );
     const segment = videoSegments[Math.max(0, currentIndex)] || videoSegments[0];
     if (!segment) return 0;
@@ -2562,7 +3333,11 @@ export function TransformationPage() {
       ),
     );
   };
-  const updateCaptionTimeline = (cues: EditableCaptionCue[], recordHistory = true) => {
+  const updateCaptionTimeline = (
+    cues: EditableCaptionCue[],
+    recordHistory = true,
+    syncRequired?: boolean,
+  ) => {
     if (recordHistory) recordEditorHistory(draft, "caption-timeline", true);
     setTimelineError("");
     setEditorDirty(true);
@@ -2577,6 +3352,8 @@ export function TransformationPage() {
               ...styleDefaults.clean_podcast,
               ...(current.clipper_style_config || {}),
               caption_timeline_initialized: true,
+              caption_sync_required:
+                syncRequired ?? Boolean(current.clipper_style_config?.caption_sync_required),
               caption_timeline: cues.map((cue) => ({
                 ...cue,
                 start: Math.max(0, Math.min(clipDuration, cue.start)),
@@ -2585,6 +3362,25 @@ export function TransformationPage() {
             },
           }
         : current,
+    );
+  };
+  const syncCaptionWithVideo = () => {
+    if (
+      captionTimelineInitialized &&
+      editableCaptionCues.length > 0 &&
+      !window.confirm(
+        "Sinkronisasi akan menyusun ulang caption berdasarkan susunan video saat ini. Edit caption manual dapat berubah.",
+      )
+    ) {
+      return;
+    }
+    const syncedCues = projectCaptionCues(context.data.caption_cues || [], videoSequence);
+    updateCaptionTimeline(syncedCues, true, false);
+    setSelectedCaptionId(null);
+    setMessage(
+      syncedCues.length
+        ? `${syncedCues.length} caption disinkronkan dengan susunan video.`
+        : "Sinkronisasi selesai, tetapi tidak ada segment caption yang overlap dengan video.",
     );
   };
   const videoTimeFromClipTime = (clipTime: number) => {
@@ -2627,24 +3423,51 @@ export function TransformationPage() {
   const setPreviewTimeFromVideo = (videoTime: number) => {
     if (timelineDraggingRef.current) return;
     const clipTime = clipTimeFromVideoTime(videoTime);
+    previewTimeRef.current = clipTime;
     setPreviewTime(clipTime);
     syncExtractedPreviewAudio(clipTime, !previewVideoRef.current?.paused);
   };
   const seekPreviewTo = (clipTime: number) => {
     const safeTime = clampClipTime(clipTime);
     const video = previewVideoRef.current;
+    previewTimeRef.current = safeTime;
     setPreviewTime(safeTime);
     if (video) {
       video.currentTime = videoTimeFromClipTime(safeTime);
     }
     syncExtractedPreviewAudio(safeTime, Boolean(video && !video.paused));
   };
+  const stopPreviewClock = () => {
+    if (previewClockFrameRef.current !== null) {
+      window.cancelAnimationFrame(previewClockFrameRef.current);
+      previewClockFrameRef.current = null;
+    }
+  };
+  const startPreviewClock = () => {
+    stopPreviewClock();
+    previewClockLastUpdateRef.current = 0;
+    const updateClock = (timestamp: number) => {
+      const video = previewVideoRef.current;
+      if (!video || video.paused || video.ended) {
+        previewClockFrameRef.current = null;
+        return;
+      }
+      if (timestamp - previewClockLastUpdateRef.current >= 50) {
+        previewClockLastUpdateRef.current = timestamp;
+        setPreviewTimeFromVideo(video.currentTime);
+      }
+      previewClockFrameRef.current = window.requestAnimationFrame(updateClock);
+    };
+    previewClockFrameRef.current = window.requestAnimationFrame(updateClock);
+  };
   const handlePreviewPlay = () => {
     setPreviewPlaying(true);
+    startPreviewClock();
     syncExtractedPreviewAudio(previewTime, true);
   };
   const handlePreviewPause = () => {
     setPreviewPlaying(false);
+    stopPreviewClock();
     previewAudioRef.current?.pause();
   };
   const mediaTrackSelected =
@@ -2679,6 +3502,10 @@ export function TransformationPage() {
               })),
               [track === "audio" ? "audio_track_deleted" : "video_track_deleted"]:
                 sequence.length === 0,
+              caption_sync_required:
+                track === "video" && captionTimelineInitialized
+                  ? true
+                  : Boolean(current.clipper_style_config?.caption_sync_required),
               effect_timeline: track === "audio"
                 ? (current.clipper_style_config?.effect_timeline || [])
                 : events,
@@ -2867,6 +3694,7 @@ export function TransformationPage() {
     }
     mediaResizeRef.current = null;
     setMediaResizePreview(null);
+    setAutosaveWakeRevision((revision) => revision + 1);
   };
   const startTimedItemResize = (
     event: ReactPointerEvent<HTMLSpanElement>,
@@ -2930,6 +3758,7 @@ export function TransformationPage() {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
     timedItemResizeRef.current = null;
+    setAutosaveWakeRevision((revision) => revision + 1);
   };
   const splitSelectedMedia = () => {
     if (!mediaTrackSelected) {
@@ -3096,6 +3925,59 @@ export function TransformationPage() {
     setMessage(`Bagian ditempel di ${formatTimePrecise(insertAt)}.`);
   };
   const selectedCaption = editableCaptionCues.find((cue) => cue.id === selectedCaptionId) || null;
+  const selectedCaptionText = String(selectedCaption?.text || "").trim();
+  const selectedCaptionWordCount = captionWords(selectedCaption?.text || "").length;
+  const selectedCaptionCharacterCount = selectedCaptionText.length;
+  const selectedCaptionDuration = selectedCaption
+    ? Math.max(0, selectedCaption.end - selectedCaption.start)
+    : 0;
+  const updateSelectedCaptionText = (text: string) => {
+    if (!selectedCaption) return;
+    recordEditorHistory(draft, `caption-text:${selectedCaption.id}`);
+    updateCaptionTimeline(
+      editableCaptionCues.map((cue) =>
+        cue.id === selectedCaption.id ? { ...cue, text } : cue,
+      ),
+      false,
+    );
+  };
+  const finishSelectedCaptionTextEdit = () => {
+    historyGroupRef.current = null;
+    setAutosaveWakeRevision((revision) => revision + 1);
+  };
+  const deleteSelectedCaptionCue = () => {
+    if (!selectedCaption) return;
+    updateCaptionTimeline(editableCaptionCues.filter((cue) => cue.id !== selectedCaption.id));
+    setSelectedCaptionId(null);
+    setMessage("Caption dihapus dari timeline.");
+  };
+  const reflowSelectedCaption = () => {
+    if (!selectedCaption) return;
+    const sourceCue = selectedCaption;
+    const usedIds = new Set(editableCaptionCues.map((cue) => cue.id));
+    const reflowed = reflowCaptionCue(sourceCue, usedIds, captionStyle.maxWords);
+    const nextCues = editableCaptionCues.flatMap((cue) =>
+      cue.id === selectedCaption.id ? reflowed : [cue],
+    );
+    updateCaptionTimeline(nextCues);
+    setSelectedCaptionId(reflowed[0].id);
+    setMessage(
+      reflowed.length > 1
+        ? `Caption dipecah menjadi ${reflowed.length} cue (maksimal ${captionStyle.maxWords} kata).`
+        : `Caption sudah maksimal ${captionStyle.maxWords} kata.`,
+    );
+  };
+  const reflowAllCaptions = () => {
+    const sourceCues = editableCaptionCues;
+    const usedIds = new Set(sourceCues.map((cue) => cue.id));
+    const nextCues = sourceCues.flatMap((cue) =>
+      reflowCaptionCue(cue, usedIds, captionStyle.maxWords),
+    );
+    updateCaptionTimeline(nextCues);
+    setMessage(
+      `Semua caption dirapikan menjadi ${nextCues.length} cue (maksimal ${captionStyle.maxWords} kata).`,
+    );
+  };
   const timedTrackSelected = Boolean(selectedCaption || selectedEvent);
   const anyTrackSelected = mediaTrackSelected || timedTrackSelected || Boolean(selectedAdditionalAudioTrack);
   const selectedTrackSupportsMediaEditing = mediaTrackSelected || timedTrackSelected;
@@ -3259,6 +4141,7 @@ export function TransformationPage() {
   const markEditorPreferenceDirty = () => {
     setEditorDirty(true);
     setSaveFailure(false);
+    setSaveFailureMessage("");
   };
   const clampTimelineHeight = (value: number) =>
     Math.max(220, Math.min(value, Math.max(320, window.innerHeight - 280)));
@@ -3319,6 +4202,7 @@ export function TransformationPage() {
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
+    setAutosaveWakeRevision((revision) => revision + 1);
   };
   const timeFromClientX = (clientX: number, left: number, width: number) => {
     const ratio = width ? Math.min(1, Math.max(0, (clientX - left) / width)) : 0;
@@ -3365,6 +4249,7 @@ export function TransformationPage() {
     if (!eventDrag || event.pointerId !== eventDrag.pointerId) return;
     event.currentTarget.releasePointerCapture(event.pointerId);
     setEventDrag(null);
+    setAutosaveWakeRevision((revision) => revision + 1);
   };
   const selectTimelineItem = (item: TimelineItem) => {
     if (item.type === "additional_audio") {
@@ -3384,7 +4269,13 @@ export function TransformationPage() {
       return;
     }
     if (item.type === "caption") {
-      setSelectedCaptionId(item.eventId || item.id);
+      const captionId = item.eventId || item.id;
+      previewVideoRef.current?.pause();
+      previewAudioRef.current?.pause();
+      stopPreviewClock();
+      setPreviewPlaying(false);
+      seekPreviewTo(item.start);
+      setSelectedCaptionId(captionId);
       setSelectedEventId(null);
       setSelectedMediaSegmentId(null);
       setSelectedEditorContext("caption");
@@ -3434,14 +4325,14 @@ export function TransformationPage() {
     onItemPointerMove: handleEventPointerMove,
     onItemPointerUp: handleEventPointerUp,
   };
-  const layerTrackProps = (track: LayerTrack) => {
-    const index = layerOrder.indexOf(track);
+  const timelineTrackOrderProps = (track: TimelineTrackKey) => {
+    const index = trackOrder.indexOf(track);
     return {
       order: index,
       canMoveUp: index > 0,
-      canMoveDown: index >= 0 && index < layerOrder.length - 1,
-      onMoveUp: () => moveLayerTrack(track, -1),
-      onMoveDown: () => moveLayerTrack(track, 1),
+      canMoveDown: index >= 0 && index < trackOrder.length - 1,
+      onMoveUp: () => moveTimelineTrack(track, -1),
+      onMoveDown: () => moveTimelineTrack(track, 1),
     };
   };
   const previewModeText = renderedPreviewAvailable
@@ -3452,25 +4343,26 @@ export function TransformationPage() {
   const currentRenderLabel = renderLabel(activeRender, renderedPreviewAvailable);
   const exportIsHd = exportResolution !== "540";
   const exportMatchesRequestedResolution = Boolean(
-    activeRender?.status === "completed" &&
-    (!exportIsHd || activeRender.width >= 1000),
+    exportResultRender?.status === "completed" &&
+    exportResultRender.output_url &&
+    (!exportIsHd || exportResultRender.width >= 1000),
   );
   const exportValidating = Boolean(
     exportMatchesRequestedResolution &&
-    activeRender &&
-    exportValidatedRenderId !== activeRender.id &&
+    exportResultRender &&
+    exportValidatedRenderId !== exportResultRender.id &&
     !exportAwaitingHd &&
     !queueRender.isPending,
   );
   const exportReady = Boolean(
     exportMatchesRequestedResolution &&
-    activeRender &&
-    exportValidatedRenderId === activeRender.id &&
+    exportResultRender &&
+    exportValidatedRenderId === exportResultRender.id &&
     !renderDirty &&
     !exportAwaitingHd,
   );
-  const exportFailed = activeRender?.status === "failed" || Boolean(queueRender.error);
-  const exportBackendStatus = activeRender?.status;
+  const exportFailed = exportResultRender?.status === "failed" || Boolean(queueRender.error);
+  const exportBackendStatus = exportResultRender?.status;
   const exportInProgress = Boolean(
     exportSubmissionStage ||
     queueRender.isPending ||
@@ -3480,11 +4372,11 @@ export function TransformationPage() {
   );
   const exportLongRunning = Boolean(
     exportTaskObservation &&
-    exportTaskObservation.id === activeRender?.id &&
+    exportTaskObservation.id === exportResultRender?.id &&
     exportInProgress &&
     exportClock - exportTaskObservation.startedAt >= EXPORT_LONG_RUNNING_MS,
   );
-  const backendProgressValue = activeRender?.progress_percent ?? activeRender?.progress;
+  const backendProgressValue = exportResultRender?.progress_percent ?? exportResultRender?.progress;
   const exportProgress = typeof backendProgressValue === "number" && Number.isFinite(backendProgressValue)
     ? Math.min(100, Math.max(0, backendProgressValue <= 1 ? backendProgressValue * 100 : backendProgressValue))
     : null;
@@ -3505,11 +4397,20 @@ export function TransformationPage() {
                 : toolbarUnsaved
                   ? "Perubahan akan disimpan sebelum export."
                   : "Siap untuk export.";
-  const exportFileSize = exportReady && activeRender?.file_size_bytes
-    ? `${(activeRender.file_size_bytes / 1024 / 1024).toFixed(1)} MB`
+  const exportFileSize = exportReady && exportResultRender?.file_size_bytes
+    ? `${(exportResultRender.file_size_bytes / 1024 / 1024).toFixed(1)} MB`
     : "Tersedia setelah export";
-  const sourceFrameRate = activeRender?.frame_rate && activeRender.frame_rate !== 30
-    ? Math.round(activeRender.frame_rate)
+  const sourceFrameRate = exportResultRender?.frame_rate && exportResultRender.frame_rate !== 30
+    ? Math.round(exportResultRender.frame_rate)
+    : null;
+  const exportDownloadFilename = sanitizeDownloadFilename(
+    exportFilename,
+    uploadTitle,
+    context.data?.candidate_title,
+    context.data?.project_title,
+  );
+  const exportResultUrl = exportReady && exportResultRender?.output_url
+    ? `${downloadUrl(exportResultRender.id)}?v=${exportResultRender.id}-${exportResultRender.file_size_bytes || 0}&output_filename=${encodeURIComponent(exportDownloadFilename)}`
     : null;
   const startExport = () => {
     if (!canStartExport || queueRender.isPending || toolbarExportBusy) return;
@@ -3570,6 +4471,23 @@ export function TransformationPage() {
         draft.social_caption.length > 64 ? "..." : ""
       }`
     : "Deskripsi belum tersedia";
+  const contextualTabs: ReadonlyArray<readonly [EditorContext, string]> = manualEditorMode
+    ? [
+        ["media", "Media"],
+        ["video", "Video"],
+        ["audio", "Audio"],
+        ["caption", "Caption"],
+        ["hook", "Hook"],
+        ["effect", "Efek"],
+      ]
+    : [
+        ["video", "Video"],
+        ["audio", "Audio"],
+        ["caption", "Caption"],
+        ["hook", "Hook"],
+        ["keyword", "Keyword"],
+        ["effect", "Efek"],
+      ];
 
   return (
     <div className={`editor-workspace flex min-h-[calc(100vh-80px)] flex-col rounded-xl border border-zinc-800 bg-[#151719] shadow-2xl shadow-black/30 xl:h-[calc(100vh-80px)] xl:min-h-[720px] xl:overflow-hidden ${
@@ -3579,8 +4497,18 @@ export function TransformationPage() {
         <aside className="editor-sidepanel min-h-0 bg-[#1d1f23] xl:h-full xl:overflow-y-auto">
           <section className="p-4">
             <div className="flex items-center justify-between gap-3">
-              <h2 className="text-lg font-black text-slate-950">Konten Klip</h2>
-              <span className={`rounded-full px-2 py-1 text-[10px] font-black ${editorSaveStatusClass}`}>
+              <div>
+                <h2 className="text-lg font-black text-slate-950">
+                  {manualEditorMode ? "Video Utama" : "Konten Klip"}
+                </h2>
+                {manualEditorMode && (
+                  <p className="text-xs font-semibold text-emerald-700">Mode edit manual</p>
+                )}
+              </div>
+              <span
+                className={`rounded-full px-2 py-1 text-[10px] font-black ${editorSaveStatusClass}`}
+                title={editorSaveStatusTitle}
+              >
                 {editorSaveStatusLabel}
               </span>
             </div>
@@ -3590,9 +4518,11 @@ export function TransformationPage() {
                 isOpen={openLeftSection === "title"}
                 onToggle={toggleLeftSection}
                 summary={uploadTitle || "Judul belum tersedia"}
-                title="Judul Klip"
+                title={manualEditorMode ? "Judul Video" : "Judul Klip"}
               >
-                <label htmlFor="upload_title">Judul Klip</label>
+                <label htmlFor="upload_title">
+                  {manualEditorMode ? "Judul Video" : "Judul Klip"}
+                </label>
                 <input
                   id="upload_title"
                   maxLength={300}
@@ -3602,14 +4532,16 @@ export function TransformationPage() {
                     setUploadTitle(event.target.value);
                   }}
                 />
-                <button
-                  className="btn-secondary mt-2 px-3 py-2 text-xs"
-                  disabled={regenerate.isPending}
-                  onClick={() => regenerate.mutate()}
-                  type="button"
-                >
-                  {regenerate.isPending ? "Membuat..." : "Buat ulang judul"}
-                </button>
+                {!manualEditorMode && (
+                  <button
+                    className="btn-secondary mt-2 px-3 py-2 text-xs"
+                    disabled={regenerate.isPending}
+                    onClick={() => regenerate.mutate()}
+                    type="button"
+                  >
+                    {regenerate.isPending ? "Membuat..." : "Buat ulang judul"}
+                  </button>
+                )}
               </AccordionSection>
 
               <AccordionSection
@@ -3623,14 +4555,16 @@ export function TransformationPage() {
                   <label className="mb-0" htmlFor="hook_text_panel">
                     Hook Pembuka
                   </label>
-                  <button
-                    type="button"
-                    className="btn-secondary px-3 py-2 text-xs"
-                    disabled={regenerateHook.isPending}
-                    onClick={() => regenerateHook.mutate()}
-                  >
-                    {regenerateHook.isPending ? "Membuat..." : "Buat ulang hook"}
-                  </button>
+                  {!manualEditorMode && (
+                    <button
+                      type="button"
+                      className="btn-secondary px-3 py-2 text-xs"
+                      disabled={regenerateHook.isPending}
+                      onClick={() => regenerateHook.mutate()}
+                    >
+                      {regenerateHook.isPending ? "Membuat..." : "Buat ulang hook"}
+                    </button>
+                  )}
                 </div>
                 <textarea
                   id="hook_text_panel"
@@ -3645,7 +4579,7 @@ export function TransformationPage() {
                 </p>
               </AccordionSection>
 
-              <AccordionSection
+              {!manualEditorMode && <AccordionSection
                 id="transcript"
                 isOpen={openLeftSection === "transcript"}
                 onToggle={(id) => {
@@ -3658,7 +4592,7 @@ export function TransformationPage() {
                 <div className="max-h-52 overflow-y-auto whitespace-pre-line text-sm leading-6 text-slate-700">
                   {context.data.candidate_transcript || "Transkrip suara belum tersedia untuk klip ini."}
                 </div>
-              </AccordionSection>
+              </AccordionSection>}
 
               <AccordionSection
                 id="caption"
@@ -3678,14 +4612,16 @@ export function TransformationPage() {
                   }}
                 />
                 <div className="mt-2 flex flex-wrap gap-2">
-                  <button
-                    className="btn-secondary px-3 py-2 text-xs"
-                    disabled={regenerateCaption.isPending || applySource.isPending}
-                    onClick={() => regenerateCaption.mutate()}
-                    type="button"
-                  >
-                    {regenerateCaption.isPending ? "Membuat..." : "Buat ulang deskripsi"}
-                  </button>
+                  {!manualEditorMode && (
+                    <button
+                      className="btn-secondary px-3 py-2 text-xs"
+                      disabled={regenerateCaption.isPending || applySource.isPending}
+                      onClick={() => regenerateCaption.mutate()}
+                      type="button"
+                    >
+                      {regenerateCaption.isPending ? "Membuat..." : "Buat ulang deskripsi"}
+                    </button>
+                  )}
                   <button
                     className="btn-secondary px-3 py-2 text-xs"
                     disabled={!draft.social_caption}
@@ -3724,7 +4660,7 @@ export function TransformationPage() {
                 </div>
               </AccordionSection>
 
-              <AccordionSection
+              {!manualEditorMode && <AccordionSection
                 id="potential"
                 isOpen={openLeftSection === "potential"}
                 onToggle={toggleLeftSection}
@@ -3758,7 +4694,7 @@ export function TransformationPage() {
                 {report?.recommendations_json?.[0] && (
                   <p className="mt-2 text-xs text-violet-800">{report.recommendations_json[0]}</p>
                 )}
-              </AccordionSection>
+              </AccordionSection>}
             </div>
           </section>
         </aside>
@@ -3785,7 +4721,9 @@ export function TransformationPage() {
             className="flex min-h-0 flex-1 items-center justify-center px-3 py-2.5"
             onClick={() => {
               setSelectedEventId(null);
-              setSelectedEditorContext("video");
+              setSelectedEditorContext(
+                manualEditorMode && videoSequence.length === 0 ? "media" : "video",
+              );
             }}
           >
             <div className="relative aspect-[9/16] h-[clamp(320px,44vh,520px)] max-h-full max-w-full overflow-hidden rounded-lg bg-black shadow-2xl shadow-black/50 ring-1 ring-white/10">
@@ -3816,6 +4754,7 @@ export function TransformationPage() {
                     audioVolume={audioSettings.volume}
                     src={sourceClipUrl}
                     preset={preset}
+                    framing={videoFraming}
                     controls
                     onLoadedMetadata={setPreviewTimeFromVideo}
                     onPause={handlePreviewPause}
@@ -3823,6 +4762,27 @@ export function TransformationPage() {
                     onSeeked={setPreviewTimeFromVideo}
                     onTimeUpdate={setPreviewTimeFromVideo}
                     videoRef={previewVideoRef}
+                  />
+                </div>
+              )}
+              {manualEditorMode && videoSequence.length === 0 && (
+                <div
+                  className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 bg-zinc-950 p-5 text-center"
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  <div>
+                    <p className="text-base font-black text-zinc-100">
+                      Import media untuk mulai mengedit
+                    </p>
+                    <p className="mt-1 max-w-xs text-xs font-semibold text-zinc-400">
+                      Video pertama akan otomatis masuk timeline.
+                    </p>
+                  </div>
+                  <EditorMediaImportControls
+                    className="grid w-full max-w-xs grid-cols-1 gap-2"
+                    disabled={editorMediaUploading}
+                    onImport={importEditorMedia}
+                    uploadingKind={editorMediaUploadKind}
                   />
                 </div>
               )}
@@ -3843,26 +4803,58 @@ export function TransformationPage() {
                   Track Video kosong
                 </div>
               )}
-              {!renderedPreviewAvailable && (
-                <>
-                  {styleConfig.hook_text_enabled && liveHookEvent && (liveHookEvent.text || hookPreview) && (
-                    <div
-                      className="pointer-events-auto absolute left-8 right-8 top-8 cursor-pointer rounded-xl bg-black/55 p-3 text-center text-base font-black text-white"
-                      style={{ zIndex: visualLayerZIndex("hook") }}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        const hookEvent = editableEffectTimeline.find((item) => item.type === "hook_text");
-                        setSelectedEventId(hookEvent?.id || null);
-                        setSelectedEditorContext("hook");
-                      }}
+              {hookPreviewState.shouldRenderHookOverlay && liveHookEvent && liveHookText && (
+                <div
+                  data-hook-duplicate-suppressed={
+                    hookPreviewState.hookPreviewDuplicateSuppressed
+                  }
+                  data-hook-render-source={hookPreviewState.hookPreviewRenderSource}
+                  className={`pointer-events-auto absolute max-h-20 cursor-pointer overflow-hidden rounded-lg text-center leading-tight ${
+                    ""
+                  } ${activeHookTemplate.widthClass} ${activeHookTemplate.paddingClass} ${
+                    activeHookTemplate.containerClass
+                  } ${hookOverlayTextSizeClass(liveHookText, hookTextSize, hookTextTemplate)}`}
+                  style={{
+                    ...hookUnifiedTextStyle,
+                    top: `${hookSafeArea.topPercent}%`,
+                    fontSize: `${hookSafeArea.fontSizePx}px`,
+                    zIndex: visualLayerZIndex("hook"),
+                    textShadow: hookUnifiedTextStyle.textShadow || activeHookTemplate.textShadow,
+                    fontFamily: activeHookFont.fontFamily,
+                  }}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setSelectedEventId(liveHookEvent.id || null);
+                    setSelectedEditorContext("hook");
+                  }}
+                >
+                  {activeHookTemplate.badge && (
+                    <span
+                      className={`block font-black ${
+                        activeHookTemplate.badgeClass || "mb-1 text-[8px] tracking-wide opacity-90"
+                      }`}
                     >
-                      {liveHookEvent.text || hookPreview}
-                    </div>
+                      {activeHookTemplate.badge}
+                    </span>
                   )}
-                  {styleConfig.keyword_popup_enabled && liveKeywordEvent?.text && (
+                  <span className={`block line-clamp-2 ${activeHookTemplate.textClass}`}>
+                    {hookSafeArea.lines.map((line, index) => (
+                      <span key={`${line}-${index}`} className="block whitespace-normal">
+                        {line}
+                      </span>
+                    ))}
+                  </span>
+                </div>
+              )}
+              {!renderedPreviewAvailable &&
+                styleConfig.keyword_popup_enabled &&
+                liveKeywordEvent?.text && (
                     <div
-                      className="pointer-events-auto absolute bottom-32 left-10 right-10 cursor-pointer rounded-xl bg-yellow-300/90 px-3 py-2 text-center text-xl font-black text-slate-950 shadow-xl"
-                      style={{ zIndex: visualLayerZIndex("keyword") }}
+                      className="pointer-events-auto absolute bottom-32 left-[16%] right-[16%] max-h-14 cursor-pointer overflow-hidden rounded-md px-2 py-1.5 text-center text-sm leading-tight md:text-base"
+                      style={{
+                        ...keywordUnifiedTextStyle,
+                        zIndex: visualLayerZIndex("keyword"),
+                      }}
                       onClick={(event) => {
                         event.stopPropagation();
                         setSelectedEventId(liveKeywordEvent.id || null);
@@ -3871,63 +4863,68 @@ export function TransformationPage() {
                     >
                       {liveKeywordEvent.text}
                     </div>
-                  )}
-                  {subtitlePreview && (
-                    <div
-                      className={`pointer-events-auto absolute left-[10%] right-[10%] cursor-pointer text-center leading-snug ${captionPositionClass(
-                        captionStyle.position,
-                      )} ${captionSizeClass(captionStyle.fontSize)} ${captionWeightClass(
-                        captionStyle.fontWeight,
-                      )}`}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        setSelectedEditorContext("caption");
-                      }}
-                      style={{
-                        zIndex: visualLayerZIndex("caption"),
-                        color: captionStyle.textColor,
-                        textShadow: [
-                          captionStyle.outlineEnabled
-                            ? "0 1px 2px #000, 1px 0 1px #000, -1px 0 1px #000, 0 -1px 1px #000"
-                            : "",
-                          captionStyle.shadowEnabled ? "0 4px 10px rgba(0,0,0,0.55)" : "",
-                        ]
-                          .filter(Boolean)
-                          .join(", "),
-                      }}
-                    >
-                      <span
-                        className={`inline-block max-w-full rounded-lg px-3 py-2 ${
-                          captionStyle.backgroundEnabled ? "" : "bg-transparent"
-                        }`}
-                        style={{
-                          backgroundColor: captionStyle.backgroundEnabled
-                            ? `rgba(0,0,0,${captionStyle.backgroundOpacity})`
-                            : "transparent",
-                        }}
-                      >
-                        {captionStyle.karaokeEnabled ? (
-                          karaokeWords.map((word, index) => (
-                            <span
-                              key={`${word}-${index}`}
-                              style={{
-                                color:
-                                  index <= karaokeActiveIndex
-                                    ? captionStyle.highlightColor
-                                    : captionStyle.textColor,
-                              }}
-                            >
-                              {word}
-                              {index < karaokeWords.length - 1 ? " " : ""}
-                            </span>
-                          ))
-                        ) : (
-                          subtitlePreview
-                        )}
-                      </span>
-                    </div>
-                  )}
-                </>
+              )}
+              {captionOverlayText && (
+                <div
+                  className={`pointer-events-auto absolute left-[8%] right-[8%] cursor-pointer text-center leading-tight ${captionPositionClass(
+                    captionStyle.position,
+                  )} ${captionSizeClass(
+                    captionStyle.fontSize,
+                    captionStyle.preset,
+                    captionPreviewWordCount,
+                  )} ${captionWeightClass(
+                    captionStyle.fontWeight,
+                  )}`}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setSelectedCaptionId(currentCaptionCue?.id || null);
+                    setSelectedEditorContext("caption");
+                  }}
+                  style={{
+                    zIndex: visualLayerZIndex("caption"),
+                    color: captionUnifiedTextStyle.color || captionStyle.textColor,
+                    fontFamily: captionUnifiedTextStyle.fontFamily,
+                    fontWeight: captionUnifiedTextStyle.fontWeight,
+                    textTransform: captionUnifiedTextStyle.textTransform,
+                    textShadow:
+                      captionUnifiedTextStyle.textShadow || captionTextShadow(captionStyle),
+                    WebkitTextStroke: captionUnifiedTextStyle.WebkitTextStroke,
+                    paintOrder: captionUnifiedTextStyle.paintOrder,
+                  }}
+                >
+                  <span
+                    className={`inline-block max-w-full rounded-md px-3 py-1.5 ${
+                      captionStyle.backgroundEnabled ? "" : "bg-transparent"
+                    }`}
+                    style={{
+                      backgroundColor: captionStyle.backgroundEnabled
+                        ? captionUnifiedTextStyle.backgroundColor ||
+                          `rgba(0,0,0,${captionStyle.backgroundOpacity})`
+                        : captionUnifiedTextStyle.backgroundColor || "transparent",
+                    }}
+                  >
+                    <span className="block break-words">
+                      {captionStyle.displayMode === "karaoke" ? (
+                        karaokeWords.map((word, index) => (
+                          <span
+                            key={`${word}-${index}`}
+                            style={{
+                              color:
+                                index === karaokeActiveIndex
+                                  ? captionStyle.highlightColor
+                                  : captionUnifiedTextStyle.color || captionStyle.textColor,
+                            }}
+                          >
+                            {word}
+                            {index < karaokeWords.length - 1 ? " " : ""}
+                          </span>
+                        ))
+                      ) : (
+                        captionOverlayText
+                      )}
+                    </span>
+                  </span>
+                </div>
               )}
             </div>
           </div>
@@ -3951,7 +4948,9 @@ export function TransformationPage() {
                   Contextual Tools
                 </p>
                 <h2 className="mt-1 truncate text-base font-black text-slate-950">
-                  {selectedEditorContext === "audio"
+                  {selectedEditorContext === "media"
+                    ? "Media Editor"
+                    : selectedEditorContext === "audio"
                     ? "Audio Tools"
                     : selectedEditorContext === "caption"
                       ? "Caption Tools"
@@ -3970,19 +4969,15 @@ export function TransformationPage() {
                               : "Video Tools"}
                 </h2>
               </div>
-              <span className={`shrink-0 rounded-full px-2 py-1 text-[10px] font-black ${editorSaveStatusClass}`}>
+              <span
+                className={`shrink-0 rounded-full px-2 py-1 text-[10px] font-black ${editorSaveStatusClass}`}
+                title={editorSaveStatusTitle}
+              >
                 {editorSaveStatusLabel}
               </span>
             </div>
             <div className="mt-3 grid grid-cols-3 gap-1">
-              {([
-                ["video", "Video"],
-                ["audio", "Audio"],
-                ["caption", "Caption"],
-                ["hook", "Hook"],
-                ["keyword", "Keyword"],
-                ["effect", "Efek"],
-              ] as const).map(([contextValue, label]) => (
+              {contextualTabs.map(([contextValue, label]) => (
                 <button
                   className={`rounded-lg px-2 py-2 text-xs font-black ${
                     selectedEditorContext === contextValue
@@ -4016,6 +5011,69 @@ export function TransformationPage() {
             </div>
           </section>
 
+          {(!manualEditorMode || selectedEditorContext === "media") && (
+          <ToolSection title="Media Editor">
+            <p className="text-[11px] font-semibold text-zinc-500">
+              Impor video, audio, atau gambar langsung dari editor.
+            </p>
+            <EditorMediaImportControls
+              className="mt-2 grid grid-cols-1 gap-2"
+              disabled={editorMediaUploading}
+              onImport={importEditorMedia}
+              uploadingKind={editorMediaUploadKind}
+            />
+            {editorMediaQuery.isLoading ? (
+              <p className="mt-3 text-xs font-semibold text-zinc-400">Memuat media...</p>
+            ) : editorMediaQuery.data?.length ? (
+              <div className="mt-3 space-y-2">
+                {editorMediaQuery.data.map((asset) => (
+                  <div
+                    className="rounded-xl border border-zinc-700 bg-[#25282d] p-2"
+                    key={asset.asset_id}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="min-w-0 truncate text-xs font-black text-zinc-100">
+                        {asset.name}
+                      </span>
+                      <span className="shrink-0 rounded bg-zinc-700 px-1 text-[10px] uppercase text-zinc-300">
+                        {asset.kind}
+                      </span>
+                    </div>
+                    <div className="mt-2 flex gap-2">
+                      {asset.kind === "image" ? (
+                        <span className="px-1 py-1 text-[10px] font-bold text-emerald-600">
+                          Tersimpan di media
+                        </span>
+                      ) : (
+                        <button
+                          className="btn-secondary px-2 py-1 text-[10px]"
+                          onClick={() => addEditorMediaToTimeline(asset)}
+                          type="button"
+                        >
+                          + Timeline
+                        </button>
+                      )}
+                      {asset.kind !== "image" && (
+                        <a
+                          className="btn-secondary px-2 py-1 text-[10px]"
+                          href={mediaUrl(transformationId, asset.asset_id)}
+                          target="_blank"
+                        >
+                          Putar
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="mt-3 rounded-xl bg-slate-50 p-3 text-xs font-semibold text-zinc-500">
+                Belum ada media diimpor.
+              </p>
+            )}
+          </ToolSection>
+          )}
+
           {selectedEditorContext === "video" && (
             <>
           <ToolSection title="Track Video">
@@ -4024,71 +5082,187 @@ export function TransformationPage() {
               <p className="mt-1">Track video aktif penuh. Pilih template di bawah untuk crop dan layout hasil export.</p>
             </div>
           </ToolSection>
-          <ToolSection title="Template Video">
+          <ToolSection title="Frame Position">
             <div className="grid grid-cols-2 gap-2">
-              {presetOptions.map(({ value, label }) => (
-                <button
-                  className={`rounded-xl border-2 p-2 text-left text-xs font-bold ${
-                    preset === value
-                      ? "border-violet-600 bg-violet-50 text-violet-700"
-                      : "border-slate-200 bg-slate-50 text-slate-600"
-                  }`}
-                  key={value}
-                  onClick={() => selectPreset(value)}
-                >
-                  <div className="mb-2 aspect-[9/16] w-12 overflow-hidden rounded-md bg-black">
-                    <PresetVideo src={sourceClipUrl} preset={value} />
-                  </div>
-                  {label}
-                </button>
-              ))}
+              <button
+                className="btn-secondary px-3 py-2 text-xs"
+                onClick={() => setVideoFraming({ x: videoFraming.x - 5 })}
+                type="button"
+              >
+                Geser Kiri
+              </button>
+              <button
+                className="btn-secondary px-3 py-2 text-xs"
+                onClick={() => setVideoFraming({ x: videoFraming.x + 5 })}
+                type="button"
+              >
+                Geser Kanan
+              </button>
+              <button
+                className="btn-secondary px-3 py-2 text-xs"
+                onClick={() => setVideoFraming({ y: videoFraming.y - 5 })}
+                type="button"
+              >
+                Geser Atas
+              </button>
+              <button
+                className="btn-secondary px-3 py-2 text-xs"
+                onClick={() => setVideoFraming({ y: videoFraming.y + 5 })}
+                type="button"
+              >
+                Geser Bawah
+              </button>
+              <button
+                className="btn-secondary px-3 py-2 text-xs"
+                onClick={() => setVideoFraming({ scale: videoFraming.scale - 0.05 })}
+                type="button"
+              >
+                Zoom -
+              </button>
+              <button
+                className="btn-secondary px-3 py-2 text-xs"
+                onClick={() => setVideoFraming({ scale: videoFraming.scale + 0.05 })}
+                type="button"
+              >
+                Zoom +
+              </button>
             </div>
+
+            <div className="mt-3 grid gap-3 rounded-xl bg-slate-50 p-3">
+              <label className="text-xs font-bold text-slate-700" htmlFor="video_framing_x">
+                <span className="flex items-center justify-between gap-2">
+                  <span>Posisi X</span>
+                  <span>{videoFraming.x.toFixed(0)}</span>
+                </span>
+                <input
+                  className="mt-1 w-full accent-violet-600"
+                  id="video_framing_x"
+                  max={40}
+                  min={-40}
+                  onChange={(event) => setVideoFraming({ x: Number(event.target.value) })}
+                  step={1}
+                  type="range"
+                  value={videoFraming.x}
+                />
+              </label>
+              <label className="text-xs font-bold text-slate-700" htmlFor="video_framing_y">
+                <span className="flex items-center justify-between gap-2">
+                  <span>Posisi Y</span>
+                  <span>{videoFraming.y.toFixed(0)}</span>
+                </span>
+                <input
+                  className="mt-1 w-full accent-violet-600"
+                  id="video_framing_y"
+                  max={40}
+                  min={-40}
+                  onChange={(event) => setVideoFraming({ y: Number(event.target.value) })}
+                  step={1}
+                  type="range"
+                  value={videoFraming.y}
+                />
+              </label>
+              <label className="text-xs font-bold text-slate-700" htmlFor="video_framing_scale">
+                <span className="flex items-center justify-between gap-2">
+                  <span>Zoom</span>
+                  <span>{videoFraming.scale.toFixed(2)}x</span>
+                </span>
+                <input
+                  className="mt-1 w-full accent-violet-600"
+                  id="video_framing_scale"
+                  max={2}
+                  min={1}
+                  onChange={(event) => setVideoFraming({ scale: Number(event.target.value) })}
+                  step={0.05}
+                  type="range"
+                  value={videoFraming.scale}
+                />
+              </label>
+            </div>
+
+            <button
+              className="btn-secondary mt-3 w-full px-3 py-2 text-xs"
+              onClick={() => setVideoFraming(defaultVideoFraming)}
+              type="button"
+            >
+              Reset Framing
+            </button>
+            <p className="mt-3 text-[11px] font-semibold leading-relaxed text-slate-500">
+              Framing berlaku untuk Potong tengah dan foreground Latar buram pada Live Preview
+              serta file export.
+            </p>
+          </ToolSection>
+          <ToolSection title="Template Video">
+            <select
+              className="w-full"
+              id="context_video_template"
+              onChange={(event) => selectPreset(event.target.value as RenderPreset)}
+              value={preset}
+            >
+              {presetOptions.map(({ value, label }) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
+            </select>
+            <p className="mt-1.5 text-[10px] font-semibold leading-tight text-slate-500">
+              {presetOptions.find((item) => item.value === preset)?.description}
+            </p>
           </ToolSection>
 
           <ToolSection title="Gaya Editing">
-            <div className="grid grid-cols-2 gap-2">
+            <select
+              className="w-full"
+              id="context_editing_style"
+              onChange={(event) => {
+                const nextStyle = event.target.value as keyof typeof styleDefaults;
+                setRenderDirty(true);
+                setRender(undefined);
+                set("clipper_style_config", {
+                  ...styleDefaults[nextStyle],
+                  hook_text: styleConfig.hook_text,
+                  hook_text_template: styleConfig.hook_text_template,
+                  hook_text_font: styleConfig.hook_text_font,
+                  hook_text_position: styleConfig.hook_text_position,
+                  hook_text_size: styleConfig.hook_text_size,
+                  hook_text_style_preset: styleConfig.hook_text_style_preset,
+                  keyword_text_style_preset: styleConfig.keyword_text_style_preset,
+                  caption_style: styleConfig.caption_style,
+                  effect_timeline: styleConfig.effect_timeline || [],
+                  audio_settings: audioSettings,
+                  media_trim: styleConfig.media_trim,
+                  media_split_points: styleConfig.media_split_points || [],
+                  media_sequence: styleConfig.media_sequence || [],
+                  video_sequence: styleConfig.video_sequence || [],
+                  audio_sequence: styleConfig.audio_sequence || [],
+                  audio_extracted: audioExtracted,
+                  video_track_deleted: videoTrackDeleted,
+                  audio_track_deleted: audioTrackDeleted,
+                  video_framing: videoFraming,
+                  editor_state_version: styleConfig.editor_state_version || 0,
+                  video_sequence_initialized:
+                    styleConfig.video_sequence_initialized || false,
+                  audio_sequence_initialized:
+                    styleConfig.audio_sequence_initialized || false,
+                  caption_timeline_initialized:
+                    styleConfig.caption_timeline_initialized || false,
+                  effect_timeline_initialized:
+                    styleConfig.effect_timeline_initialized || false,
+                  layer_order: visualLayerOrder,
+                  track_order: trackOrder,
+                  additional_audio_assets: additionalAudioAssets,
+                  additional_audio_tracks: additionalAudioTracks,
+                  caption_timeline: styleConfig.caption_timeline || [],
+                  render_preset: preset,
+                });
+              }}
+              value={styleConfig.clipper_style_preset}
+            >
               {stylePresets.map((item) => (
-                <button
-                  type="button"
-                  key={item.value}
-                  className={`rounded-xl border-2 p-2.5 text-left text-xs font-bold ${
-                    styleConfig.clipper_style_preset === item.value
-                      ? "border-violet-600 bg-violet-50 text-violet-700"
-                      : "border-slate-200 bg-slate-50 text-slate-600"
-                  }`}
-                  onClick={() => {
-                    setRenderDirty(true);
-                    setRender(undefined);
-                    set("clipper_style_config", {
-                      ...styleDefaults[item.value],
-                      hook_text: styleConfig.hook_text,
-                       effect_timeline: styleConfig.effect_timeline || [],
-                       audio_settings: audioSettings,
-                       media_trim: styleConfig.media_trim,
-                       media_split_points: styleConfig.media_split_points || [],
-                       media_sequence: styleConfig.media_sequence || [],
-                       video_sequence: styleConfig.video_sequence || [],
-                        audio_sequence: styleConfig.audio_sequence || [],
-                        audio_extracted: audioExtracted,
-                        video_track_deleted: videoTrackDeleted,
-                        audio_track_deleted: audioTrackDeleted,
-                        editor_state_version: styleConfig.editor_state_version || 0,
-                        video_sequence_initialized: styleConfig.video_sequence_initialized || false,
-                        audio_sequence_initialized: styleConfig.audio_sequence_initialized || false,
-                        caption_timeline_initialized: styleConfig.caption_timeline_initialized || false,
-                        effect_timeline_initialized: styleConfig.effect_timeline_initialized || false,
-                        layer_order: layerOrder,
-                        additional_audio_assets: additionalAudioAssets,
-                        additional_audio_tracks: additionalAudioTracks,
-                        caption_timeline: styleConfig.caption_timeline || [],
-                       render_preset: preset,
-                    });
-                  }}
-                >
+                <option key={item.value} value={item.value}>
                   {item.label}
-                </button>
+                </option>
               ))}
-            </div>
+            </select>
           </ToolSection>
 
           <ToolSection title="Efek Gaya">
@@ -4334,38 +5508,227 @@ export function TransformationPage() {
 
           {selectedEditorContext === "caption" && (
             <ToolSection title="Caption Style Studio">
-              <div className="rounded-xl bg-emerald-50 p-3 text-xs font-bold text-emerald-700">
-                <p>Caption aktif dan sinkron</p>
-                <p className="mt-1 text-emerald-800">
-                  {timelineCaptionItems.length} cue / timing read-only / max{" "}
-                  {captionStyle.maxWords} kata, {captionStyle.maxChars} karakter
-                </p>
-              </div>
-
-              <div>
-                <p className="mb-2 text-xs font-black uppercase tracking-wide text-slate-500">
-                  Preset Caption
-                </p>
-                <div className="grid grid-cols-2 gap-2">
-                  {captionStylePresets.map((item) => (
+              {captionSyncRequired && (
+                <div className="rounded-xl border border-amber-300 bg-amber-50 p-3 text-amber-900">
+                  <p className="text-xs font-black">
+                    Susunan video berubah. Caption mungkin perlu disinkronkan ulang.
+                  </p>
+                </div>
+              )}
+              <button
+                className="btn-secondary w-full px-3 py-2 text-xs"
+                onClick={syncCaptionWithVideo}
+                type="button"
+              >
+                Sinkronkan Caption dengan Video
+              </button>
+              {selectedCaption ? (
+                <div className="rounded-xl border-2 border-cyan-300 bg-cyan-50 p-3 text-slate-800 shadow-sm">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-xs font-black uppercase tracking-wide text-cyan-800">
+                      Caption Terpilih
+                    </p>
+                    <span className="rounded-full bg-cyan-200 px-2 py-1 text-[10px] font-black text-cyan-900">
+                      Dipilih user
+                    </span>
+                  </div>
+                  <label className="mt-3 block text-xs font-black text-slate-700" htmlFor="selected_caption_text">
+                    Teks caption
+                  </label>
+                  <textarea
+                    className="mt-1 min-h-24 w-full resize-y rounded-lg border border-cyan-200 bg-white p-3 text-sm font-semibold leading-relaxed text-slate-900 outline-none focus:border-cyan-500 focus:ring-2 focus:ring-cyan-200"
+                    id="selected_caption_text"
+                    onBlur={finishSelectedCaptionTextEdit}
+                    onChange={(event) => updateSelectedCaptionText(event.target.value)}
+                    placeholder="Caption ini kosong."
+                    value={selectedCaption.text || ""}
+                  />
+                  {!selectedCaptionText && (
+                    <p className="mt-2 text-xs font-bold text-slate-500">Caption ini kosong.</p>
+                  )}
+                  {selectedCaptionWordCount > captionStyle.maxWords && (
+                    <p className="mt-2 rounded-lg bg-amber-100 p-2 text-xs font-bold text-amber-900">
+                      Cue ini panjang. Gunakan Rapikan Cue Ini.
+                    </p>
+                  )}
+                  <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
+                    <div className="rounded-lg bg-white p-2">
+                      <p className="font-semibold text-slate-500">Mulai</p>
+                      <p className="mt-1 font-black text-slate-800">
+                        {formatTimePrecise(selectedCaption.start)}
+                      </p>
+                    </div>
+                    <div className="rounded-lg bg-white p-2">
+                      <p className="font-semibold text-slate-500">Selesai</p>
+                      <p className="mt-1 font-black text-slate-800">
+                        {formatTimePrecise(selectedCaption.end)}
+                      </p>
+                    </div>
+                    <div className="rounded-lg bg-white p-2">
+                      <p className="font-semibold text-slate-500">Durasi</p>
+                      <p className="mt-1 font-black text-slate-800">
+                        {selectedCaptionDuration.toFixed(2)} detik
+                      </p>
+                    </div>
+                    <div className="rounded-lg bg-white p-2">
+                      <p className="font-semibold text-slate-500">Isi</p>
+                      <p className="mt-1 font-black text-slate-800">
+                        {selectedCaptionWordCount} kata / {selectedCaptionCharacterCount} karakter
+                      </p>
+                    </div>
+                  </div>
+                  {import.meta.env.DEV && (
+                    <p className="mt-2 break-all font-mono text-[10px] text-cyan-800">
+                      Cue ID: {selectedCaption.id}
+                    </p>
+                  )}
+                  <div className="mt-3 grid grid-cols-2 gap-2">
                     <button
-                      className={`rounded-xl border-2 p-2 text-left text-xs font-bold ${
-                        captionStyle.preset === item.value
-                          ? "border-violet-600 bg-violet-50 text-violet-700"
-                          : "border-slate-200 bg-slate-50 text-slate-600"
-                      }`}
-                      key={item.value}
-                      onClick={() => setCaptionStyle(item.config)}
+                      className="btn-secondary px-3 py-2 text-xs"
+                      onClick={reflowSelectedCaption}
                       type="button"
                     >
-                      <span className="block">{item.label}</span>
-                      <span className="mt-1 block text-[10px] font-semibold opacity-75">
-                        {item.description}
-                      </span>
+                      Rapikan Cue Ini
+                    </button>
+                    <button
+                      className="rounded-lg bg-red-50 px-3 py-2 text-xs font-black text-red-700 hover:bg-red-100"
+                      onClick={deleteSelectedCaptionCue}
+                      type="button"
+                    >
+                      Hapus Caption
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-4 text-center">
+                  <p className="text-sm font-bold text-slate-700">
+                    Klik salah satu caption di timeline untuk melihat teksnya.
+                  </p>
+                  <p className="mt-2 text-xs font-semibold text-slate-500">
+                    {timelineCaptionItems.length} cue tersedia.
+                  </p>
+                </div>
+              )}
+
+              <button
+                className="btn-secondary w-full px-3 py-2 text-xs"
+                disabled={!editableCaptionCues.length}
+                onClick={reflowAllCaptions}
+                type="button"
+              >
+                Rapikan Semua Caption
+              </button>
+
+              <div className="rounded-xl border border-slate-200 p-3">
+                <p className="text-xs font-black uppercase tracking-wide text-slate-500">
+                  Mode Tampilan Caption
+                </p>
+                <div className="mt-2 grid grid-cols-3 gap-1 rounded-lg bg-slate-100 p-1">
+                  {([
+                    ["segment", "Segment"],
+                    ["karaoke", "Karaoke"],
+                    ["word_by_word", "Word by Word"],
+                  ] as Array<[CaptionDisplayMode, string]>).map(([value, label]) => (
+                    <button
+                      className={`min-h-9 rounded-md px-2 text-[11px] font-black transition-colors ${
+                        captionStyle.displayMode === value
+                          ? "bg-white text-violet-700 shadow-sm"
+                          : "text-slate-600 hover:text-slate-900"
+                      }`}
+                      key={value}
+                      onClick={() =>
+                        setCaptionStyle({
+                          displayMode: value,
+                          karaokeEnabled: value === "karaoke",
+                        })
+                      }
+                      type="button"
+                    >
+                      {label}
                     </button>
                   ))}
                 </div>
+                <p className="mt-3 text-xs font-black text-slate-600">Target kata per cue</p>
+                <div className="mt-2 grid grid-cols-3 gap-2">
+                  {[3, 4, 5].map((wordTarget) => (
+                    <button
+                      className={`rounded-lg border px-3 py-2 text-xs font-black ${
+                        captionStyle.maxWords === wordTarget
+                          ? "border-violet-600 bg-violet-50 text-violet-700"
+                          : "border-slate-200 bg-white text-slate-600"
+                      }`}
+                      key={wordTarget}
+                      onClick={() => setCaptionStyle({ maxWords: wordTarget })}
+                      type="button"
+                    >
+                      {wordTarget} kata
+                    </button>
+                  ))}
+                </div>
+                <p className="mt-3 text-[11px] font-semibold leading-relaxed text-slate-500">
+                  Mode Word by Word dan Karaoke masih estimasi sampai tersedia timing kata per kata.
+                </p>
               </div>
+
+              {previewPlaying && currentCaptionCue && (
+                <div className="rounded-xl border border-violet-200 bg-violet-50 p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-xs font-black uppercase tracking-wide text-violet-800">
+                      Caption aktif saat ini
+                    </p>
+                    <span className="rounded-full bg-violet-200 px-2 py-1 text-[10px] font-black text-violet-900">
+                      Mengikuti playhead
+                    </span>
+                  </div>
+                  <p className="mt-2 whitespace-pre-wrap break-words text-sm font-semibold leading-relaxed text-slate-900">
+                    {String(currentCaptionCue.text || "").trim() || "Caption ini kosong."}
+                  </p>
+                  <p className="mt-2 text-xs font-bold text-violet-800">
+                    {formatTimePrecise(currentCaptionCue.start)} - {formatTimePrecise(currentCaptionCue.end)}
+                  </p>
+                </div>
+              )}
+
+              <div>
+                <label
+                  className="text-xs font-black uppercase tracking-wide text-slate-500"
+                  htmlFor="caption_style_preset"
+                >
+                  Preset Caption
+                </label>
+                <select
+                  className="mt-2 w-full"
+                  id="caption_style_preset"
+                  onChange={(event) => {
+                    const selectedPreset = captionStylePresets.find(
+                      (item) => item.value === event.target.value,
+                    );
+                    if (!selectedPreset) return;
+                    setCaptionStyle({
+                      ...selectedPreset.config,
+                      displayMode: captionStyle.displayMode,
+                      maxWords: captionStyle.maxWords,
+                      karaokeEnabled: captionStyle.displayMode === "karaoke",
+                    });
+                  }}
+                  value={captionStyle.preset}
+                >
+                  {captionStylePresets.map((item) => (
+                    <option key={item.value} value={item.value}>
+                      {item.label}
+                    </option>
+                  ))}
+                </select>
+                <p className="mt-1.5 text-[10px] font-semibold leading-tight text-slate-500">
+                  {captionStylePresets.find((item) => item.value === captionStyle.preset)?.description}
+                </p>
+              </div>
+
+              <TextStylePresetSelector
+                label="Gaya Teks Caption"
+                onChange={(value) => setCaptionStyle({ textPreset: value })}
+                value={captionStyle.textPreset}
+              />
 
               <div className="rounded-xl border border-slate-200 p-3">
                 <p className="mb-2 text-xs font-black uppercase tracking-wide text-slate-500">
@@ -4439,21 +5802,7 @@ export function TransformationPage() {
                       onChange={(event) => setCaptionStyle({ highlightColor: event.target.value })}
                     />
                   </div>
-                  <div>
-                    <label htmlFor="caption_max_words">Kata</label>
-                    <input
-                      id="caption_max_words"
-                      max={8}
-                      min={1}
-                      type="number"
-                      value={captionStyle.maxWords}
-                      onChange={(event) => {
-                        const value = Number(event.target.value);
-                        setCaptionStyle({ maxWords: value });
-                      }}
-                    />
-                  </div>
-                  <div>
+                  <div className="col-span-2">
                     <label htmlFor="caption_max_chars">Karakter</label>
                     <input
                       id="caption_max_chars"
@@ -4473,7 +5822,6 @@ export function TransformationPage() {
                     ["outlineEnabled", "Outline"],
                     ["shadowEnabled", "Shadow"],
                     ["backgroundEnabled", "Background box"],
-                    ["karaokeEnabled", "Karaoke preview"],
                   ].map(([key, label]) => (
                     <label
                       className="flex items-center justify-between rounded-lg bg-slate-50 px-3 py-2 text-xs font-bold text-slate-700"
@@ -4512,7 +5860,8 @@ export function TransformationPage() {
               </div>
 
               <p className="rounded-xl bg-violet-50 p-3 text-xs font-semibold text-violet-800">
-                Perubahan style tampil di Live Preview. Export style ke MP4 akan dilanjutkan pada tahap berikutnya.
+                Teks, timing, dan gaya dasar Caption diterapkan ke Live Preview serta file export.
+                Mode tampilan tertentu dapat memiliki perbedaan kecil pada MP4.
               </p>
               {!transcriptionReady && (
                 <div className="rounded-xl bg-amber-50 p-3 text-sm text-amber-800">
@@ -4529,6 +5878,14 @@ export function TransformationPage() {
 
           {selectedEditorContext === "timeline" && (
             <ToolSection title="Timeline Tools">
+              {manualEditorMode &&
+                !styleConfig.video_sequence?.length &&
+                !(styleConfig.additional_audio_assets?.length) &&
+                !(styleConfig.editor_image_assets?.length) && (
+                  <div className="mb-3 rounded-xl border border-dashed border-zinc-300 bg-slate-50 p-3 text-xs font-semibold text-slate-500">
+                    Tambahkan video, audio, atau gambar ke timeline dari panel Media.
+                  </div>
+                )}
               <div className="rounded-xl bg-slate-50 p-3 text-sm font-semibold text-slate-700">
                 Playhead: <strong>{formatTimeLabel(previewTime)}</strong>
               </div>
@@ -4570,6 +5927,119 @@ export function TransformationPage() {
                     : "Effect Tools"
               }
             >
+              {selectedEditorContext === "hook" && (
+                <>
+                  <div>
+                    <label
+                      className="text-xs font-black uppercase tracking-wide text-slate-500"
+                      htmlFor="hook_text_template"
+                    >
+                      Template Hook
+                    </label>
+                    <select
+                      className="mt-2 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-bold text-slate-800 outline-none focus:border-violet-500"
+                      id="hook_text_template"
+                      onChange={(event) => setStyle("hook_text_template", event.target.value)}
+                      value={hookTextTemplate}
+                    >
+                      {hookTextTemplates.map((template) => (
+                        <option key={template.value} value={template.value}>
+                          {template.label}
+                        </option>
+                      ))}
+                    </select>
+                    <p className="mt-1.5 text-[10px] font-semibold leading-tight text-slate-500">
+                      {activeHookTemplate.description}
+                    </p>
+                  </div>
+
+                  <TextStylePresetSelector
+                    label="Gaya Teks Hook"
+                    onChange={(value) => setStyle("hook_text_style_preset", value)}
+                    value={hookTextStylePreset}
+                  />
+
+                  <div className="rounded-lg border border-slate-200 bg-white p-3">
+                    <label
+                      className="text-xs font-black uppercase tracking-wide text-slate-500"
+                      htmlFor="hook_text_font"
+                    >
+                      Font Hook
+                    </label>
+                    <select
+                      className="mt-2 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-bold text-slate-800 outline-none focus:border-violet-500"
+                      id="hook_text_font"
+                      onChange={(event) => setStyle("hook_text_font", event.target.value)}
+                      style={{ fontFamily: activeHookFont.fontFamily }}
+                      value={hookTextFont}
+                    >
+                      {hookTextFonts.map((font) => (
+                        <option key={font.value} value={font.value}>
+                          {font.label}
+                        </option>
+                      ))}
+                    </select>
+                    <p className="mt-1.5 text-[10px] font-semibold leading-tight text-slate-500">
+                      {activeHookFont.description}
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3 rounded-lg border border-slate-200 p-3">
+                    <div>
+                      <p className="text-xs font-black text-slate-600">Posisi</p>
+                      <div className="mt-2 grid grid-cols-3 gap-1">
+                        {(["safe_top", "top", "upper_center"] as HookTextPosition[]).map((position) => (
+                          <button
+                            className={`rounded-md px-2 py-2 text-[10px] font-black ${
+                              hookTextPosition === position
+                                ? "bg-violet-600 text-white"
+                                : "bg-slate-100 text-slate-600"
+                            }`}
+                            key={position}
+                            onClick={() => setStyle("hook_text_position", position)}
+                            type="button"
+                          >
+                            {position === "safe_top"
+                              ? "Paling Atas"
+                              : position === "top"
+                                ? "Atas"
+                                : "Tengah Atas"}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div>
+                      <p className="text-xs font-black text-slate-600">Ukuran</p>
+                      <div className="mt-2 grid grid-cols-2 gap-1">
+                        {(["normal", "large"] as HookTextSize[]).map((size) => (
+                          <button
+                            className={`rounded-md px-2 py-2 text-[10px] font-black ${
+                              hookTextSize === size
+                                ? "bg-violet-600 text-white"
+                                : "bg-slate-100 text-slate-600"
+                            }`}
+                            key={size}
+                            onClick={() => setStyle("hook_text_size", size)}
+                            type="button"
+                          >
+                            {size === "normal" ? "Normal" : "Besar"}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                  <p className="text-[11px] font-semibold leading-relaxed text-slate-500">
+                    Style Hook berlaku untuk Live Preview. Hook tetap dapat dihapus dari timeline.
+                  </p>
+                </>
+              )}
+              {selectedEditorContext === "keyword" && (
+                <TextStylePresetSelector
+                  label="Gaya Teks Keyword"
+                  onChange={(value) => setStyle("keyword_text_style_preset", value)}
+                  value={keywordTextStylePreset}
+                />
+              )}
               {!selectedEvent ? (
                 <p className="rounded-xl bg-slate-50 p-3 text-sm font-semibold text-slate-600">
                   Pilih marker di timeline untuk mengedit detail event.
@@ -4606,56 +6076,65 @@ export function TransformationPage() {
                       )}
                     </div>
                   )}
-                  <div className="grid grid-cols-2 gap-2">
-                    <div>
-                      <label htmlFor="context_event_start">Start</label>
-                      <input
-                        id="context_event_start"
-                        max={clipDuration}
-                        min={0}
-                        step={0.1}
-                        type="number"
-                        value={selectedEvent.start}
-                        onChange={(event) => {
-                          const bounds = eventDurationBounds(selectedEvent.type);
-                          const nextStart = clampClipTime(Number(event.target.value));
-                          const nextEnd = Math.min(
-                            clipDuration,
-                            Math.max(nextStart + bounds.min, selectedEvent.end),
-                          );
-                          replaceEvent(selectedEvent.id || "", {
-                            start: Number(nextStart.toFixed(2)),
-                            end: Number(nextEnd.toFixed(2)),
-                          });
-                        }}
-                      />
-                    </div>
-                    <div>
-                      <label htmlFor="context_event_end">End</label>
-                      <input
-                        id="context_event_end"
-                        max={clipDuration}
-                        min={0}
-                        step={0.1}
-                        type="number"
-                        value={selectedEvent.end}
-                        onChange={(event) => {
-                          const bounds = eventDurationBounds(selectedEvent.type);
-                          const rawEnd = clampClipTime(Number(event.target.value));
-                          const maxEnd = Math.min(clipDuration, selectedEvent.start + bounds.max);
-                          const nextEnd = Math.min(
-                            maxEnd,
-                            Math.max(selectedEvent.start + bounds.min, rawEnd),
-                          );
-                          replaceEvent(selectedEvent.id || "", { end: Number(nextEnd.toFixed(2)) });
-                        }}
-                      />
-                    </div>
-                  </div>
-                  <p className="rounded-xl bg-slate-50 p-3 text-xs font-semibold text-slate-600">
-                    Durasi: {(selectedEvent.end - selectedEvent.start).toFixed(1)} detik
-                    {selectedEvent.reason ? ` / Reason: ${selectedEvent.reason}` : ""}
-                  </p>
+                  {selectedEditorContext !== "hook" && (
+                    <>
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label htmlFor="context_event_start">Start</label>
+                          <input
+                            id="context_event_start"
+                            max={clipDuration}
+                            min={0}
+                            step={0.1}
+                            type="number"
+                            value={selectedEvent.start}
+                            onChange={(event) => {
+                              const bounds = eventDurationBounds(selectedEvent.type);
+                              const nextStart = clampClipTime(Number(event.target.value));
+                              const nextEnd = Math.min(
+                                clipDuration,
+                                Math.max(nextStart + bounds.min, selectedEvent.end),
+                              );
+                              replaceEvent(selectedEvent.id || "", {
+                                start: Number(nextStart.toFixed(2)),
+                                end: Number(nextEnd.toFixed(2)),
+                              });
+                            }}
+                          />
+                        </div>
+                        <div>
+                          <label htmlFor="context_event_end">End</label>
+                          <input
+                            id="context_event_end"
+                            max={clipDuration}
+                            min={0}
+                            step={0.1}
+                            type="number"
+                            value={selectedEvent.end}
+                            onChange={(event) => {
+                              const bounds = eventDurationBounds(selectedEvent.type);
+                              const rawEnd = clampClipTime(Number(event.target.value));
+                              const maxEnd = Math.min(
+                                clipDuration,
+                                selectedEvent.start + bounds.max,
+                              );
+                              const nextEnd = Math.min(
+                                maxEnd,
+                                Math.max(selectedEvent.start + bounds.min, rawEnd),
+                              );
+                              replaceEvent(selectedEvent.id || "", {
+                                end: Number(nextEnd.toFixed(2)),
+                              });
+                            }}
+                          />
+                        </div>
+                      </div>
+                      <p className="rounded-xl bg-slate-50 p-3 text-xs font-semibold text-slate-600">
+                        Durasi: {(selectedEvent.end - selectedEvent.start).toFixed(1)} detik
+                        {selectedEvent.reason ? ` / Reason: ${selectedEvent.reason}` : ""}
+                      </p>
+                    </>
+                  )}
                   {selectedEvent.type === "punch_zoom" && (
                     <div>
                       <label htmlFor="context_event_zoom">Zoom</label>
@@ -4689,13 +6168,15 @@ export function TransformationPage() {
                       </select>
                     </div>
                   )}
-                  <button
-                    className="rounded-lg bg-red-50 px-3 py-2 text-xs font-black text-red-700"
-                    onClick={() => deleteEvent(selectedEvent.id || "")}
-                    type="button"
-                  >
-                    Hapus event
-                  </button>
+                  {selectedEditorContext !== "hook" && (
+                    <button
+                      className="rounded-lg bg-red-50 px-3 py-2 text-xs font-black text-red-700"
+                      onClick={() => deleteEvent(selectedEvent.id || "")}
+                      type="button"
+                    >
+                      Hapus event
+                    </button>
+                  )}
                 </>
               )}
             </ToolSection>
@@ -4796,7 +6277,10 @@ export function TransformationPage() {
               </span>
             </div>
             {(editorDirty || timelineDirty || isSavingEditor || saveFailure) && (
-              <span className="rounded-full bg-zinc-800 px-3 py-1.5 text-xs font-black text-cyan-300">
+              <span
+                className="rounded-full bg-zinc-800 px-3 py-1.5 text-xs font-black text-cyan-300"
+                title={editorSaveStatusTitle}
+              >
                 {editorSaveStatusLabel}
               </span>
             )}
@@ -5019,7 +6503,7 @@ export function TransformationPage() {
               </div>
             </div>
             <TimelineTrack
-              {...layerTrackProps("video")}
+              {...timelineTrackOrderProps("video")}
               duration={timelineScaleDuration}
               items={timelineVideoItems}
               label="Video"
@@ -5033,11 +6517,37 @@ export function TransformationPage() {
               {...timelinePointerProps}
               playheadPercent={playheadPercent}
               selected={selectedEditorContext === "video"}
-              emptyText="Track Video kosong"
+              emptyText={
+                manualEditorMode && videoSequence.length === 0
+                  ? "Belum ada media di timeline"
+                  : "Track Video kosong"
+              }
             />
+            {manualEditorMode && videoSequence.length === 0 && (
+              <div className="grid grid-cols-[112px_minmax(0,1fr)] items-center gap-3">
+                <div />
+                <label className="w-fit">
+                  <span className="btn-secondary inline-flex cursor-pointer px-3 py-1.5 text-[11px] font-black">
+                    Import media
+                  </span>
+                  <input
+                    accept={editorMediaInputConfig.video.accept}
+                    aria-label="Import media ke timeline"
+                    className="sr-only"
+                    disabled={editorMediaUploading}
+                    onChange={(event) => {
+                      const file = event.currentTarget.files?.[0];
+                      if (file) void importEditorMedia("video", file);
+                      event.currentTarget.value = "";
+                    }}
+                    type="file"
+                  />
+                </label>
+              </div>
+            )}
             {audioExtracted && (
             <TimelineTrack
-              {...layerTrackProps("audio")}
+              {...timelineTrackOrderProps("audio")}
               duration={timelineScaleDuration}
               items={timelineAudioItems}
               label="Audio"
@@ -5064,14 +6574,14 @@ export function TransformationPage() {
                 onItemContextMenu={handleTrackItemContextMenu}
                 selected={selectedAdditionalAudioTrackId === track.id}
                 selectedItemId={selectedAdditionalAudioTrackId}
-                order={layerOrder.indexOf("audio")}
+                order={trackOrder.indexOf("audio")}
                 {...timelinePointerProps}
                 playheadPercent={playheadPercent}
                 emptyText={`${track.label} kosong`}
               />
             ))}
             <TimelineTrack
-              {...layerTrackProps("caption")}
+              {...timelineTrackOrderProps("caption")}
               duration={timelineScaleDuration}
               items={timelineCaptionItems}
               label="Caption"
@@ -5088,7 +6598,7 @@ export function TransformationPage() {
               emptyText="Belum ada cue caption"
             />
             <TimelineTrack
-              {...layerTrackProps("hook")}
+              {...timelineTrackOrderProps("hook")}
               duration={timelineScaleDuration}
               items={timelineHookItems}
               label="Hook"
@@ -5103,7 +6613,7 @@ export function TransformationPage() {
               selected={selectedEditorContext === "hook"}
             />
             <TimelineTrack
-              {...layerTrackProps("punch")}
+              {...timelineTrackOrderProps("punch")}
               duration={timelineScaleDuration}
               items={timelinePunchItems}
               label="Punch"
@@ -5119,7 +6629,7 @@ export function TransformationPage() {
               emptyText={styleConfig.punch_zoom_enabled ? "Belum ada momen efek" : "Tidak aktif"}
             />
             <TimelineTrack
-              {...layerTrackProps("keyword")}
+              {...timelineTrackOrderProps("keyword")}
               duration={timelineScaleDuration}
               items={timelineKeywordItems}
               label="Keyword"
@@ -5135,7 +6645,7 @@ export function TransformationPage() {
               emptyText={keywordSkipped ? "Tidak ada frasa penting" : "Tidak ada event"}
             />
             <TimelineTrack
-              {...layerTrackProps("pattern")}
+              {...timelineTrackOrderProps("pattern")}
               duration={timelineScaleDuration}
               items={timelinePatternItems}
               label="Pattern"
@@ -5154,13 +6664,14 @@ export function TransformationPage() {
           </div>
         </div>
 
-        {!configuredEffectTimeline.length && (
+        {!manualEditorMode && !configuredEffectTimeline.length && (
           <p className="mt-2 rounded-xl bg-amber-50 p-2 text-xs font-semibold text-amber-800">
             Belum ada timeline efek tersimpan. Export draft akan membuat timeline efek dari transcript dan interval aman.
           </p>
         )}
         <p className="mt-2 text-[10px] font-semibold text-zinc-500">
-          Urutan layer diterapkan pada Live Preview. Dukungan layer_order pada compositor output export masih TODO.
+          Urutan track tersimpan untuk timeline. Urutan layer visual diterapkan pada Live Preview;
+          compositor output export belum sepenuhnya mengikuti layer_order.
         </p>
       </section>
 
@@ -5197,7 +6708,7 @@ export function TransformationPage() {
                     className="h-full w-full object-cover"
                     muted
                     preload="metadata"
-                    src={renderedPreviewUrl || sourceClipUrl}
+                    src={exportResultUrl || sourceClipUrl}
                   />
                 </div>
                 <div className="mt-3 grid gap-2 rounded-xl bg-zinc-800 p-3 text-xs">
@@ -5326,6 +6837,29 @@ export function TransformationPage() {
                     </div>
                   )}
                 </div>
+                {(editableCaptionCues.length > 0 ||
+                  editableEffectTimeline.some((event) =>
+                    ["hook_text", "pattern_interrupt"].includes(event.type),
+                  ) ||
+                  additionalAudioTracks.length > 0) && (
+                  <div className="rounded-lg border border-amber-400/30 bg-amber-950/35 p-3 text-xs text-amber-100">
+                    <p className="font-black">Catatan kompatibilitas export</p>
+                    <ul className="mt-1 list-disc space-y-1 pl-4 font-semibold text-amber-100/80">
+                      {editableCaptionCues.length > 0 && (
+                        <li>Mode tampilan Caption tertentu belum sepenuhnya identik dengan Live Preview.</li>
+                      )}
+                      {editableEffectTimeline.some((event) => event.type === "hook_text") && (
+                        <li>Template box Hook lama dapat berbeda, tetapi teks, timing, dan gaya dasarnya tetap diekspor.</li>
+                      )}
+                      {editableEffectTimeline.some((event) => event.type === "pattern_interrupt") && (
+                        <li>Pattern Effect belum diterapkan pada file export.</li>
+                      )}
+                      {additionalAudioTracks.length > 0 && (
+                        <li>Audio tambahan belum dicampur ke file export.</li>
+                      )}
+                    </ul>
+                  </div>
+                )}
                 {exportWasClosedDuringTask && toolbarExportBusy && (
                   <div className="rounded-xl border border-cyan-400/30 bg-cyan-950/30 p-3">
                     <p className="text-sm font-black text-cyan-100">
@@ -5387,7 +6921,7 @@ export function TransformationPage() {
                     </button>
                     {exportTechnicalOpen && (
                       <pre className="mt-2 whitespace-pre-wrap rounded-lg bg-black/40 p-3 text-[10px] text-red-200">
-                        {queueRender.error?.message || activeRender?.error_message || "Proses export tidak dapat diselesaikan."}
+                        {queueRender.error?.message || exportResultRender?.error_message || "Proses export tidak dapat diselesaikan."}
                       </pre>
                     )}
                   </div>
@@ -5403,11 +6937,15 @@ export function TransformationPage() {
               >
                 Tutup
               </button>
-              {exportReady && activeRender ? (
+              {exportReady && exportResultRender && exportResultUrl ? (
                 <a
                   className="btn px-5 py-2 text-sm"
-                  download={exportFilename || "XA-AutoClip.mp4"}
-                  href={downloadUrl(activeRender.id)}
+                  download={exportDownloadFilename}
+                  href={exportResultUrl}
+                  onClick={() => console.info("[XA AutoClip] export_download", {
+                    download_render_id: exportResultRender.id,
+                    render_download_url: exportResultUrl,
+                  })}
                 >
                   Unduh MP4
                 </a>
@@ -5582,5 +7120,68 @@ export function TransformationPage() {
         </p>
       )}
     </div>
+  );
+}
+
+function TextStylePresetSelector({
+  label,
+  onChange,
+  value,
+}: {
+  label: string;
+  onChange: (value: TextStylePresetKey) => void;
+  value: TextStylePresetKey;
+}) {
+  return (
+    <div>
+      <p className="text-xs font-black uppercase tracking-wide text-slate-500">{label}</p>
+      <div className="mt-2 grid grid-cols-7 gap-1">
+        {TEXT_STYLE_PRESETS.map((preset) => {
+          const previewStyle = resolveTextOverlayStyle(preset.key);
+          return (
+            <button
+              aria-label={preset.label}
+              className={`aspect-square min-w-0 rounded-md border text-[11px] leading-none transition-colors ${
+                value === preset.key
+                  ? "border-violet-500 ring-2 ring-violet-200"
+                  : "border-slate-300 hover:border-slate-500"
+              }`}
+              key={preset.key}
+              onClick={() => onChange(preset.key)}
+              style={{
+                ...previewStyle,
+                backgroundColor: previewStyle.backgroundColor || "#27272a",
+                color: previewStyle.color || "#ffffff",
+              }}
+              title={preset.label}
+              type="button"
+            >
+              Aa
+            </button>
+          );
+        })}
+      </div>
+      <p className="mt-1.5 text-[10px] font-semibold text-slate-500">
+        {getTextStylePreset(value).label}
+      </p>
+    </div>
+  );
+}
+
+function activeHookCue(events: EffectTimelineEvent[], currentTime: number) {
+  return events.find(
+    (event) =>
+      event.type === "hook_text" &&
+      Number.isFinite(event.start) &&
+      Number.isFinite(event.end) &&
+      event.end > event.start &&
+      currentTime >= event.start &&
+      currentTime < event.end,
+  );
+}
+
+function hookCueText(event: EffectTimelineEvent | undefined, fallback: string) {
+  return safeHookPreview(
+    String(event?.text || event?.title || event?.content || fallback || ""),
   );
 }

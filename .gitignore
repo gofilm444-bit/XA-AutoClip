@@ -13,3 +13,5 @@ storage/*
 *.log
 .DS_Store
 Docker Desktop Installer.exe
+*.patch
+backup-*

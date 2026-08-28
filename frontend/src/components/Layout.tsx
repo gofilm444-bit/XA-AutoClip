@@ -1,5 +1,6 @@
 import { type ReactNode, useMemo, useState } from "react";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
+import { useBlankManualEditor } from "../hooks/useBlankManualEditor";
 
 export type EditorToolbarConfig = {
   actions?: ReactNode;
@@ -18,6 +19,7 @@ export function Layout() {
   const focusMode = location.pathname !== "/";
   const editorMode = location.pathname.startsWith("/transformations/");
   const [editorToolbar, setEditorToolbar] = useState<EditorToolbarConfig | null>(null);
+  const blankEditor = useBlankManualEditor();
   const outletContext = useMemo<LayoutOutletContext>(
     () => ({ setEditorToolbar }),
     [],
@@ -101,30 +103,44 @@ export function Layout() {
             <span>P</span>
             Proyek saya
           </NavLink>
-          <NavLink
-            to="/projects/new"
-            className={({ isActive }) =>
-              `workspace-link ${isActive ? "workspace-link-active" : ""}`
-            }
+          <button
+            type="button"
+            onClick={() => blankEditor.mutate()}
+            className={`workspace-link ${
+              location.pathname === "/projects/new" && !location.search.includes("mode=autoclip")
+                ? "workspace-link-active"
+                : ""
+            }`}
           >
             <span>+</span>
-            Upload Baru
-          </NavLink>
+            Mulai Edit
+          </button>
+          <Link
+            to="/projects/new?mode=autoclip"
+            className={`workspace-link ${
+              location.pathname === "/projects/new" && location.search.includes("mode=autoclip")
+                ? "workspace-link-active"
+                : ""
+            }`}
+          >
+            <span>AI</span>
+            Buat AutoClip
+          </Link>
         </nav>
         <div className="mt-8 border-t border-zinc-800 pt-6">
           <p className="px-3 text-xs font-bold uppercase tracking-[0.2em] text-zinc-600">
             Alur kerja
           </p>
           <ol className="mt-4 space-y-3 px-3 text-sm text-zinc-500">
-            <li>1. Paste link dan upload video</li>
-            <li>2. Simpan 5 klip terbaik</li>
-            <li>3. Edit dan render per klip</li>
+            <li>1. Upload atau paste link video</li>
+            <li>2. Atur timeline dan elemen</li>
+            <li>3. Export hasil edit</li>
           </ol>
         </div>
         <div className="mt-auto rounded-2xl border border-zinc-800 bg-zinc-900 p-4">
-          <p className="text-sm font-bold">AI clipping workspace</p>
+          <p className="text-sm font-bold">Video editing workspace</p>
           <p className="mt-1 text-xs leading-5 text-zinc-500">
-            Dari video panjang menjadi klip vertikal siap ditinjau.
+            Edit manual sebagai alur utama, AutoClip tetap tersedia.
           </p>
         </div>
       </aside>

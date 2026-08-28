@@ -1,3 +1,4 @@
+import math
 import re
 import unicodedata
 from typing import Any
@@ -18,6 +19,12 @@ DEFAULT_AUDIO_SETTINGS: dict[str, Any] = {
     "muted": False,
     "fade_in": 0.0,
     "fade_out": 0.0,
+}
+
+DEFAULT_VIDEO_FRAMING: dict[str, float] = {
+    "x": 0.0,
+    "y": 0.0,
+    "scale": 1.0,
 }
 
 IMPORTANT_EFFECT_KEYWORDS = (
@@ -122,6 +129,7 @@ DEFAULT_STYLE: dict[str, Any] = {
     "audio_extracted": False,
     "video_track_deleted": False,
     "audio_track_deleted": False,
+    "video_framing": DEFAULT_VIDEO_FRAMING,
     "editor_state_version": 0,
     "video_sequence_initialized": False,
     "audio_sequence_initialized": False,
@@ -250,6 +258,7 @@ def normalize_clipper_style(config: dict | None, hook_fallback: str = "") -> dic
     normalized["audio_extracted"] = bool(normalized.get("audio_extracted", False))
     normalized["video_track_deleted"] = bool(normalized.get("video_track_deleted", False))
     normalized["audio_track_deleted"] = bool(normalized.get("audio_track_deleted", False))
+    normalized["video_framing"] = normalize_video_framing(normalized.get("video_framing"))
     try:
         editor_state_version = int(normalized.get("editor_state_version") or 0)
     except (TypeError, ValueError):
@@ -280,6 +289,23 @@ def normalize_clipper_style(config: dict | None, hook_fallback: str = "") -> dic
         normalized.get("caption_timeline")
     )
     return normalized
+
+
+def normalize_video_framing(value: Any) -> dict[str, float]:
+    framing = value if isinstance(value, dict) else {}
+
+    def finite_float(key: str, fallback: float) -> float:
+        try:
+            result = float(framing.get(key, fallback))
+        except (TypeError, ValueError):
+            return fallback
+        return result if math.isfinite(result) else fallback
+
+    return {
+        "x": max(-40.0, min(40.0, finite_float("x", DEFAULT_VIDEO_FRAMING["x"]))),
+        "y": max(-40.0, min(40.0, finite_float("y", DEFAULT_VIDEO_FRAMING["y"]))),
+        "scale": max(1.0, min(2.0, finite_float("scale", DEFAULT_VIDEO_FRAMING["scale"]))),
+    }
 
 
 def normalize_audio_settings(value: Any) -> dict[str, Any]:
@@ -437,6 +463,8 @@ def validate_effect_timeline(
                 "end": round(end, 2),
                 "reason": normalize_indonesian_text(str(event.get("reason") or ""))[:80],
             }
+            if event.get("id"):
+                normalized["id"] = str(event["id"])[:120]
             if event_type == "punch_zoom":
                 normalized["zoom"] = max(1.01, min(float(event.get("zoom") or 1.06), 1.18))
             elif event_type == "keyword_popup":

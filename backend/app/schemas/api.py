@@ -85,6 +85,7 @@ class ProjectRead(BaseModel):
     total_top_clips: int = 0
     final_clips_count: int = 0
     storage_size_estimate: int = 0
+    manual_editor_url: str | None = None
 
 
 class JobRead(BaseModel):
@@ -147,6 +148,17 @@ class CandidateSelectionRead(BaseModel):
     message: str
 
 
+class ManualEditorRead(BaseModel):
+    project_id: uuid.UUID
+    candidate_id: uuid.UUID
+    transformation_id: uuid.UUID
+    editor_url: str
+    status: str
+    duration: float
+    source_asset_id: uuid.UUID
+    source_filename: str
+
+
 class CandidatePatch(BaseModel):
     start_seconds: float = Field(ge=0)
     end_seconds: float = Field(gt=0)
@@ -162,14 +174,19 @@ class TransformationCreate(BaseModel):
 
 
 class TransformationPatch(BaseModel):
+    # Draft-friendly autosave schema: every text field may be omitted, null,
+    # an empty string, or a short string while the editor is being typed.
+    # Length validation is intentionally relaxed here so editor autosave never
+    # returns 422 because the user is mid-typing. Final/publish validation (when
+    # present) lives on the dedicated creation/regeneration endpoints instead.
     purpose: TransformationPurpose | None = None
-    audience: str | None = Field(default=None, min_length=2, max_length=200)
-    new_angle: str | None = Field(default=None, min_length=10)
-    original_hook: str | None = Field(default=None, min_length=5)
-    commentary_script: str | None = Field(default=None, min_length=20)
-    conclusion: str | None = Field(default=None, min_length=5)
-    engagement_question: str | None = Field(default=None, min_length=5)
-    social_caption: str | None = Field(default=None, min_length=20, max_length=5000)
+    audience: str | None = Field(default=None, max_length=200)
+    new_angle: str | None = None
+    original_hook: str | None = None
+    commentary_script: str | None = None
+    conclusion: str | None = None
+    engagement_question: str | None = None
+    social_caption: str | None = Field(default=None, max_length=5000)
     storyboard: list[dict] | None = None
     clipper_style_config: dict | None = None
 
@@ -196,6 +213,25 @@ class TransformationRead(BaseModel):
 class HookTextRead(BaseModel):
     transformation_id: uuid.UUID
     hook_text: str
+
+
+class BlankManualEditorRead(BaseModel):
+    project_id: uuid.UUID
+    transformation_id: uuid.UUID
+    editor_url: str
+    status: str
+
+
+class EditorMediaAssetRead(BaseModel):
+    asset_id: str
+    kind: str
+    name: str
+    url: str
+    duration_seconds: float | None = None
+    width: int | None = None
+    height: int | None = None
+    size_bytes: int
+    mime_type: str
 
 
 class TransformationContextRead(BaseModel):
