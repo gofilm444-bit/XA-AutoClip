@@ -71,6 +71,7 @@ type EffectTimelineEvent = {
 };
 
 type EditorContext = "media" | "video" | "audio" | "caption" | "hook" | "keyword" | "effect" | "timeline" | "render";
+export type EditorNavTab = "autoclip" | "media" | "audio" | "text" | "caption" | "effect" | "templates";
 type EditorMediaKind = "video" | "audio" | "image";
 
 const editorMediaInputConfig: Record<
@@ -1661,6 +1662,9 @@ export function TransformationPage() {
   const [selectedMediaSegmentId, setSelectedMediaSegmentId] = useState<string | null>(null);
   const [selectedAdditionalAudioTrackId, setSelectedAdditionalAudioTrackId] = useState<string | null>(null);
   const [audioLibraryTab, setAudioLibraryTab] = useState<"music" | "sfx" | "uploads">("music");
+  const [activeNavTab, setActiveNavTab] = useState<EditorNavTab>("media");
+  const [activeTextSubTab, setActiveTextSubTab] = useState<"presets" | "hook" | "keyword">("presets");
+  const [activeEffectSubTab, setActiveEffectSubTab] = useState<"style" | "punch" | "pattern">("style");
   const [audioUploadProgress, setAudioUploadProgress] = useState(0);
   const [audioUploading, setAudioUploading] = useState(false);
   const [exportModalOpen, setExportModalOpen] = useState(false);
@@ -1826,6 +1830,7 @@ export function TransformationPage() {
   useEffect(() => {
     if (plan.data) {
       setDraft(plan.data);
+      setActiveNavTab(isManualEditorTransformation(plan.data) ? "media" : "autoclip");
       if (
         initialEditorContext(plan.data) === "media" &&
         initializedManualContextRef.current !== plan.data.id
@@ -4471,68 +4476,85 @@ export function TransformationPage() {
         draft.social_caption.length > 64 ? "..." : ""
       }`
     : "Deskripsi belum tersedia";
-  const contextualTabs: ReadonlyArray<readonly [EditorContext, string]> = manualEditorMode
-    ? [
-        ["media", "Media"],
-        ["video", "Video"],
-        ["audio", "Audio"],
-        ["caption", "Caption"],
-        ["hook", "Hook"],
-        ["effect", "Efek"],
-      ]
-    : [
-        ["video", "Video"],
-        ["audio", "Audio"],
-        ["caption", "Caption"],
-        ["hook", "Hook"],
-        ["keyword", "Keyword"],
-        ["effect", "Efek"],
-      ];
-
-  return (
+  const availableNavTabs: Array<{ id: EditorNavTab; label: string; icon: string }> = [
+    ...(!manualEditorMode ? [{ id: "autoclip" as const, label: "AutoClip", icon: "✨" }] : []),
+    { id: "media" as const, label: "Media", icon: "📁" },
+    { id: "audio" as const, label: "Audio", icon: "🎵" },
+    { id: "text" as const, label: "Text", icon: "T" },
+    { id: "caption" as const, label: "Captions", icon: "💬" },
+    { id: "effect" as const, label: "Effects", icon: "✦" },
+    { id: "templates" as const, label: "Templates", icon: "📐" },
+  ];
+return (
     <div className={`editor-workspace flex min-h-[calc(100vh-80px)] flex-col rounded-xl border border-zinc-800 bg-[#151719] shadow-2xl shadow-black/30 xl:h-[calc(100vh-80px)] xl:min-h-[720px] xl:overflow-hidden ${
       editorTheme === "light" ? "editor-theme-light" : "editor-theme-dark"
     }`}>
-      <div className="grid min-h-0 flex-1 gap-px bg-zinc-800 xl:grid-cols-[290px_minmax(440px,1fr)_340px] xl:items-stretch">
-        <aside className="editor-sidepanel min-h-0 bg-[#1d1f23] xl:h-full xl:overflow-y-auto">
-          <section className="p-4">
-            <div className="flex items-center justify-between gap-3">
+      {/* 1. TOP NAV TABS BAR (Kategori Sumber / Preset) */}
+      <div className="flex shrink-0 items-center justify-between border-b border-zinc-800 bg-[#16181b] px-3 py-1.5 z-20">
+        <div className="flex items-center gap-1 overflow-x-auto py-0.5">
+          {availableNavTabs.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              onClick={() => setActiveNavTab(tab.id)}
+              className={`flex items-center gap-2 rounded-lg px-3.5 py-1.5 text-xs font-black transition-all ${
+                activeNavTab === tab.id
+                  ? "bg-[#272a31] text-cyan-300 shadow-sm ring-1 ring-cyan-500/30"
+                  : "text-zinc-400 hover:bg-[#1f2227] hover:text-zinc-200"
+              }`}
+            >
+              <span className="text-sm font-normal">{tab.icon}</span>
+              <span>{tab.label}</span>
+            </button>
+          ))}
+        </div>
+        <div className="hidden items-center gap-3 text-xs font-bold text-zinc-500 lg:flex pr-2">
+          {manualEditorMode ? (
+            <span className="flex items-center gap-1.5 text-emerald-400">
+              <span className="size-2 rounded-full bg-emerald-400" />
+              Editor Manual
+            </span>
+          ) : (
+            <span className="flex items-center gap-1.5 text-cyan-400">
+              <span className="size-2 rounded-full bg-cyan-400" />
+              AutoClip AI
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* 2. MIDDLE 3-PANEL GRID */}
+      <div className="grid min-h-0 flex-1 gap-px bg-zinc-800 xl:grid-cols-[330px_minmax(400px,1fr)_330px] xl:items-stretch overflow-hidden">
+        {/* LEFT SOURCE PANEL (Input / Library / Preset / Add Asset) */}
+        <aside className="editor-sidepanel min-h-0 bg-[#17191c] xl:h-full xl:overflow-y-auto p-3.5 space-y-4">
+          {/* TAB A: AUTOCLIP (Hanya AutoClip Mode) */}
+          {activeNavTab === "autoclip" && !manualEditorMode && (
+            <section className="space-y-3">
               <div>
-                <h2 className="text-lg font-black text-slate-950">
-                  {manualEditorMode ? "Video Utama" : "Konten Klip"}
+                <h2 className="text-sm font-black text-slate-950 uppercase tracking-wide text-cyan-400">
+                  Ringkasan Klip (AutoClip AI)
                 </h2>
-                {manualEditorMode && (
-                  <p className="text-xs font-semibold text-emerald-700">Mode edit manual</p>
-                )}
+                <p className="mt-0.5 text-xs text-zinc-400">Hasil ekstraksi otomatis kandidat klip AI.</p>
               </div>
-              <span
-                className={`rounded-full px-2 py-1 text-[10px] font-black ${editorSaveStatusClass}`}
-                title={editorSaveStatusTitle}
-              >
-                {editorSaveStatusLabel}
-              </span>
-            </div>
-            <div className="mt-4 space-y-2">
-              <AccordionSection
-                id="title"
-                isOpen={openLeftSection === "title"}
-                onToggle={toggleLeftSection}
-                summary={uploadTitle || "Judul belum tersedia"}
-                title={manualEditorMode ? "Judul Video" : "Judul Klip"}
-              >
-                <label htmlFor="upload_title">
-                  {manualEditorMode ? "Judul Video" : "Judul Klip"}
-                </label>
-                <input
-                  id="upload_title"
-                  maxLength={300}
-                  value={uploadTitle}
-                  onChange={(event) => {
-                    setEditorDirty(true);
-                    setUploadTitle(event.target.value);
-                  }}
-                />
-                {!manualEditorMode && (
+
+              <div className="space-y-2">
+                <AccordionSection
+                  id="title"
+                  isOpen={openLeftSection === "title"}
+                  onToggle={toggleLeftSection}
+                  summary={uploadTitle || "Judul belum tersedia"}
+                  title="Judul Klip"
+                >
+                  <label htmlFor="upload_title">Judul Klip</label>
+                  <input
+                    id="upload_title"
+                    maxLength={300}
+                    value={uploadTitle}
+                    onChange={(event) => {
+                      setEditorDirty(true);
+                      setUploadTitle(event.target.value);
+                    }}
+                  />
                   <button
                     className="btn-secondary mt-2 px-3 py-2 text-xs"
                     disabled={regenerate.isPending}
@@ -4541,21 +4563,17 @@ export function TransformationPage() {
                   >
                     {regenerate.isPending ? "Membuat..." : "Buat ulang judul"}
                   </button>
-                )}
-              </AccordionSection>
+                </AccordionSection>
 
-              <AccordionSection
-                id="hook"
-                isOpen={openLeftSection === "hook"}
-                onToggle={toggleLeftSection}
-                summary={styleConfig.hook_text || "Hook belum tersedia"}
-                title="Hook Pembuka"
-              >
-                <div className="mb-1 flex items-center justify-between gap-3">
-                  <label className="mb-0" htmlFor="hook_text_panel">
-                    Hook Pembuka
-                  </label>
-                  {!manualEditorMode && (
+                <AccordionSection
+                  id="hook"
+                  isOpen={openLeftSection === "hook"}
+                  onToggle={toggleLeftSection}
+                  summary={styleConfig.hook_text || "Hook belum tersedia"}
+                  title="Hook Pembuka"
+                >
+                  <div className="mb-1 flex items-center justify-between gap-3">
+                    <label className="mb-0" htmlFor="hook_text_panel">Hook Pembuka</label>
                     <button
                       type="button"
                       className="btn-secondary px-3 py-2 text-xs"
@@ -4564,55 +4582,38 @@ export function TransformationPage() {
                     >
                       {regenerateHook.isPending ? "Membuat..." : "Buat ulang hook"}
                     </button>
-                  )}
-                </div>
-                <textarea
-                  id="hook_text_panel"
-                  rows={2}
-                  maxLength={70}
-                  value={styleConfig.hook_text}
-                  placeholder="Hook pendek khusus klip ini"
-                  onChange={(event) => setStyle("hook_text", event.target.value)}
-                />
-                <p className={`mt-1 text-xs ${hookWords > 12 ? "text-amber-700" : "text-slate-500"}`}>
-                  Hook ideal 6-12 kata. Saat ini {hookWords || 0} kata.
-                </p>
-              </AccordionSection>
+                  </div>
+                  <textarea
+                    id="hook_text_panel"
+                    rows={2}
+                    maxLength={70}
+                    value={styleConfig.hook_text}
+                    placeholder="Hook pendek khusus klip ini"
+                    onChange={(event) => setStyle("hook_text", event.target.value)}
+                  />
+                  <p className={`mt-1 text-xs ${hookWords > 12 ? "text-amber-700" : "text-slate-500"}`}>
+                    Hook ideal 6-12 kata. Saat ini {hookWords || 0} kata.
+                  </p>
+                </AccordionSection>
 
-              {!manualEditorMode && <AccordionSection
-                id="transcript"
-                isOpen={openLeftSection === "transcript"}
-                onToggle={(id) => {
-                  setSelectedEditorContext("caption");
-                  toggleLeftSection(id);
-                }}
-                summary={transcriptSummary}
-                title="Transkrip Klip"
-              >
-                <div className="max-h-52 overflow-y-auto whitespace-pre-line text-sm leading-6 text-slate-700">
-                  {context.data.candidate_transcript || "Transkrip suara belum tersedia untuk klip ini."}
-                </div>
-              </AccordionSection>}
-
-              <AccordionSection
-                id="caption"
-                isOpen={openLeftSection === "caption"}
-                onToggle={toggleLeftSection}
-                summary={captionSummary}
-                title="Deskripsi Posting"
-              >
-                <label htmlFor="social_caption">Deskripsi Posting</label>
-                <textarea
-                  id="social_caption"
-                  rows={6}
-                  value={draft.social_caption}
-                  onChange={(event) => {
-                    set("social_caption", event.target.value);
-                    setCaptionCopied(false);
-                  }}
-                />
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {!manualEditorMode && (
+                <AccordionSection
+                  id="caption"
+                  isOpen={openLeftSection === "caption"}
+                  onToggle={toggleLeftSection}
+                  summary={captionSummary}
+                  title="Deskripsi Posting"
+                >
+                  <label htmlFor="social_caption">Deskripsi Posting</label>
+                  <textarea
+                    id="social_caption"
+                    rows={5}
+                    value={draft.social_caption}
+                    onChange={(event) => {
+                      set("social_caption", event.target.value);
+                      setCaptionCopied(false);
+                    }}
+                  />
+                  <div className="mt-2 flex flex-wrap gap-2">
                     <button
                       className="btn-secondary px-3 py-2 text-xs"
                       disabled={regenerateCaption.isPending || applySource.isPending}
@@ -4621,86 +4622,680 @@ export function TransformationPage() {
                     >
                       {regenerateCaption.isPending ? "Membuat..." : "Buat ulang deskripsi"}
                     </button>
-                  )}
-                  <button
-                    className="btn-secondary px-3 py-2 text-xs"
-                    disabled={!draft.social_caption}
-                    onClick={copyCaption}
-                    type="button"
-                  >
-                    {captionCopied ? "Tersalin" : "Salin"}
-                  </button>
-                </div>
-              </AccordionSection>
+                    <button
+                      className="btn-secondary px-3 py-2 text-xs"
+                      disabled={!draft.social_caption}
+                      onClick={copyCaption}
+                      type="button"
+                    >
+                      {captionCopied ? "Tersalin" : "Salin"}
+                    </button>
+                  </div>
+                </AccordionSection>
 
-              <AccordionSection
-                id="source"
-                isOpen={openLeftSection === "source"}
-                onToggle={toggleLeftSection}
-                summary={sourceUrl || "Link sumber belum diisi"}
-                title="Link Sumber"
-              >
-                <label htmlFor="editor_source_url">Link sumber</label>
-                <div className="flex gap-2">
-                  <input
-                    id="editor_source_url"
-                    type="url"
-                    placeholder="https://youtube.com/watch?v=..."
-                    value={sourceUrl}
-                    onChange={(event) => setSourceUrl(event.target.value)}
-                  />
-                  <button
-                    type="button"
-                    className="btn-secondary shrink-0 px-3 py-2 text-xs"
-                    disabled={applySource.isPending || !sourceUrl.trim()}
-                    onClick={() => applySource.mutate()}
-                  >
-                    {applySource.isPending ? "..." : "Ambil"}
-                  </button>
-                </div>
-              </AccordionSection>
+                <AccordionSection
+                  id="source"
+                  isOpen={openLeftSection === "source"}
+                  onToggle={toggleLeftSection}
+                  summary={sourceUrl || "Link sumber belum diisi"}
+                  title="Link Sumber"
+                >
+                  <label htmlFor="editor_source_url">Link sumber</label>
+                  <div className="flex gap-2">
+                    <input
+                      id="editor_source_url"
+                      type="url"
+                      placeholder="https://youtube.com/watch?v=..."
+                      value={sourceUrl}
+                      onChange={(event) => setSourceUrl(event.target.value)}
+                    />
+                    <button
+                      type="button"
+                      className="btn-secondary shrink-0 px-3 py-2 text-xs"
+                      disabled={applySource.isPending || !sourceUrl.trim()}
+                      onClick={() => applySource.mutate()}
+                    >
+                      {applySource.isPending ? "..." : "Ambil"}
+                    </button>
+                  </div>
+                </AccordionSection>
 
-              {!manualEditorMode && <AccordionSection
-                id="potential"
-                isOpen={openLeftSection === "potential"}
-                onToggle={toggleLeftSection}
-                summary={
-                  report
-                    ? `Transformasi ${report.transformative_value_score.toFixed(0)} / Risiko ${report.copyright_risk_level}`
-                    : "Belum dinilai"
-                }
-                title="Info Potensi"
-              >
-                <div className="flex items-center justify-between gap-3 rounded-xl border border-violet-100 bg-violet-50 p-3">
-                  <div>
-                    <p className="text-xs font-black uppercase tracking-wide text-violet-700">
-                      Info Potensi
-                    </p>
-                    <p className="mt-1 text-sm text-slate-700">
-                      {report
-                        ? `Transformasi ${report.transformative_value_score.toFixed(0)} / Risiko ${report.copyright_risk_level}`
-                        : "Belum dinilai. Jalankan penilaian jika perlu sebelum final."}
+                <AccordionSection
+                  id="metadata"
+                  isOpen={openLeftSection === "metadata"}
+                  onToggle={toggleLeftSection}
+                  summary={`Durasi ${formatTimeLabel(clipDuration)}`}
+                  title="Info Kandidat"
+                >
+                  <div className="space-y-2 text-xs text-zinc-300">
+                    <div className="flex justify-between py-1 border-b border-zinc-800">
+                      <span className="text-zinc-500">Durasi Klip</span>
+                      <span className="font-bold">{formatTime(context.data.clip_start_seconds)} - {formatTime(context.data.clip_end_seconds)} ({formatTimeLabel(clipDuration)})</span>
+                    </div>
+                    <div className="flex justify-between py-1 border-b border-zinc-800">
+                      <span className="text-zinc-500">Model AI</span>
+                      <span className="font-bold">Groq / OpenAI</span>
+                    </div>
+                    <div className="flex justify-between py-1 border-b border-zinc-800">
+                      <span className="text-zinc-500">Tipe Konten</span>
+                      <span className="font-bold capitalize">{context.data.content_type || "Podcast"}</span>
+                    </div>
+                    <Link
+                      to={`/jobs/${draft.project_id}/clips`}
+                      className="btn-secondary mt-2 block w-full py-2 text-center text-xs font-bold text-cyan-300 hover:text-cyan-200"
+                    >
+                      Lihat Semua Kandidat
+                    </Link>
+                  </div>
+                </AccordionSection>
+
+                <AccordionSection
+                  id="potential"
+                  isOpen={openLeftSection === "potential"}
+                  onToggle={toggleLeftSection}
+                  summary={
+                    report
+                      ? `Transformasi ${report.transformative_value_score.toFixed(0)} / Risiko ${report.copyright_risk_level}`
+                      : "Belum dinilai"
+                  }
+                  title="Info Potensi"
+                >
+                  <div className="flex items-center justify-between gap-3 rounded-xl border border-violet-900/50 bg-violet-950/30 p-3">
+                    <div>
+                      <p className="text-xs font-black uppercase tracking-wide text-violet-400">Info Potensi</p>
+                      <p className="mt-1 text-xs text-slate-300">
+                        {report
+                          ? `Transformasi ${report.transformative_value_score.toFixed(0)} / Risiko ${report.copyright_risk_level}`
+                          : "Belum dinilai. Jalankan penilaian jika perlu."}
+                      </p>
+                    </div>
+                    <button
+                      className="btn-secondary px-3 py-2 text-xs"
+                      disabled={assess.isPending}
+                      onClick={() => assess.mutate()}
+                      type="button"
+                    >
+                      {assess.isPending ? "Menilai..." : "Nilai"}
+                    </button>
+                  </div>
+                </AccordionSection>
+              </div>
+            </section>
+          )}
+
+          {/* TAB B: MEDIA (Input & Project Media Library) */}
+          {activeNavTab === "media" && (
+            <section className="space-y-4">
+              <div>
+                <h2 className="text-sm font-black text-slate-950 uppercase tracking-wide text-cyan-400">
+                  Project Media
+                </h2>
+                <p className="mt-0.5 text-xs text-zinc-400">
+                  Impor video, audio, atau gambar untuk ditambahkan ke timeline.
+                </p>
+              </div>
+
+              <EditorMediaImportControls
+                className="grid grid-cols-1 gap-2"
+                disabled={editorMediaUploading}
+                onImport={importEditorMedia}
+                uploadingKind={editorMediaUploadKind}
+              />
+
+              <div className="border-t border-zinc-800 pt-3">
+                <p className="text-xs font-black uppercase tracking-wide text-zinc-400">
+                  Daftar Asset ({editorMediaQuery.data?.length || 0})
+                </p>
+
+                {editorMediaQuery.isLoading ? (
+                  <p className="mt-3 text-xs font-semibold text-zinc-400">Memuat media...</p>
+                ) : editorMediaQuery.data?.length ? (
+                  <div className="mt-3 space-y-2.5">
+                    {editorMediaQuery.data.map((asset) => (
+                      <div
+                        className="rounded-xl border border-zinc-700/80 bg-[#22252a] p-3 transition hover:border-zinc-500"
+                        key={asset.asset_id}
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <span className="block truncate text-xs font-black text-zinc-100">
+                              {asset.name}
+                            </span>
+                            <span className="mt-0.5 block text-[10px] text-zinc-400">
+                              {(asset.size_bytes / 1024 / 1024).toFixed(1)} MB
+                            </span>
+                          </div>
+                          <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-black uppercase ${
+                            asset.kind === "video"
+                              ? "bg-blue-500/20 text-blue-300"
+                              : asset.kind === "audio"
+                              ? "bg-emerald-500/20 text-emerald-300"
+                              : "bg-purple-500/20 text-purple-300"
+                          }`}>
+                            {asset.kind}
+                          </span>
+                        </div>
+                        <div className="mt-3 flex gap-2">
+                          {asset.kind === "image" ? (
+                            <span className="px-1 py-1 text-[10px] font-bold text-emerald-400">
+                              Tersimpan di project
+                            </span>
+                          ) : (
+                            <button
+                              className="btn-secondary flex-1 py-1.5 text-xs font-bold bg-cyan-400/10 text-cyan-300 border-cyan-500/30 hover:bg-cyan-400/20"
+                              onClick={() => addEditorMediaToTimeline(asset)}
+                              type="button"
+                            >
+                              + Tambahkan ke Timeline
+                            </button>
+                          )}
+                          {asset.kind !== "image" && (
+                            <a
+                              className="btn-secondary px-2.5 py-1.5 text-xs font-semibold"
+                              href={mediaUrl(transformationId, asset.asset_id)}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              Putar
+                            </a>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="mt-3 rounded-2xl border-2 border-dashed border-zinc-700 bg-zinc-900/40 p-6 text-center">
+                    <span className="text-3xl">📁</span>
+                    <p className="mt-2 text-xs font-bold text-zinc-300">Import media untuk memulai</p>
+                    <p className="mt-1 text-[11px] text-zinc-500">
+                      Video, audio, atau gambar Anda akan muncul di sini.
                     </p>
                   </div>
+                )}
+              </div>
+            </section>
+          )}
+
+          {/* TAB C: AUDIO (Audio Library / Add Audio Only) */}
+          {activeNavTab === "audio" && (
+            <section className="space-y-4">
+              <div>
+                <h2 className="text-sm font-black text-slate-950 uppercase tracking-wide text-cyan-400">
+                  Audio Library
+                </h2>
+                <p className="mt-0.5 text-xs text-zinc-400">Pilih musik latar, efek suara, atau upload file audio.</p>
+              </div>
+
+              {/* Submenu Library: Musik, SFX, Uploads */}
+              <div className="grid grid-cols-3 gap-1 rounded-lg bg-zinc-900 p-1">
+                {(["music", "sfx", "uploads"] as const).map((tab) => (
                   <button
-                    className="btn-secondary px-3 py-2 text-xs"
-                    disabled={assess.isPending}
-                    onClick={() => assess.mutate()}
+                    key={tab}
                     type="button"
+                    onClick={() => setAudioLibraryTab(tab)}
+                    className={`rounded-md py-1.5 text-[10px] font-black uppercase transition ${
+                      audioLibraryTab === tab
+                        ? "bg-[#25282d] text-cyan-300 shadow-sm"
+                        : "text-zinc-400 hover:text-zinc-200"
+                    }`}
                   >
-                    {assess.isPending ? "Menilai..." : "Nilai"}
+                    {tab === "music" ? "Musik" : tab === "sfx" ? "SFX" : "Uploads"}
+                  </button>
+                ))}
+              </div>
+
+              <label className="btn-secondary block cursor-pointer px-3 py-2 text-center text-xs font-black">
+                {audioUploading ? `Mengupload ${audioUploadProgress}%` : "+ Upload File Audio"}
+                <input
+                  accept=".mp3,.wav,.m4a,audio/mpeg,audio/wav,audio/mp4"
+                  className="hidden"
+                  disabled={audioUploading}
+                  onChange={(event) => {
+                    void handleAdditionalAudioUpload(event.target.files?.[0]);
+                    event.currentTarget.value = "";
+                  }}
+                  type="file"
+                />
+              </label>
+
+              {audioLibraryTab !== "uploads" ? (
+                <div className="rounded-xl border border-dashed border-zinc-700 bg-zinc-900/40 p-4 text-center text-xs font-semibold text-zinc-400">
+                  <p>Pilih tab Uploads untuk menambahkan audio kustom ke timeline.</p>
+                </div>
+              ) : (
+                <div className="space-y-2.5">
+                  {additionalAudioAssets.length === 0 ? (
+                    <div className="rounded-xl border border-dashed border-zinc-700 bg-zinc-900/40 p-4 text-center text-xs font-semibold text-zinc-400">
+                      Belum ada file audio yang diunggah.
+                    </div>
+                  ) : (
+                    additionalAudioAssets.map((asset) => (
+                      <div className="rounded-xl border border-zinc-700/80 bg-[#22252a] p-3" key={asset.id}>
+                        <div className="flex items-center justify-between">
+                          <p className="truncate text-xs font-black text-zinc-200">{asset.name}</p>
+                          <span className="text-[10px] text-zinc-400">{formatTimeLabel(asset.duration_seconds)}</span>
+                        </div>
+                        <audio
+                          className="mt-2 h-7 w-full"
+                          controls
+                          preload="metadata"
+                          src={uploadedAudioUrl(transformationId, asset.id)}
+                        />
+                        <div className="mt-2 grid grid-cols-2 gap-2">
+                          <button
+                            className="btn-secondary px-2 py-1 text-[10px] font-bold text-cyan-300"
+                            onClick={() => addAdditionalAudioTrack(asset, "backsound")}
+                            type="button"
+                          >
+                            + Backsound
+                          </button>
+                          <button
+                            className="btn-secondary px-2 py-1 text-[10px] font-bold text-purple-300"
+                            onClick={() => addAdditionalAudioTrack(asset, "sfx")}
+                            type="button"
+                          >
+                            + Sound Effect
+                          </button>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+
+              <div className="rounded-xl border border-zinc-800 bg-[#202226] p-3 text-xs text-zinc-400">
+                <p className="font-bold text-zinc-300">💡 Tips Audio:</p>
+                <p className="mt-1 text-[11px]">
+                  Pilih track audio di timeline untuk mengatur volume, mute, fade in/out, atau ekstraksi audio di panel kanan (Inspector).
+                </p>
+              </div>
+            </section>
+          )}
+
+          {/* TAB D: TEXT (Text Presets & Add Actions Only) */}
+          {activeNavTab === "text" && (
+            <section className="space-y-4">
+              <div>
+                <h2 className="text-sm font-black text-slate-950 uppercase tracking-wide text-cyan-400">
+                  Text & Titles
+                </h2>
+                <p className="mt-0.5 text-xs text-zinc-400">Preset tipografi dan penambahan teks ke timeline.</p>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => addEvent("hook_text")}
+                className="btn-secondary w-full py-2 text-xs font-bold text-cyan-300"
+              >
+                + Tambah Teks ke Timeline
+              </button>
+
+              {!manualEditorMode && (
+                <div className="grid grid-cols-3 gap-1 rounded-lg bg-zinc-900 p-1">
+                  <button
+                    type="button"
+                    onClick={() => setActiveTextSubTab("presets")}
+                    className={`rounded-md py-1.5 text-[10px] font-black transition ${
+                      activeTextSubTab === "presets" ? "bg-[#25282d] text-cyan-300" : "text-zinc-400"
+                    }`}
+                  >
+                    Gaya Teks
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTextSubTab("hook")}
+                    className={`rounded-md py-1.5 text-[10px] font-black transition ${
+                      activeTextSubTab === "hook" ? "bg-[#25282d] text-cyan-300" : "text-zinc-400"
+                    }`}
+                  >
+                    Hook
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTextSubTab("keyword")}
+                    className={`rounded-md py-1.5 text-[10px] font-black transition ${
+                      activeTextSubTab === "keyword" ? "bg-[#25282d] text-cyan-300" : "text-zinc-400"
+                    }`}
+                  >
+                    Keyword
                   </button>
                 </div>
-                {report?.recommendations_json?.[0] && (
-                  <p className="mt-2 text-xs text-violet-800">{report.recommendations_json[0]}</p>
-                )}
-              </AccordionSection>}
-            </div>
-          </section>
+              )}
+
+              {(manualEditorMode || activeTextSubTab === "presets") && (
+                <div className="space-y-3">
+                  <TextStylePresetSelector
+                    label="Pilih Preset Gaya Teks"
+                    onChange={(value) => setStyle("hook_text_style_preset", value)}
+                    value={styleConfig.hook_text_style_preset || "clean_white"}
+                  />
+                  <div className="rounded-xl border border-zinc-800 bg-[#202226] p-3 text-xs text-zinc-400">
+                    <p className="font-bold text-zinc-300">💡 Tips Tipografi:</p>
+                    <p className="mt-1 text-[11px]">
+                      Klik teks atau caption di timeline/canvas untuk mengubah font, warna, ukuran, dan perataan di panel kanan (Inspector).
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {!manualEditorMode && activeTextSubTab === "hook" && (
+                <div className="space-y-3">
+                  <label className="flex items-center justify-between rounded-xl bg-zinc-800/80 p-3 text-xs font-bold">
+                    <span>Aktifkan Hook Text</span>
+                    <input
+                      checked={Boolean(styleConfig.hook_text_enabled)}
+                      className="size-4 accent-cyan-400"
+                      onChange={(event) => setStyle("hook_text_enabled", event.target.checked)}
+                      type="checkbox"
+                    />
+                  </label>
+
+                  <div>
+                    <label htmlFor="left_hook_template_select">Template Hook</label>
+                    <select
+                      id="left_hook_template_select"
+                      value={hookTextTemplate}
+                      onChange={(event) => setStyle("hook_text_template", event.target.value as HookTextTemplate)}
+                    >
+                      {hookTextTemplates.map((t) => (
+                        <option key={t.value} value={t.value}>{t.label}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <button
+                    type="button"
+                    className="btn-secondary w-full py-2 text-xs font-bold"
+                    disabled={regenerateHook.isPending}
+                    onClick={() => regenerateHook.mutate()}
+                  >
+                    {regenerateHook.isPending ? "Membuat..." : "Buat Ulang Hook AI"}
+                  </button>
+                </div>
+              )}
+
+              {!manualEditorMode && activeTextSubTab === "keyword" && (
+                <div className="space-y-3">
+                  <label className="flex items-center justify-between rounded-xl bg-zinc-800/80 p-3 text-xs font-bold">
+                    <span>Aktifkan Keyword Pop-up</span>
+                    <input
+                      checked={Boolean(styleConfig.keyword_popup_enabled)}
+                      className="size-4 accent-cyan-400"
+                      onChange={(event) => setStyle("keyword_popup_enabled", event.target.checked)}
+                      type="checkbox"
+                    />
+                  </label>
+
+                  <button
+                    type="button"
+                    onClick={() => addEvent("keyword_popup")}
+                    className="btn-secondary w-full py-2 text-xs font-bold text-yellow-300"
+                  >
+                    + Tambah Keyword ke Timeline
+                  </button>
+
+                  <div className="rounded-xl border border-zinc-700/80 bg-[#22252a] p-3 text-xs text-zinc-300">
+                    <p className="font-bold">Keyword Events ({timelineKeywordItems.length})</p>
+                    <p className="mt-1 text-[11px] text-zinc-400">
+                      Klik keyword di timeline untuk mengubah kata dan gaya di Inspector kanan.
+                    </p>
+                  </div>
+                </div>
+              )}
+            </section>
+          )}
+
+          {/* TAB E: CAPTIONS (Caption Workflow, Sync & Cues List) */}
+          {activeNavTab === "caption" && (
+            <section className="space-y-4">
+              <div>
+                <h2 className="text-sm font-black text-slate-950 uppercase tracking-wide text-cyan-400">
+                  Captions & Subtitles
+                </h2>
+                <p className="mt-0.5 text-xs text-zinc-400">Sinkronisasi, preset gaya, dan daftar cue subtitle.</p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  className="btn-secondary px-2 py-1.5 text-xs font-bold"
+                  onClick={syncCaptionWithVideo}
+                  type="button"
+                >
+                  Sinkronkan Video
+                </button>
+                <button
+                  className="btn-secondary px-2 py-1.5 text-xs font-bold"
+                  disabled={!editableCaptionCues.length}
+                  onClick={reflowAllCaptions}
+                  type="button"
+                >
+                  Rapikan Cues
+                </button>
+              </div>
+
+              <div>
+                <label htmlFor="left_caption_preset">Preset Gaya Caption</label>
+                <select
+                  id="left_caption_preset"
+                  onChange={(event) => {
+                    const selected = captionStylePresets.find((p) => p.value === event.target.value);
+                    if (selected) {
+                      setCaptionStyle({
+                        ...selected.config,
+                        displayMode: captionStyle.displayMode,
+                        maxWords: captionStyle.maxWords,
+                        karaokeEnabled: captionStyle.displayMode === "karaoke",
+                      });
+                    }
+                  }}
+                  value={captionStyle.preset}
+                >
+                  {captionStylePresets.map((p) => (
+                    <option key={p.value} value={p.value}>{p.label}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="rounded-xl border border-zinc-700/80 bg-[#22252a] p-3 space-y-2">
+                <p className="text-xs font-black uppercase text-zinc-400">Mode Tampilan</p>
+                <div className="grid grid-cols-3 gap-1 rounded-lg bg-zinc-900 p-1">
+                  {(["segment", "karaoke", "word_by_word"] as const).map((mode) => (
+                    <button
+                      key={mode}
+                      type="button"
+                      onClick={() => setCaptionStyle({ displayMode: mode, karaokeEnabled: mode === "karaoke" })}
+                      className={`rounded-md py-1 text-[10px] font-black capitalize transition ${
+                        captionStyle.displayMode === mode ? "bg-[#25282d] text-cyan-300" : "text-zinc-400"
+                      }`}
+                    >
+                      {mode === "word_by_word" ? "Word" : mode}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="border-t border-zinc-800 pt-3">
+                <p className="text-xs font-black uppercase tracking-wide text-zinc-400">
+                  Daftar Cue Caption ({editableCaptionCues.length})
+                </p>
+                <p className="mt-0.5 text-[11px] text-zinc-500">Klik cue untuk mengedit teks & styling di panel kanan.</p>
+                <div className="mt-2 max-h-64 overflow-y-auto space-y-2 pr-1">
+                  {editableCaptionCues.map((cue) => (
+                    <div
+                      key={cue.id}
+                      onClick={() => {
+                        setSelectedCaptionId(cue.id);
+                        setSelectedEditorContext("caption");
+                      }}
+                      className={`cursor-pointer rounded-lg border p-2 text-xs transition ${
+                        selectedCaptionId === cue.id
+                          ? "border-cyan-400 bg-cyan-500/10 text-cyan-200"
+                          : "border-zinc-800 bg-[#22252a] text-zinc-300 hover:border-zinc-600"
+                      }`}
+                    >
+                      <div className="flex justify-between text-[10px] text-zinc-500 font-bold">
+                        <span>{formatTimePrecise(cue.start)} - {formatTimePrecise(cue.end)}</span>
+                        <span>{(cue.end - cue.start).toFixed(1)}s</span>
+                      </div>
+                      <p className="mt-1 font-semibold line-clamp-2">{cue.text}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </section>
+          )}
+
+          {/* TAB F: EFFECTS (Effects Presets & Add Actions Only) */}
+          {activeNavTab === "effect" && (
+            <section className="space-y-4">
+              <div>
+                <h2 className="text-sm font-black text-slate-950 uppercase tracking-wide text-cyan-400">
+                  Effects & Presets
+                </h2>
+                <p className="mt-0.5 text-xs text-zinc-400">Pilih gaya editing visual atau tambahkan efek baru.</p>
+              </div>
+
+              <div className="space-y-3">
+                <div>
+                  <label htmlFor="left_clipper_style">Gaya Clipper</label>
+                  <select
+                    id="left_clipper_style"
+                    value={styleConfig.clipper_style_preset}
+                    onChange={(event) => {
+                      const nextStyle = event.target.value as keyof typeof styleDefaults;
+                      setRenderDirty(true);
+                      setRender(undefined);
+                      set("clipper_style_config", {
+                        ...styleDefaults[nextStyle],
+                        hook_text: styleConfig.hook_text,
+                        hook_text_template: styleConfig.hook_text_template,
+                        hook_text_font: styleConfig.hook_text_font,
+                        hook_text_position: styleConfig.hook_text_position,
+                        hook_text_size: styleConfig.hook_text_size,
+                        hook_text_style_preset: styleConfig.hook_text_style_preset,
+                        keyword_text_style_preset: styleConfig.keyword_text_style_preset,
+                        caption_style: styleConfig.caption_style,
+                        effect_timeline: styleConfig.effect_timeline || [],
+                        audio_settings: audioSettings,
+                        media_trim: styleConfig.media_trim,
+                        media_split_points: styleConfig.media_split_points || [],
+                        media_sequence: styleConfig.media_sequence || [],
+                        video_sequence: styleConfig.video_sequence || [],
+                        audio_sequence: styleConfig.audio_sequence || [],
+                        audio_extracted: audioExtracted,
+                        video_track_deleted: videoTrackDeleted,
+                        audio_track_deleted: audioTrackDeleted,
+                        video_framing: videoFraming,
+                        editor_state_version: styleConfig.editor_state_version || 0,
+                        video_sequence_initialized: styleConfig.video_sequence_initialized || false,
+                        audio_sequence_initialized: styleConfig.audio_sequence_initialized || false,
+                        caption_timeline_initialized: styleConfig.caption_timeline_initialized || false,
+                        effect_timeline_initialized: styleConfig.effect_timeline_initialized || false,
+                        layer_order: visualLayerOrder,
+                        track_order: trackOrder,
+                        additional_audio_assets: additionalAudioAssets,
+                        additional_audio_tracks: additionalAudioTracks,
+                        caption_timeline: styleConfig.caption_timeline || [],
+                        render_preset: preset,
+                      });
+                    }}
+                  >
+                    {stylePresets.map((item) => (
+                      <option key={item.value} value={item.value}>{item.label}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label htmlFor="left_style_intensity">Intensitas Gaya</label>
+                  <select
+                    id="left_style_intensity"
+                    value={styleConfig.style_intensity}
+                    onChange={(event) => setStyle("style_intensity", event.target.value)}
+                  >
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="border-t border-zinc-800 pt-3 space-y-2">
+                <p className="text-xs font-black uppercase tracking-wide text-zinc-400">Tambah Momen Efek</p>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => addEvent("punch_zoom")}
+                    className="btn-secondary py-2 text-xs font-bold text-rose-300"
+                  >
+                    + Punch Zoom
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => addEvent("pattern_interrupt")}
+                    className="btn-secondary py-2 text-xs font-bold text-purple-300"
+                  >
+                    + Pattern
+                  </button>
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-zinc-800 bg-[#202226] p-3 text-xs text-zinc-400">
+                <p className="font-bold text-zinc-300">💡 Tips Efek:</p>
+                <p className="mt-1 text-[11px]">
+                  Klik momen efek di timeline untuk mengatur zoom level, durasi, dan tipe transisi di panel kanan (Inspector).
+                </p>
+              </div>
+            </section>
+          )}
+
+          {/* TAB G: TEMPLATES (Templates & Layout Presets Only) */}
+          {activeNavTab === "templates" && (
+            <section className="space-y-4">
+              <div>
+                <h2 className="text-sm font-black text-slate-950 uppercase tracking-wide text-cyan-400">
+                  Templates & Layout
+                </h2>
+                <p className="mt-0.5 text-xs text-zinc-400">Pilih template layout 9:16 untuk framing video.</p>
+              </div>
+
+              <div className="space-y-2.5">
+                {presetOptions.map((opt) => (
+                  <div
+                    key={opt.value}
+                    onClick={() => selectPreset(opt.value as RenderPreset)}
+                    className={`cursor-pointer rounded-xl border p-3 transition ${
+                      preset === opt.value
+                        ? "border-cyan-400 bg-cyan-500/10 shadow-sm"
+                        : "border-zinc-700/80 bg-[#22252a] hover:border-zinc-500"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <p className="text-xs font-black text-zinc-100">{opt.label}</p>
+                      {preset === opt.value && (
+                        <span className="rounded bg-cyan-400/20 px-1.5 py-0.5 text-[10px] font-black text-cyan-300">
+                          Aktif
+                        </span>
+                      )}
+                    </div>
+                    <p className="mt-1 text-[11px] text-zinc-400">{opt.description}</p>
+                  </div>
+                ))}
+              </div>
+
+              <div className="rounded-xl border border-zinc-800 bg-[#202226] p-3 text-xs text-zinc-400">
+                <p className="font-bold text-zinc-300">💡 Tips Framing:</p>
+                <p className="mt-1 text-[11px]">
+                  Klik video di timeline atau canvas untuk mengatur posisi X, Y, dan zoom secara presisi di panel kanan (Inspector).
+                </p>
+              </div>
+            </section>
+          )}
         </aside>
 
+        {/* CENTER PREVIEW PLAYER */}
         <main className="flex min-h-0 w-full flex-col overflow-hidden bg-[#101214] xl:h-full">
-          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-4 py-2.5">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-4 py-2">
             <div className="min-w-0">
               <p className="text-xs font-black uppercase tracking-wide text-cyan-300">
                 {currentRenderLabel}
@@ -4718,15 +5313,17 @@ export function TransformationPage() {
             </div>
           </div>
           <div
-            className="flex min-h-0 flex-1 items-center justify-center px-3 py-2.5"
+            className="flex min-h-0 flex-1 items-center justify-center px-3 py-2"
             onClick={() => {
               setSelectedEventId(null);
+              setSelectedCaptionId(null);
+              setSelectedMediaSegmentId(null);
               setSelectedEditorContext(
                 manualEditorMode && videoSequence.length === 0 ? "media" : "video",
               );
             }}
           >
-            <div className="relative aspect-[9/16] h-[clamp(320px,44vh,520px)] max-h-full max-w-full overflow-hidden rounded-lg bg-black shadow-2xl shadow-black/50 ring-1 ring-white/10">
+            <div className="relative aspect-[9/16] h-[clamp(300px,42vh,500px)] max-h-full max-w-full overflow-hidden rounded-lg bg-black shadow-2xl shadow-black/50 ring-1 ring-white/10">
               {renderedPreviewUrl ? (
                 <video
                   className="h-full w-full object-cover"
@@ -4765,27 +5362,32 @@ export function TransformationPage() {
                   />
                 </div>
               )}
+
               {manualEditorMode && videoSequence.length === 0 && (
                 <div
-                  className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 bg-zinc-950 p-5 text-center"
+                  className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 bg-zinc-950/95 p-6 text-center"
                   onClick={(event) => event.stopPropagation()}
                 >
+                  <div className="flex size-14 items-center justify-center rounded-full bg-zinc-900 border border-zinc-700 text-2xl text-cyan-400">
+                    ▶
+                  </div>
                   <div>
                     <p className="text-base font-black text-zinc-100">
                       Import media untuk mulai mengedit
                     </p>
                     <p className="mt-1 max-w-xs text-xs font-semibold text-zinc-400">
-                      Video pertama akan otomatis masuk timeline.
+                      Gunakan tombol import di panel kiri atau tombol di bawah ini.
                     </p>
                   </div>
                   <EditorMediaImportControls
-                    className="grid w-full max-w-xs grid-cols-1 gap-2"
+                    className="grid w-full max-w-xs grid-cols-1 gap-2 mt-1"
                     disabled={editorMediaUploading}
                     onImport={importEditorMedia}
                     uploadingKind={editorMediaUploadKind}
                   />
                 </div>
               )}
+
               {audioExtracted && !audioTrackDeleted && !renderedPreviewUrl && (
                 <audio
                   aria-label="Preview track audio terpisah"
@@ -4795,6 +5397,7 @@ export function TransformationPage() {
                   src={sourceMediaUrl}
                 />
               )}
+
               {videoTrackDeleted && !renderedPreviewUrl && (
                 <div
                   className="pointer-events-none absolute inset-x-0 bottom-10 top-0 flex items-center justify-center bg-black text-sm font-bold text-zinc-500"
@@ -4803,6 +5406,7 @@ export function TransformationPage() {
                   Track Video kosong
                 </div>
               )}
+
               {hookPreviewState.shouldRenderHookOverlay && liveHookEvent && liveHookText && (
                 <div
                   data-hook-duplicate-suppressed={
@@ -4846,6 +5450,7 @@ export function TransformationPage() {
                   </span>
                 </div>
               )}
+
               {!renderedPreviewAvailable &&
                 styleConfig.keyword_popup_enabled &&
                 liveKeywordEvent?.text && (
@@ -4864,6 +5469,7 @@ export function TransformationPage() {
                       {liveKeywordEvent.text}
                     </div>
               )}
+
               {captionOverlayText && (
                 <div
                   className={`pointer-events-auto absolute left-[8%] right-[8%] cursor-pointer text-center leading-tight ${captionPositionClass(
@@ -4929,424 +5535,261 @@ export function TransformationPage() {
             </div>
           </div>
           {activeRender?.status === "failed" && (
-            <div className="mx-4 mb-3 rounded-xl bg-red-950/70 p-2.5 text-xs font-semibold text-red-100">
+            <div className="mx-4 mb-2 rounded-xl bg-red-950/70 p-2.5 text-xs font-semibold text-red-100">
               {activeRender.error_message || "Export gagal."}
-            </div>
-          )}
-          {keywordSkipped && (
-            <div className="mx-4 mb-3 rounded-xl bg-amber-900/70 p-2.5 text-xs font-semibold text-amber-100">
-              Keyword pop-up dilewati karena tidak ada kata/frasa penting yang layak.
             </div>
           )}
         </main>
 
-        <aside className="editor-sidepanel editor-inspector min-h-0 space-y-3 bg-[#1d1f23] p-3 xl:h-full xl:overflow-y-auto">
-          <section className="sticky top-0 z-10 rounded-xl border border-zinc-700 bg-[#25282d]/95 p-3 shadow-lg backdrop-blur">
+        {/* RIGHT INSPECTOR PANEL (Contextual Properties & Inspector Only) */}
+        <aside className="editor-sidepanel editor-inspector min-h-0 space-y-3 bg-[#17191c] p-3.5 xl:h-full xl:overflow-y-auto">
+          <section className="sticky top-0 z-10 rounded-xl border border-zinc-700 bg-[#22252a]/95 p-3 shadow-lg backdrop-blur">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
-                <p className="text-xs font-black uppercase tracking-wide text-violet-600">
-                  Contextual Tools
+                <p className="text-[10px] font-black uppercase tracking-wide text-cyan-400">
+                  Inspector
                 </p>
-                <h2 className="mt-1 truncate text-base font-black text-slate-950">
-                  {selectedEditorContext === "media"
-                    ? "Media Editor"
+                <h2 className="mt-0.5 truncate text-sm font-black text-slate-950">
+                  {!anyTrackSelected && !selectedEvent && !selectedCaption
+                    ? "Project Details"
+                    : selectedEditorContext === "video"
+                    ? "Video Inspector"
                     : selectedEditorContext === "audio"
-                    ? "Audio Tools"
+                    ? "Audio Inspector"
                     : selectedEditorContext === "caption"
-                      ? "Caption Tools"
-                      : selectedEditorContext === "hook"
-                      ? "Hook Tools"
-                      : selectedEditorContext === "keyword"
-                        ? `Keyword: ${selectedEvent?.text || "Pilih keyword"}`
-                        : selectedEditorContext === "effect"
-                          ? selectedEvent?.type === "pattern_interrupt"
-                            ? "Pattern Tools"
-                            : "Punch Zoom Tools"
-                          : selectedEditorContext === "timeline"
-                            ? "Timeline Tools"
-                            : selectedEditorContext === "render"
-                              ? "Export Tools"
-                              : "Video Tools"}
+                    ? "Caption Inspector"
+                    : selectedEditorContext === "hook"
+                    ? "Hook Text Inspector"
+                    : selectedEditorContext === "keyword"
+                    ? "Keyword Inspector"
+                    : selectedEditorContext === "effect"
+                    ? "Effect Inspector"
+                    : "Item Inspector"}
                 </h2>
               </div>
               <span
-                className={`shrink-0 rounded-full px-2 py-1 text-[10px] font-black ${editorSaveStatusClass}`}
+                className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-black ${editorSaveStatusClass}`}
                 title={editorSaveStatusTitle}
               >
                 {editorSaveStatusLabel}
               </span>
             </div>
-            <div className="mt-3 grid grid-cols-3 gap-1">
-              {contextualTabs.map(([contextValue, label]) => (
-                <button
-                  className={`rounded-lg px-2 py-2 text-xs font-black ${
-                    selectedEditorContext === contextValue
-                      ? "bg-violet-600 text-white"
-                      : "bg-slate-100 text-slate-600"
-                  }`}
-                  key={contextValue}
-                  onClick={() => {
-                    if (contextValue === "hook") {
-                      setSelectedEventId(hookEvents[0]?.id || null);
-                    } else if (contextValue === "keyword") {
-                      setSelectedEventId(
-                        editableEffectTimeline.find((event) => event.type === "keyword_popup")?.id || null,
-                      );
-                    } else if (contextValue === "effect") {
-                      setSelectedEventId(
-                        editableEffectTimeline.find(
-                          (event) => event.type === "punch_zoom" || event.type === "pattern_interrupt",
-                        )?.id || null,
-                      );
-                    } else {
-                      setSelectedEventId(null);
-                    }
-                    setSelectedEditorContext(contextValue);
-                  }}
-                  type="button"
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
           </section>
 
-          {(!manualEditorMode || selectedEditorContext === "media") && (
-          <ToolSection title="Media Editor">
-            <p className="text-[11px] font-semibold text-zinc-500">
-              Impor video, audio, atau gambar langsung dari editor.
-            </p>
-            <EditorMediaImportControls
-              className="mt-2 grid grid-cols-1 gap-2"
-              disabled={editorMediaUploading}
-              onImport={importEditorMedia}
-              uploadingKind={editorMediaUploadKind}
-            />
-            {editorMediaQuery.isLoading ? (
-              <p className="mt-3 text-xs font-semibold text-zinc-400">Memuat media...</p>
-            ) : editorMediaQuery.data?.length ? (
-              <div className="mt-3 space-y-2">
-                {editorMediaQuery.data.map((asset) => (
-                  <div
-                    className="rounded-xl border border-zinc-700 bg-[#25282d] p-2"
-                    key={asset.asset_id}
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="min-w-0 truncate text-xs font-black text-zinc-100">
-                        {asset.name}
-                      </span>
-                      <span className="shrink-0 rounded bg-zinc-700 px-1 text-[10px] uppercase text-zinc-300">
-                        {asset.kind}
-                      </span>
-                    </div>
-                    <div className="mt-2 flex gap-2">
-                      {asset.kind === "image" ? (
-                        <span className="px-1 py-1 text-[10px] font-bold text-emerald-600">
-                          Tersimpan di media
-                        </span>
-                      ) : (
-                        <button
-                          className="btn-secondary px-2 py-1 text-[10px]"
-                          onClick={() => addEditorMediaToTimeline(asset)}
-                          type="button"
-                        >
-                          + Timeline
-                        </button>
-                      )}
-                      {asset.kind !== "image" && (
-                        <a
-                          className="btn-secondary px-2 py-1 text-[10px]"
-                          href={mediaUrl(transformationId, asset.asset_id)}
-                          target="_blank"
-                        >
-                          Putar
-                        </a>
-                      )}
-                    </div>
+          {/* 1. If NO item selected, show Project Details (CapCut-style) */}
+          {!anyTrackSelected && !selectedEvent && !selectedCaption && (
+            <ToolSection title="Detail Project">
+              <div className="space-y-2.5 text-xs">
+                <div>
+                  <label htmlFor="inspector_project_name" className="text-zinc-400">Nama Project</label>
+                  <input
+                    id="inspector_project_name"
+                    value={uploadTitle}
+                    onChange={(event) => {
+                      setEditorDirty(true);
+                      setUploadTitle(event.target.value);
+                    }}
+                  />
+                </div>
+
+                <div className="rounded-xl border border-zinc-700/80 bg-[#22252a] p-3 space-y-2 text-zinc-300">
+                  <div className="flex justify-between py-1 border-b border-zinc-800">
+                    <span className="text-zinc-500">Mode Editor</span>
+                    <span className={`font-bold ${manualEditorMode ? "text-emerald-400" : "text-cyan-400"}`}>
+                      {manualEditorMode ? "Editor Manual" : "Mode AutoClip AI"}
+                    </span>
                   </div>
-                ))}
+                  <div className="flex justify-between py-1 border-b border-zinc-800">
+                    <span className="text-zinc-500">Aspect Ratio</span>
+                    <span className="font-bold text-cyan-300">9:16 (Portrait)</span>
+                  </div>
+                  <div className="flex justify-between py-1 border-b border-zinc-800">
+                    <span className="text-zinc-500">Resolusi</span>
+                    <span className="font-bold">1080x1920 (Adapted)</span>
+                  </div>
+                  <div className="flex justify-between py-1 border-b border-zinc-800">
+                    <span className="text-zinc-500">Frame Rate</span>
+                    <span className="font-bold">30.00 fps</span>
+                  </div>
+                  <div className="flex justify-between py-1 border-b border-zinc-800">
+                    <span className="text-zinc-500">Warna Ruang</span>
+                    <span className="font-bold">Rec. 709 SDR</span>
+                  </div>
+                  <div className="flex justify-between py-1 border-b border-zinc-800">
+                    <span className="text-zinc-500">Media Project</span>
+                    <span className="font-bold">{(editorMediaQuery.data?.length || 0) + (manualEditorMode ? 0 : 1)} File</span>
+                  </div>
+                  <div className="flex justify-between py-1">
+                    <span className="text-zinc-500">Durasi Timeline</span>
+                    <span className="font-bold text-cyan-300">{formatTimeLabel(clipDuration)}</span>
+                  </div>
+                </div>
+
+                <div className="pt-2">
+                  <button
+                    className="btn w-full py-2 text-xs"
+                    disabled={!canStartExport}
+                    onClick={openExportModal}
+                    type="button"
+                  >
+                    Export Video
+                  </button>
+                </div>
               </div>
-            ) : (
-              <p className="mt-3 rounded-xl bg-slate-50 p-3 text-xs font-semibold text-zinc-500">
-                Belum ada media diimpor.
-              </p>
-            )}
-          </ToolSection>
+            </ToolSection>
           )}
 
+          {/* 2. Contextual Video Inspector */}
           {selectedEditorContext === "video" && (
             <>
-          <ToolSection title="Track Video">
-            <div className="rounded-xl bg-blue-50 p-3 text-xs font-semibold text-blue-800">
-              <p className="font-black">Video utama • {formatTimeLabel(clipDuration)}</p>
-              <p className="mt-1">Track video aktif penuh. Pilih template di bawah untuk crop dan layout hasil export.</p>
-            </div>
-          </ToolSection>
-          <ToolSection title="Frame Position">
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                className="btn-secondary px-3 py-2 text-xs"
-                onClick={() => setVideoFraming({ x: videoFraming.x - 5 })}
-                type="button"
-              >
-                Geser Kiri
-              </button>
-              <button
-                className="btn-secondary px-3 py-2 text-xs"
-                onClick={() => setVideoFraming({ x: videoFraming.x + 5 })}
-                type="button"
-              >
-                Geser Kanan
-              </button>
-              <button
-                className="btn-secondary px-3 py-2 text-xs"
-                onClick={() => setVideoFraming({ y: videoFraming.y - 5 })}
-                type="button"
-              >
-                Geser Atas
-              </button>
-              <button
-                className="btn-secondary px-3 py-2 text-xs"
-                onClick={() => setVideoFraming({ y: videoFraming.y + 5 })}
-                type="button"
-              >
-                Geser Bawah
-              </button>
-              <button
-                className="btn-secondary px-3 py-2 text-xs"
-                onClick={() => setVideoFraming({ scale: videoFraming.scale - 0.05 })}
-                type="button"
-              >
-                Zoom -
-              </button>
-              <button
-                className="btn-secondary px-3 py-2 text-xs"
-                onClick={() => setVideoFraming({ scale: videoFraming.scale + 0.05 })}
-                type="button"
-              >
-                Zoom +
-              </button>
-            </div>
+              <ToolSection title="Frame & Position">
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    className="btn-secondary px-3 py-1.5 text-xs"
+                    onClick={() => setVideoFraming({ x: videoFraming.x - 5 })}
+                    type="button"
+                  >
+                    Geser Kiri
+                  </button>
+                  <button
+                    className="btn-secondary px-3 py-1.5 text-xs"
+                    onClick={() => setVideoFraming({ x: videoFraming.x + 5 })}
+                    type="button"
+                  >
+                    Geser Kanan
+                  </button>
+                  <button
+                    className="btn-secondary px-3 py-1.5 text-xs"
+                    onClick={() => setVideoFraming({ y: videoFraming.y - 5 })}
+                    type="button"
+                  >
+                    Geser Atas
+                  </button>
+                  <button
+                    className="btn-secondary px-3 py-1.5 text-xs"
+                    onClick={() => setVideoFraming({ y: videoFraming.y + 5 })}
+                    type="button"
+                  >
+                    Geser Bawah
+                  </button>
+                </div>
 
-            <div className="mt-3 grid gap-3 rounded-xl bg-slate-50 p-3">
-              <label className="text-xs font-bold text-slate-700" htmlFor="video_framing_x">
-                <span className="flex items-center justify-between gap-2">
-                  <span>Posisi X</span>
-                  <span>{videoFraming.x.toFixed(0)}</span>
-                </span>
-                <input
-                  className="mt-1 w-full accent-violet-600"
-                  id="video_framing_x"
-                  max={40}
-                  min={-40}
-                  onChange={(event) => setVideoFraming({ x: Number(event.target.value) })}
-                  step={1}
-                  type="range"
-                  value={videoFraming.x}
-                />
-              </label>
-              <label className="text-xs font-bold text-slate-700" htmlFor="video_framing_y">
-                <span className="flex items-center justify-between gap-2">
-                  <span>Posisi Y</span>
-                  <span>{videoFraming.y.toFixed(0)}</span>
-                </span>
-                <input
-                  className="mt-1 w-full accent-violet-600"
-                  id="video_framing_y"
-                  max={40}
-                  min={-40}
-                  onChange={(event) => setVideoFraming({ y: Number(event.target.value) })}
-                  step={1}
-                  type="range"
-                  value={videoFraming.y}
-                />
-              </label>
-              <label className="text-xs font-bold text-slate-700" htmlFor="video_framing_scale">
-                <span className="flex items-center justify-between gap-2">
-                  <span>Zoom</span>
-                  <span>{videoFraming.scale.toFixed(2)}x</span>
-                </span>
-                <input
-                  className="mt-1 w-full accent-violet-600"
-                  id="video_framing_scale"
-                  max={2}
-                  min={1}
-                  onChange={(event) => setVideoFraming({ scale: Number(event.target.value) })}
-                  step={0.05}
-                  type="range"
-                  value={videoFraming.scale}
-                />
-              </label>
-            </div>
+                <div className="mt-3 grid gap-3 rounded-xl bg-zinc-850 p-3">
+                  <label className="text-xs font-bold text-zinc-300" htmlFor="video_framing_x">
+                    <span className="flex items-center justify-between gap-2">
+                      <span>Posisi X</span>
+                      <span>{videoFraming.x.toFixed(0)}</span>
+                    </span>
+                    <input
+                      className="mt-1 w-full accent-cyan-400"
+                      id="video_framing_x"
+                      max={40}
+                      min={-40}
+                      onChange={(event) => setVideoFraming({ x: Number(event.target.value) })}
+                      step={1}
+                      type="range"
+                      value={videoFraming.x}
+                    />
+                  </label>
+                  <label className="text-xs font-bold text-zinc-300" htmlFor="video_framing_y">
+                    <span className="flex items-center justify-between gap-2">
+                      <span>Posisi Y</span>
+                      <span>{videoFraming.y.toFixed(0)}</span>
+                    </span>
+                    <input
+                      className="mt-1 w-full accent-cyan-400"
+                      id="video_framing_y"
+                      max={40}
+                      min={-40}
+                      onChange={(event) => setVideoFraming({ y: Number(event.target.value) })}
+                      step={1}
+                      type="range"
+                      value={videoFraming.y}
+                    />
+                  </label>
+                  <label className="text-xs font-bold text-zinc-300" htmlFor="video_framing_scale">
+                    <span className="flex items-center justify-between gap-2">
+                      <span>Zoom / Scale</span>
+                      <span>{videoFraming.scale.toFixed(2)}x</span>
+                    </span>
+                    <input
+                      className="mt-1 w-full accent-cyan-400"
+                      id="video_framing_scale"
+                      max={2}
+                      min={1}
+                      onChange={(event) => setVideoFraming({ scale: Number(event.target.value) })}
+                      step={0.05}
+                      type="range"
+                      value={videoFraming.scale}
+                    />
+                  </label>
+                </div>
 
-            <button
-              className="btn-secondary mt-3 w-full px-3 py-2 text-xs"
-              onClick={() => setVideoFraming(defaultVideoFraming)}
-              type="button"
-            >
-              Reset Framing
-            </button>
-            <p className="mt-3 text-[11px] font-semibold leading-relaxed text-slate-500">
-              Framing berlaku untuk Potong tengah dan foreground Latar buram pada Live Preview
-              serta file export.
-            </p>
-          </ToolSection>
-          <ToolSection title="Template Video">
-            <select
-              className="w-full"
-              id="context_video_template"
-              onChange={(event) => selectPreset(event.target.value as RenderPreset)}
-              value={preset}
-            >
-              {presetOptions.map(({ value, label }) => (
-                <option key={value} value={value}>
-                  {label}
-                </option>
-              ))}
-            </select>
-            <p className="mt-1.5 text-[10px] font-semibold leading-tight text-slate-500">
-              {presetOptions.find((item) => item.value === preset)?.description}
-            </p>
-          </ToolSection>
-
-          <ToolSection title="Gaya Editing">
-            <select
-              className="w-full"
-              id="context_editing_style"
-              onChange={(event) => {
-                const nextStyle = event.target.value as keyof typeof styleDefaults;
-                setRenderDirty(true);
-                setRender(undefined);
-                set("clipper_style_config", {
-                  ...styleDefaults[nextStyle],
-                  hook_text: styleConfig.hook_text,
-                  hook_text_template: styleConfig.hook_text_template,
-                  hook_text_font: styleConfig.hook_text_font,
-                  hook_text_position: styleConfig.hook_text_position,
-                  hook_text_size: styleConfig.hook_text_size,
-                  hook_text_style_preset: styleConfig.hook_text_style_preset,
-                  keyword_text_style_preset: styleConfig.keyword_text_style_preset,
-                  caption_style: styleConfig.caption_style,
-                  effect_timeline: styleConfig.effect_timeline || [],
-                  audio_settings: audioSettings,
-                  media_trim: styleConfig.media_trim,
-                  media_split_points: styleConfig.media_split_points || [],
-                  media_sequence: styleConfig.media_sequence || [],
-                  video_sequence: styleConfig.video_sequence || [],
-                  audio_sequence: styleConfig.audio_sequence || [],
-                  audio_extracted: audioExtracted,
-                  video_track_deleted: videoTrackDeleted,
-                  audio_track_deleted: audioTrackDeleted,
-                  video_framing: videoFraming,
-                  editor_state_version: styleConfig.editor_state_version || 0,
-                  video_sequence_initialized:
-                    styleConfig.video_sequence_initialized || false,
-                  audio_sequence_initialized:
-                    styleConfig.audio_sequence_initialized || false,
-                  caption_timeline_initialized:
-                    styleConfig.caption_timeline_initialized || false,
-                  effect_timeline_initialized:
-                    styleConfig.effect_timeline_initialized || false,
-                  layer_order: visualLayerOrder,
-                  track_order: trackOrder,
-                  additional_audio_assets: additionalAudioAssets,
-                  additional_audio_tracks: additionalAudioTracks,
-                  caption_timeline: styleConfig.caption_timeline || [],
-                  render_preset: preset,
-                });
-              }}
-              value={styleConfig.clipper_style_preset}
-            >
-              {stylePresets.map((item) => (
-                <option key={item.value} value={item.value}>
-                  {item.label}
-                </option>
-              ))}
-            </select>
-          </ToolSection>
-
-          <ToolSection title="Efek Gaya">
-            <div className="grid gap-2">
-              {[
-                ["hook_text_enabled", "Hook text awal"],
-                ["punch_zoom_enabled", "Punch zoom"],
-                ["pattern_interrupt_enabled", "Pattern interrupt"],
-                ["keyword_popup_enabled", "Keyword pop-up"],
-              ].map(([key, label]) => (
-                <label
-                  className="flex items-center justify-between rounded-xl bg-slate-50 p-2.5 text-sm font-bold"
-                  key={key}
+                <button
+                  className="btn-secondary mt-3 w-full px-3 py-2 text-xs"
+                  onClick={() => setVideoFraming(defaultVideoFraming)}
+                  type="button"
                 >
-                  <span>{label}</span>
-                  <input
-                    type="checkbox"
-                    className="size-5 w-5 accent-violet-600"
-                    checked={Boolean(styleConfig[key as keyof typeof styleConfig])}
-                    onChange={(event) => setStyle(key, event.target.checked)}
-                  />
-                </label>
-              ))}
-            </div>
-            <div>
-              <label htmlFor="style_intensity">Intensity</label>
-              <select
-                id="style_intensity"
-                value={styleConfig.style_intensity}
-                onChange={(event) => setStyle("style_intensity", event.target.value)}
-              >
-                <option value="low">Low</option>
-                <option value="medium">Medium</option>
-                <option value="high">High</option>
-              </select>
-            </div>
-            <div className="rounded-xl bg-slate-50 p-3 text-xs font-semibold text-slate-600">
-              <p>Effect timeline</p>
-              <p className="mt-1">
-                Punch zoom: {effectSummary.punch} momen / Keyword pop-up:{" "}
-                {effectSummary.keyword} momen / Pattern: {effectSummary.pattern} momen
-              </p>
-              {styleConfig.pattern_interrupt_enabled && effectSummary.pattern === 0 && (
-                <p className="mt-1 text-amber-700">
-                  Pattern interrupt disimpan sebagai opsi aman, belum ditampilkan jika tidak ada event valid.
-                </p>
-              )}
-              {keywordSkipped && (
-                <p className="mt-1 text-amber-700">
-                  Keyword pop-up dilewati karena tidak ada kata/frasa penting yang layak.
-                </p>
-              )}
-            </div>
-          </ToolSection>
+                  Reset Framing
+                </button>
+              </ToolSection>
+
+              <ToolSection title="Template Video">
+                <select
+                  className="w-full"
+                  id="context_video_template"
+                  onChange={(event) => selectPreset(event.target.value as RenderPreset)}
+                  value={preset}
+                >
+                  {presetOptions.map(({ value, label }) => (
+                    <option key={value} value={value}>{label}</option>
+                  ))}
+                </select>
+              </ToolSection>
             </>
           )}
 
+          {/* 3. Contextual Audio Inspector (Volume, Mute, Fade In/Out, Ekstrak/Gabung) */}
           {selectedEditorContext === "audio" && (
-            <>
-            <ToolSection title="Audio Asli">
-              <div className="rounded-xl bg-emerald-50 p-3 text-xs font-semibold text-emerald-800">
-                <p className="font-black">Track audio sumber • {formatTimeLabel(clipDuration)}</p>
-                <p className="mt-1">Perubahan diterapkan pada live preview dan file hasil export.</p>
+            <ToolSection title="Audio Settings">
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  className="btn-secondary px-2 py-1.5 text-xs font-bold text-cyan-300"
+                  onClick={extractAudioTrack}
+                  type="button"
+                >
+                  Ekstrak Audio
+                </button>
+                {audioExtracted && (
+                  <button
+                    className="btn-secondary px-2 py-1.5 text-xs font-bold text-amber-300"
+                    onClick={mergeAudioIntoVideoTrack}
+                    type="button"
+                  >
+                    Gabungkan Audio
+                  </button>
+                )}
               </div>
 
-              <label className="flex items-center justify-between rounded-xl bg-slate-50 p-3 text-sm font-bold">
-                <span>Mute audio</span>
+              <label className="flex items-center justify-between rounded-xl bg-zinc-850 p-3 text-xs font-bold">
+                <span>Mute Audio</span>
                 <input
                   checked={audioSettings.muted}
-                  className="size-5 accent-violet-600"
+                  className="size-4 accent-cyan-400"
                   onChange={(event) => setAudioSettings({ muted: event.target.checked })}
                   type="checkbox"
                 />
               </label>
 
               <div>
-                <div className="mb-2 flex items-center justify-between gap-3">
-                  <label htmlFor="source_audio_volume">Volume</label>
-                  <strong className="text-xs text-slate-600">{Math.round(audioSettings.volume * 100)}%</strong>
+                <div className="mb-2 flex items-center justify-between gap-3 text-xs">
+                  <label htmlFor="inspector_source_audio_volume">Volume</label>
+                  <strong className="text-cyan-300">{Math.round(audioSettings.volume * 100)}%</strong>
                 </div>
                 <input
-                  className="w-full accent-violet-600"
+                  className="w-full accent-cyan-400"
                   disabled={audioSettings.muted}
-                  id="source_audio_volume"
+                  id="inspector_source_audio_volume"
                   max={2}
                   min={0}
                   onChange={(event) => setAudioSettings({ volume: Number(event.target.value) })}
@@ -5354,14 +5797,13 @@ export function TransformationPage() {
                   type="range"
                   value={audioSettings.volume}
                 />
-                <p className="mt-1 text-[11px] font-semibold text-slate-400">0% hingga 200%</p>
               </div>
 
               <div className="grid grid-cols-2 gap-2">
                 <div>
-                  <label htmlFor="source_audio_fade_in">Fade in (detik)</label>
+                  <label htmlFor="inspector_audio_fade_in">Fade In (s)</label>
                   <input
-                    id="source_audio_fade_in"
+                    id="inspector_audio_fade_in"
                     max={5}
                     min={0}
                     onChange={(event) => setAudioSettings({ fade_in: Number(event.target.value) })}
@@ -5371,9 +5813,9 @@ export function TransformationPage() {
                   />
                 </div>
                 <div>
-                  <label htmlFor="source_audio_fade_out">Fade out (detik)</label>
+                  <label htmlFor="inspector_audio_fade_out">Fade Out (s)</label>
                   <input
-                    id="source_audio_fade_out"
+                    id="inspector_audio_fade_out"
                     max={5}
                     min={0}
                     onChange={(event) => setAudioSettings({ fade_out: Number(event.target.value) })}
@@ -5383,357 +5825,67 @@ export function TransformationPage() {
                   />
                 </div>
               </div>
-
               <button
                 className="btn-secondary w-full px-3 py-2 text-xs"
                 onClick={() => setAudioSettings(defaultAudioSettings)}
                 type="button"
               >
-                Reset audio
+                Reset Audio
               </button>
             </ToolSection>
-            <ToolSection title="Library Audio">
-              <div className="grid grid-cols-3 gap-1 rounded-lg bg-slate-100 p-1">
-                {([
-                  ["music", "Musik / Backsound"],
-                  ["sfx", "Sound Effect"],
-                  ["uploads", "Upload Saya"],
-                ] as const).map(([value, label]) => (
-                  <button
-                    className={`rounded-md px-2 py-2 text-[10px] font-black ${
-                      audioLibraryTab === value
-                        ? "bg-violet-600 text-white"
-                        : "text-slate-600 hover:bg-white"
-                    }`}
-                    key={value}
-                    onClick={() => setAudioLibraryTab(value)}
-                    type="button"
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-
-              {audioLibraryTab !== "uploads" ? (
-                <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-4 text-center text-xs font-semibold text-slate-500">
-                  Belum ada aset musik bebas royalti. Upload audio sendiri atau tambahkan file ke library lokal.
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-                    <p className="text-xs font-black text-slate-700">Upload Saya</p>
-                    <p className="mt-1 text-[11px] font-semibold text-slate-500">
-                      MP3, WAV, atau M4A · maksimal 50 MB.
-                    </p>
-                    <label className="btn-secondary mt-3 block cursor-pointer px-3 py-2 text-center text-xs">
-                      {audioUploading ? `Mengupload ${audioUploadProgress}%` : "Upload Audio"}
-                      <input
-                        accept=".mp3,.wav,.m4a,audio/mpeg,audio/wav,audio/mp4"
-                        className="hidden"
-                        disabled={audioUploading}
-                        onChange={(event) => {
-                          void handleAdditionalAudioUpload(event.target.files?.[0]);
-                          event.currentTarget.value = "";
-                        }}
-                        type="file"
-                      />
-                    </label>
-                  </div>
-
-                  {!additionalAudioAssets.length ? (
-                    <p className="rounded-xl bg-slate-50 p-3 text-xs font-semibold text-slate-500">
-                      Belum ada audio yang diupload.
-                    </p>
-                  ) : (
-                    additionalAudioAssets.map((asset) => (
-                      <div className="rounded-xl border border-slate-200 bg-white p-3" key={asset.id}>
-                        <div className="flex items-start justify-between gap-2">
-                          <div className="min-w-0">
-                            <p className="truncate text-xs font-black text-slate-800">{asset.name}</p>
-                            <p className="mt-1 text-[10px] font-semibold text-slate-500">
-                              {formatTimeLabel(asset.duration_seconds)} · {(asset.size_bytes / 1024 / 1024).toFixed(1)} MB
-                            </p>
-                          </div>
-                        </div>
-                        <audio
-                          className="mt-2 h-8 w-full"
-                          controls
-                          preload="metadata"
-                          src={uploadedAudioUrl(transformationId, asset.id)}
-                        />
-                        <div className="mt-2 grid grid-cols-2 gap-2">
-                          <button
-                            className="btn-secondary px-2 py-2 text-[10px]"
-                            onClick={() => addAdditionalAudioTrack(asset, "backsound")}
-                            type="button"
-                          >
-                            + Backsound
-                          </button>
-                          <button
-                            className="btn-secondary px-2 py-2 text-[10px]"
-                            onClick={() => addAdditionalAudioTrack(asset, "sfx")}
-                            type="button"
-                          >
-                            + Sound Effect
-                          </button>
-                        </div>
-                      </div>
-                    ))
-                  )}
-                </div>
-              )}
-
-              {selectedAdditionalAudioTrack && (
-                <div className="rounded-xl border border-fuchsia-200 bg-fuchsia-50 p-3 text-xs text-fuchsia-900">
-                  <p className="font-black">{selectedAdditionalAudioTrack.label} terpilih</p>
-                  <p className="mt-1 font-semibold">
-                    {formatTimePrecise(selectedAdditionalAudioTrack.start)}–{formatTimePrecise(selectedAdditionalAudioTrack.end)}
-                  </p>
-                  <button
-                    className="mt-2 rounded-lg bg-red-50 px-3 py-2 text-xs font-black text-red-700"
-                    onClick={deleteSelectedTrackItem}
-                    type="button"
-                  >
-                    Hapus dari Timeline
-                  </button>
-                </div>
-              )}
-
-              <p className="rounded-xl bg-amber-50 p-3 text-[11px] font-semibold text-amber-800">
-                Mix audio tambahan ke live preview/output export akan disempurnakan pada tahap berikutnya. Export saat ini tetap memakai audio asli.
-              </p>
-            </ToolSection>
-            </>
           )}
 
+          {/* 4. Contextual Caption Inspector (Selected Cue Text & Detailed Typography) */}
           {selectedEditorContext === "caption" && (
-            <ToolSection title="Caption Style Studio">
-              {captionSyncRequired && (
-                <div className="rounded-xl border border-amber-300 bg-amber-50 p-3 text-amber-900">
-                  <p className="text-xs font-black">
-                    Susunan video berubah. Caption mungkin perlu disinkronkan ulang.
-                  </p>
-                </div>
-              )}
-              <button
-                className="btn-secondary w-full px-3 py-2 text-xs"
-                onClick={syncCaptionWithVideo}
-                type="button"
-              >
-                Sinkronkan Caption dengan Video
-              </button>
-              {selectedCaption ? (
-                <div className="rounded-xl border-2 border-cyan-300 bg-cyan-50 p-3 text-slate-800 shadow-sm">
-                  <div className="flex items-center justify-between gap-2">
-                    <p className="text-xs font-black uppercase tracking-wide text-cyan-800">
-                      Caption Terpilih
-                    </p>
-                    <span className="rounded-full bg-cyan-200 px-2 py-1 text-[10px] font-black text-cyan-900">
-                      Dipilih user
-                    </span>
-                  </div>
-                  <label className="mt-3 block text-xs font-black text-slate-700" htmlFor="selected_caption_text">
-                    Teks caption
-                  </label>
-                  <textarea
-                    className="mt-1 min-h-24 w-full resize-y rounded-lg border border-cyan-200 bg-white p-3 text-sm font-semibold leading-relaxed text-slate-900 outline-none focus:border-cyan-500 focus:ring-2 focus:ring-cyan-200"
-                    id="selected_caption_text"
-                    onBlur={finishSelectedCaptionTextEdit}
-                    onChange={(event) => updateSelectedCaptionText(event.target.value)}
-                    placeholder="Caption ini kosong."
-                    value={selectedCaption.text || ""}
-                  />
-                  {!selectedCaptionText && (
-                    <p className="mt-2 text-xs font-bold text-slate-500">Caption ini kosong.</p>
-                  )}
-                  {selectedCaptionWordCount > captionStyle.maxWords && (
-                    <p className="mt-2 rounded-lg bg-amber-100 p-2 text-xs font-bold text-amber-900">
-                      Cue ini panjang. Gunakan Rapikan Cue Ini.
-                    </p>
-                  )}
-                  <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
-                    <div className="rounded-lg bg-white p-2">
-                      <p className="font-semibold text-slate-500">Mulai</p>
-                      <p className="mt-1 font-black text-slate-800">
-                        {formatTimePrecise(selectedCaption.start)}
-                      </p>
+            <>
+              <ToolSection title="Caption Cue Inspector">
+                {selectedCaption ? (
+                  <div className="space-y-3">
+                    <div>
+                      <label htmlFor="inspector_caption_text">Teks Caption</label>
+                      <textarea
+                        className="min-h-24 w-full"
+                        id="inspector_caption_text"
+                        onBlur={finishSelectedCaptionTextEdit}
+                        onChange={(event) => updateSelectedCaptionText(event.target.value)}
+                        value={selectedCaption.text || ""}
+                      />
                     </div>
-                    <div className="rounded-lg bg-white p-2">
-                      <p className="font-semibold text-slate-500">Selesai</p>
-                      <p className="mt-1 font-black text-slate-800">
-                        {formatTimePrecise(selectedCaption.end)}
-                      </p>
+                    <div className="grid grid-cols-2 gap-2 text-xs">
+                      <div className="rounded-lg bg-zinc-800 p-2">
+                        <span className="text-zinc-400">Mulai:</span>
+                        <p className="font-bold text-zinc-100">{formatTimePrecise(selectedCaption.start)}</p>
+                      </div>
+                      <div className="rounded-lg bg-zinc-800 p-2">
+                        <span className="text-zinc-400">Selesai:</span>
+                        <p className="font-bold text-zinc-100">{formatTimePrecise(selectedCaption.end)}</p>
+                      </div>
                     </div>
-                    <div className="rounded-lg bg-white p-2">
-                      <p className="font-semibold text-slate-500">Durasi</p>
-                      <p className="mt-1 font-black text-slate-800">
-                        {selectedCaptionDuration.toFixed(2)} detik
-                      </p>
-                    </div>
-                    <div className="rounded-lg bg-white p-2">
-                      <p className="font-semibold text-slate-500">Isi</p>
-                      <p className="mt-1 font-black text-slate-800">
-                        {selectedCaptionWordCount} kata / {selectedCaptionCharacterCount} karakter
-                      </p>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        className="btn-secondary px-3 py-1.5 text-xs font-bold"
+                        onClick={reflowSelectedCaption}
+                        type="button"
+                      >
+                        Rapikan Cue
+                      </button>
+                      <button
+                        className="rounded-lg bg-red-900/40 text-red-300 border border-red-800/60 px-3 py-1.5 text-xs font-bold hover:bg-red-900/60"
+                        onClick={deleteSelectedCaptionCue}
+                        type="button"
+                      >
+                        Hapus Cue
+                      </button>
                     </div>
                   </div>
-                  {import.meta.env.DEV && (
-                    <p className="mt-2 break-all font-mono text-[10px] text-cyan-800">
-                      Cue ID: {selectedCaption.id}
-                    </p>
-                  )}
-                  <div className="mt-3 grid grid-cols-2 gap-2">
-                    <button
-                      className="btn-secondary px-3 py-2 text-xs"
-                      onClick={reflowSelectedCaption}
-                      type="button"
-                    >
-                      Rapikan Cue Ini
-                    </button>
-                    <button
-                      className="rounded-lg bg-red-50 px-3 py-2 text-xs font-black text-red-700 hover:bg-red-100"
-                      onClick={deleteSelectedCaptionCue}
-                      type="button"
-                    >
-                      Hapus Caption
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-4 text-center">
-                  <p className="text-sm font-bold text-slate-700">
-                    Klik salah satu caption di timeline untuk melihat teksnya.
+                ) : (
+                  <p className="rounded-xl bg-zinc-850 p-3 text-xs text-zinc-400">
+                    Pilih salah satu cue caption di timeline atau daftar sebelah kiri untuk mengedit teks.
                   </p>
-                  <p className="mt-2 text-xs font-semibold text-slate-500">
-                    {timelineCaptionItems.length} cue tersedia.
-                  </p>
-                </div>
-              )}
+                )}
+              </ToolSection>
 
-              <button
-                className="btn-secondary w-full px-3 py-2 text-xs"
-                disabled={!editableCaptionCues.length}
-                onClick={reflowAllCaptions}
-                type="button"
-              >
-                Rapikan Semua Caption
-              </button>
-
-              <div className="rounded-xl border border-slate-200 p-3">
-                <p className="text-xs font-black uppercase tracking-wide text-slate-500">
-                  Mode Tampilan Caption
-                </p>
-                <div className="mt-2 grid grid-cols-3 gap-1 rounded-lg bg-slate-100 p-1">
-                  {([
-                    ["segment", "Segment"],
-                    ["karaoke", "Karaoke"],
-                    ["word_by_word", "Word by Word"],
-                  ] as Array<[CaptionDisplayMode, string]>).map(([value, label]) => (
-                    <button
-                      className={`min-h-9 rounded-md px-2 text-[11px] font-black transition-colors ${
-                        captionStyle.displayMode === value
-                          ? "bg-white text-violet-700 shadow-sm"
-                          : "text-slate-600 hover:text-slate-900"
-                      }`}
-                      key={value}
-                      onClick={() =>
-                        setCaptionStyle({
-                          displayMode: value,
-                          karaokeEnabled: value === "karaoke",
-                        })
-                      }
-                      type="button"
-                    >
-                      {label}
-                    </button>
-                  ))}
-                </div>
-                <p className="mt-3 text-xs font-black text-slate-600">Target kata per cue</p>
-                <div className="mt-2 grid grid-cols-3 gap-2">
-                  {[3, 4, 5].map((wordTarget) => (
-                    <button
-                      className={`rounded-lg border px-3 py-2 text-xs font-black ${
-                        captionStyle.maxWords === wordTarget
-                          ? "border-violet-600 bg-violet-50 text-violet-700"
-                          : "border-slate-200 bg-white text-slate-600"
-                      }`}
-                      key={wordTarget}
-                      onClick={() => setCaptionStyle({ maxWords: wordTarget })}
-                      type="button"
-                    >
-                      {wordTarget} kata
-                    </button>
-                  ))}
-                </div>
-                <p className="mt-3 text-[11px] font-semibold leading-relaxed text-slate-500">
-                  Mode Word by Word dan Karaoke masih estimasi sampai tersedia timing kata per kata.
-                </p>
-              </div>
-
-              {previewPlaying && currentCaptionCue && (
-                <div className="rounded-xl border border-violet-200 bg-violet-50 p-3">
-                  <div className="flex items-center justify-between gap-2">
-                    <p className="text-xs font-black uppercase tracking-wide text-violet-800">
-                      Caption aktif saat ini
-                    </p>
-                    <span className="rounded-full bg-violet-200 px-2 py-1 text-[10px] font-black text-violet-900">
-                      Mengikuti playhead
-                    </span>
-                  </div>
-                  <p className="mt-2 whitespace-pre-wrap break-words text-sm font-semibold leading-relaxed text-slate-900">
-                    {String(currentCaptionCue.text || "").trim() || "Caption ini kosong."}
-                  </p>
-                  <p className="mt-2 text-xs font-bold text-violet-800">
-                    {formatTimePrecise(currentCaptionCue.start)} - {formatTimePrecise(currentCaptionCue.end)}
-                  </p>
-                </div>
-              )}
-
-              <div>
-                <label
-                  className="text-xs font-black uppercase tracking-wide text-slate-500"
-                  htmlFor="caption_style_preset"
-                >
-                  Preset Caption
-                </label>
-                <select
-                  className="mt-2 w-full"
-                  id="caption_style_preset"
-                  onChange={(event) => {
-                    const selectedPreset = captionStylePresets.find(
-                      (item) => item.value === event.target.value,
-                    );
-                    if (!selectedPreset) return;
-                    setCaptionStyle({
-                      ...selectedPreset.config,
-                      displayMode: captionStyle.displayMode,
-                      maxWords: captionStyle.maxWords,
-                      karaokeEnabled: captionStyle.displayMode === "karaoke",
-                    });
-                  }}
-                  value={captionStyle.preset}
-                >
-                  {captionStylePresets.map((item) => (
-                    <option key={item.value} value={item.value}>
-                      {item.label}
-                    </option>
-                  ))}
-                </select>
-                <p className="mt-1.5 text-[10px] font-semibold leading-tight text-slate-500">
-                  {captionStylePresets.find((item) => item.value === captionStyle.preset)?.description}
-                </p>
-              </div>
-
-              <TextStylePresetSelector
-                label="Gaya Teks Caption"
-                onChange={(value) => setCaptionStyle({ textPreset: value })}
-                value={captionStyle.textPreset}
-              />
-
-              <div className="rounded-xl border border-slate-200 p-3">
-                <p className="mb-2 text-xs font-black uppercase tracking-wide text-slate-500">
-                  Pengaturan dasar
-                </p>
+              <ToolSection title="Tipografi & Gaya Caption">
                 <div className="grid grid-cols-2 gap-2">
                   <div>
                     <label htmlFor="caption_font_size">Ukuran</label>
@@ -5752,7 +5904,7 @@ export function TransformationPage() {
                     </select>
                   </div>
                   <div>
-                    <label htmlFor="caption_font_weight">Weight</label>
+                    <label htmlFor="caption_font_weight">Ketebalan</label>
                     <select
                       id="caption_font_weight"
                       value={captionStyle.fontWeight}
@@ -5767,7 +5919,10 @@ export function TransformationPage() {
                       <option value="bold">Bold</option>
                     </select>
                   </div>
-                  <div className="col-span-2">
+                </div>
+
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  <div>
                     <label htmlFor="caption_position">Posisi</label>
                     <select
                       id="caption_position"
@@ -5778,368 +5933,194 @@ export function TransformationPage() {
                         })
                       }
                     >
-                      <option value="bottom">Bottom</option>
-                      <option value="center_lower">Center lower</option>
-                      <option value="center">Center</option>
-                      <option value="top">Top</option>
+                      <option value="bottom">Bawah</option>
+                      <option value="center_lower">Bawah Tengah</option>
+                      <option value="center">Tengah</option>
+                      <option value="top">Atas</option>
                     </select>
                   </div>
                   <div>
-                    <label htmlFor="caption_text_color">Text</label>
+                    <label htmlFor="caption_text_color">Warna Teks</label>
                     <input
+                      className="h-10 p-1 w-full rounded bg-zinc-800"
                       id="caption_text_color"
+                      onChange={(event) => setCaptionStyle({ textColor: event.target.value })}
                       type="color"
                       value={captionStyle.textColor}
-                      onChange={(event) => setCaptionStyle({ textColor: event.target.value })}
-                    />
-                  </div>
-                  <div>
-                    <label htmlFor="caption_highlight_color">Highlight</label>
-                    <input
-                      id="caption_highlight_color"
-                      type="color"
-                      value={captionStyle.highlightColor}
-                      onChange={(event) => setCaptionStyle({ highlightColor: event.target.value })}
-                    />
-                  </div>
-                  <div className="col-span-2">
-                    <label htmlFor="caption_max_chars">Karakter</label>
-                    <input
-                      id="caption_max_chars"
-                      max={45}
-                      min={10}
-                      type="number"
-                      value={captionStyle.maxChars}
-                      onChange={(event) => {
-                        const value = Number(event.target.value);
-                        setCaptionStyle({ maxChars: value });
-                      }}
                     />
                   </div>
                 </div>
-                <div className="mt-3 grid gap-2">
-                  {[
-                    ["outlineEnabled", "Outline"],
-                    ["shadowEnabled", "Shadow"],
-                    ["backgroundEnabled", "Background box"],
-                  ].map(([key, label]) => (
-                    <label
-                      className="flex items-center justify-between rounded-lg bg-slate-50 px-3 py-2 text-xs font-bold text-slate-700"
-                      key={key}
-                    >
-                      <span>{label}</span>
-                      <input
-                        checked={Boolean(captionStyle[key as keyof CaptionStyleConfig])}
-                        className="size-4 accent-violet-600"
-                        onChange={(event) =>
-                          setCaptionStyle({
-                            [key]: event.target.checked,
-                          } as Partial<CaptionStyleConfig>)
-                        }
-                        type="checkbox"
-                      />
-                    </label>
-                  ))}
+
+                <div className="mt-2">
+                  <label htmlFor="caption_highlight_color">Warna Sorotan Karaoke</label>
+                  <input
+                    className="h-10 p-1 w-full rounded bg-zinc-800"
+                    id="caption_highlight_color"
+                    onChange={(event) => setCaptionStyle({ highlightColor: event.target.value })}
+                    type="color"
+                    value={captionStyle.highlightColor}
+                  />
                 </div>
+
+                <div className="mt-3 grid grid-cols-2 gap-2">
+                  <label className="flex items-center gap-2 rounded-lg bg-zinc-850 p-2 text-xs font-bold">
+                    <input
+                      checked={captionStyle.outlineEnabled}
+                      className="size-4 accent-cyan-400"
+                      onChange={(event) =>
+                        setCaptionStyle({ outlineEnabled: event.target.checked })
+                      }
+                      type="checkbox"
+                    />
+                    <span>Garis Luar</span>
+                  </label>
+                  <label className="flex items-center gap-2 rounded-lg bg-zinc-850 p-2 text-xs font-bold">
+                    <input
+                      checked={captionStyle.shadowEnabled}
+                      className="size-4 accent-cyan-400"
+                      onChange={(event) =>
+                        setCaptionStyle({ shadowEnabled: event.target.checked })
+                      }
+                      type="checkbox"
+                    />
+                    <span>Bayangan</span>
+                  </label>
+                </div>
+
+                <label className="mt-2 flex items-center justify-between rounded-lg bg-zinc-850 p-2 text-xs font-bold">
+                  <span>Latar Belakang</span>
+                  <input
+                    checked={captionStyle.backgroundEnabled}
+                    className="size-4 accent-cyan-400"
+                    onChange={(event) =>
+                      setCaptionStyle({ backgroundEnabled: event.target.checked })
+                    }
+                    type="checkbox"
+                  />
+                </label>
+
                 {captionStyle.backgroundEnabled && (
-                  <div className="mt-3">
-                    <label htmlFor="caption_background_opacity">Background opacity</label>
+                  <div className="mt-2">
+                    <div className="flex items-center justify-between text-xs">
+                      <span>Transparansi Latar</span>
+                      <span>{Math.round(captionStyle.backgroundOpacity * 100)}%</span>
+                    </div>
                     <input
-                      id="caption_background_opacity"
+                      className="w-full accent-cyan-400"
                       max={0.85}
-                      min={0}
-                      step={0.05}
-                      type="range"
-                      value={captionStyle.backgroundOpacity}
+                      min={0.1}
                       onChange={(event) =>
                         setCaptionStyle({ backgroundOpacity: Number(event.target.value) })
                       }
+                      step={0.05}
+                      type="range"
+                      value={captionStyle.backgroundOpacity}
                     />
                   </div>
                 )}
-              </div>
+              </ToolSection>
+            </>
+          )}
 
-              <p className="rounded-xl bg-violet-50 p-3 text-xs font-semibold text-violet-800">
-                Teks, timing, dan gaya dasar Caption diterapkan ke Live Preview serta file export.
-                Mode tampilan tertentu dapat memiliki perbedaan kecil pada MP4.
-              </p>
-              {!transcriptionReady && (
-                <div className="rounded-xl bg-amber-50 p-3 text-sm text-amber-800">
-                  Subtitle audio asli belum aktif.
-                  {context.data.configured_transcription_provider !== "mock" && (
-                    <button className="mt-2 block font-bold underline" onClick={() => reprocess.mutate()}>
-                      Proses ulang speech-to-text
-                    </button>
-                  )}
+          {/* 5. Contextual Hook / Keyword / Effects Inspector */}
+          {(selectedEditorContext === "hook" || selectedEditorContext === "keyword" || selectedEditorContext === "effect") && (
+            <ToolSection title={selectedEditorContext === "hook" ? "Hook Inspector" : selectedEditorContext === "keyword" ? "Keyword Inspector" : "Effect Inspector"}>
+              {selectedEditorContext === "hook" && (
+                <div className="space-y-3">
+                  <div>
+                    <label htmlFor="inspector_hook_text">Teks Hook</label>
+                    <input
+                      id="inspector_hook_text"
+                      value={styleConfig.hook_text}
+                      maxLength={70}
+                      onChange={(event) => setStyle("hook_text", event.target.value)}
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label htmlFor="inspector_hook_font">Font</label>
+                      <select
+                        id="inspector_hook_font"
+                        value={hookTextFont}
+                        onChange={(event) => setStyle("hook_text_font", event.target.value as HookTextFont)}
+                      >
+                        {hookTextFonts.map((f) => (
+                          <option key={f.value} value={f.value}>{f.label}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label htmlFor="inspector_hook_size">Ukuran</label>
+                      <select
+                        id="inspector_hook_size"
+                        value={hookTextSize}
+                        onChange={(event) => setStyle("hook_text_size", event.target.value as HookTextSize)}
+                      >
+                        <option value="normal">Normal</option>
+                        <option value="large">Besar</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label htmlFor="inspector_hook_pos">Posisi</label>
+                    <select
+                      id="inspector_hook_pos"
+                      value={hookTextPosition}
+                      onChange={(event) => setStyle("hook_text_position", event.target.value as HookTextPosition)}
+                    >
+                      <option value="safe_top">Paling Atas</option>
+                      <option value="top">Atas</option>
+                      <option value="upper_center">Tengah Atas</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label htmlFor="inspector_hook_template">Template</label>
+                    <select
+                      id="inspector_hook_template"
+                      value={hookTextTemplate}
+                      onChange={(event) => setStyle("hook_text_template", event.target.value as HookTextTemplate)}
+                    >
+                      {hookTextTemplates.map((t) => (
+                        <option key={t.value} value={t.value}>{t.label}</option>
+                      ))}
+                    </select>
+                  </div>
                 </div>
               )}
-            </ToolSection>
-          )}
 
-          {selectedEditorContext === "timeline" && (
-            <ToolSection title="Timeline Tools">
-              {manualEditorMode &&
-                !styleConfig.video_sequence?.length &&
-                !(styleConfig.additional_audio_assets?.length) &&
-                !(styleConfig.editor_image_assets?.length) && (
-                  <div className="mb-3 rounded-xl border border-dashed border-zinc-300 bg-slate-50 p-3 text-xs font-semibold text-slate-500">
-                    Tambahkan video, audio, atau gambar ke timeline dari panel Media.
-                  </div>
-                )}
-              <div className="rounded-xl bg-slate-50 p-3 text-sm font-semibold text-slate-700">
-                Playhead: <strong>{formatTimeLabel(previewTime)}</strong>
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                <button className="btn-secondary px-3 py-2 text-xs" onClick={() => addEvent("punch_zoom")}>
-                  + Punch
-                </button>
-                <button className="btn-secondary px-3 py-2 text-xs" onClick={() => addEvent("keyword_popup")}>
-                  + Keyword
-                </button>
-                <button className="btn-secondary px-3 py-2 text-xs" onClick={() => addEvent("pattern_interrupt")}>
-                  + Pattern
-                </button>
-                {!editableEffectTimeline.some((event) => event.type === "hook_text") && (
-                  <button className="btn-secondary px-3 py-2 text-xs" onClick={() => addEvent("hook_text")}>
-                    + Hook
-                  </button>
-                )}
-              </div>
-              <div className="rounded-xl border border-slate-200 p-3 text-xs font-semibold text-slate-600">
-                Caption: {timelineCaptionItems.length} cue / Hook: {timelineHookItems.length} / Punch:{" "}
-                {effectSummary.punch} / Keyword: {effectSummary.keyword} / Pattern: {effectSummary.pattern}
-              </div>
-              <p className="text-xs font-semibold text-slate-500">
-                Klik marker untuk mengedit detail event.
-              </p>
-            </ToolSection>
-          )}
-
-          {(selectedEditorContext === "hook" ||
-            selectedEditorContext === "keyword" ||
-            selectedEditorContext === "effect") && (
-            <ToolSection
-              title={
-                selectedEditorContext === "hook"
-                  ? "Hook Tools"
-                  : selectedEditorContext === "keyword"
-                    ? "Keyword Tools"
-                    : "Effect Tools"
-              }
-            >
-              {selectedEditorContext === "hook" && (
-                <>
+              {selectedEditorContext === "keyword" && selectedEvent && (
+                <div className="space-y-3">
                   <div>
-                    <label
-                      className="text-xs font-black uppercase tracking-wide text-slate-500"
-                      htmlFor="hook_text_template"
-                    >
-                      Template Hook
-                    </label>
-                    <select
-                      className="mt-2 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-bold text-slate-800 outline-none focus:border-violet-500"
-                      id="hook_text_template"
-                      onChange={(event) => setStyle("hook_text_template", event.target.value)}
-                      value={hookTextTemplate}
-                    >
-                      {hookTextTemplates.map((template) => (
-                        <option key={template.value} value={template.value}>
-                          {template.label}
-                        </option>
-                      ))}
-                    </select>
-                    <p className="mt-1.5 text-[10px] font-semibold leading-tight text-slate-500">
-                      {activeHookTemplate.description}
-                    </p>
+                    <label htmlFor="inspector_keyword_text">Teks Keyword</label>
+                    <input
+                      id="inspector_keyword_text"
+                      value={selectedEvent.text || ""}
+                      onChange={(event) => {
+                        const text = sanitizeKeywordInput(event.target.value);
+                        replaceEvent(selectedEvent.id || "", { text });
+                      }}
+                    />
                   </div>
-
-                  <TextStylePresetSelector
-                    label="Gaya Teks Hook"
-                    onChange={(value) => setStyle("hook_text_style_preset", value)}
-                    value={hookTextStylePreset}
-                  />
-
-                  <div className="rounded-lg border border-slate-200 bg-white p-3">
-                    <label
-                      className="text-xs font-black uppercase tracking-wide text-slate-500"
-                      htmlFor="hook_text_font"
-                    >
-                      Font Hook
-                    </label>
-                    <select
-                      className="mt-2 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-bold text-slate-800 outline-none focus:border-violet-500"
-                      id="hook_text_font"
-                      onChange={(event) => setStyle("hook_text_font", event.target.value)}
-                      style={{ fontFamily: activeHookFont.fontFamily }}
-                      value={hookTextFont}
-                    >
-                      {hookTextFonts.map((font) => (
-                        <option key={font.value} value={font.value}>
-                          {font.label}
-                        </option>
-                      ))}
-                    </select>
-                    <p className="mt-1.5 text-[10px] font-semibold leading-tight text-slate-500">
-                      {activeHookFont.description}
-                    </p>
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-3 rounded-lg border border-slate-200 p-3">
-                    <div>
-                      <p className="text-xs font-black text-slate-600">Posisi</p>
-                      <div className="mt-2 grid grid-cols-3 gap-1">
-                        {(["safe_top", "top", "upper_center"] as HookTextPosition[]).map((position) => (
-                          <button
-                            className={`rounded-md px-2 py-2 text-[10px] font-black ${
-                              hookTextPosition === position
-                                ? "bg-violet-600 text-white"
-                                : "bg-slate-100 text-slate-600"
-                            }`}
-                            key={position}
-                            onClick={() => setStyle("hook_text_position", position)}
-                            type="button"
-                          >
-                            {position === "safe_top"
-                              ? "Paling Atas"
-                              : position === "top"
-                                ? "Atas"
-                                : "Tengah Atas"}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                    <div>
-                      <p className="text-xs font-black text-slate-600">Ukuran</p>
-                      <div className="mt-2 grid grid-cols-2 gap-1">
-                        {(["normal", "large"] as HookTextSize[]).map((size) => (
-                          <button
-                            className={`rounded-md px-2 py-2 text-[10px] font-black ${
-                              hookTextSize === size
-                                ? "bg-violet-600 text-white"
-                                : "bg-slate-100 text-slate-600"
-                            }`}
-                            key={size}
-                            onClick={() => setStyle("hook_text_size", size)}
-                            type="button"
-                          >
-                            {size === "normal" ? "Normal" : "Besar"}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-                  <p className="text-[11px] font-semibold leading-relaxed text-slate-500">
-                    Style Hook berlaku untuk Live Preview. Hook tetap dapat dihapus dari timeline.
-                  </p>
-                </>
+                  <button
+                    className="rounded-lg bg-red-900/40 text-red-300 border border-red-800/60 w-full py-1.5 text-xs font-bold"
+                    onClick={() => deleteEvent(selectedEvent.id || "")}
+                    type="button"
+                  >
+                    Hapus Keyword
+                  </button>
+                </div>
               )}
-              {selectedEditorContext === "keyword" && (
-                <TextStylePresetSelector
-                  label="Gaya Teks Keyword"
-                  onChange={(value) => setStyle("keyword_text_style_preset", value)}
-                  value={keywordTextStylePreset}
-                />
-              )}
-              {!selectedEvent ? (
-                <p className="rounded-xl bg-slate-50 p-3 text-sm font-semibold text-slate-600">
-                  Pilih marker di timeline untuk mengedit detail event.
-                </p>
-              ) : (
-                <>
-                  {(selectedEditorContext === "hook" || selectedEditorContext === "keyword") && (
-                    <div>
-                      <label htmlFor="context_event_text">
-                        {selectedEditorContext === "hook" ? "Text hook" : "Keyword"}
-                      </label>
-                      <input
-                        id="context_event_text"
-                        value={selectedEvent.text || ""}
-                        onChange={(event) => {
-                          const text =
-                            selectedEditorContext === "keyword"
-                              ? sanitizeKeywordInput(event.target.value)
-                              : event.target.value.slice(0, 70);
-                          if (selectedEditorContext === "keyword") {
-                            setTimelineError(
-                              text && !isValidKeyword(text)
-                                ? "Keyword belum layak. Hindari stopword tunggal."
-                                : "",
-                            );
-                          }
-                          replaceEvent(selectedEvent.id || "", { text });
-                        }}
-                      />
-                      {selectedEditorContext === "keyword" && selectedEvent.text && !isValidKeyword(selectedEvent.text) && (
-                        <p className="mt-1 text-xs font-semibold text-red-600">
-                          Keyword tidak valid. Gunakan 1-4 kata bermakna.
-                        </p>
-                      )}
-                    </div>
-                  )}
-                  {selectedEditorContext !== "hook" && (
-                    <>
-                      <div className="grid grid-cols-2 gap-2">
-                        <div>
-                          <label htmlFor="context_event_start">Start</label>
-                          <input
-                            id="context_event_start"
-                            max={clipDuration}
-                            min={0}
-                            step={0.1}
-                            type="number"
-                            value={selectedEvent.start}
-                            onChange={(event) => {
-                              const bounds = eventDurationBounds(selectedEvent.type);
-                              const nextStart = clampClipTime(Number(event.target.value));
-                              const nextEnd = Math.min(
-                                clipDuration,
-                                Math.max(nextStart + bounds.min, selectedEvent.end),
-                              );
-                              replaceEvent(selectedEvent.id || "", {
-                                start: Number(nextStart.toFixed(2)),
-                                end: Number(nextEnd.toFixed(2)),
-                              });
-                            }}
-                          />
-                        </div>
-                        <div>
-                          <label htmlFor="context_event_end">End</label>
-                          <input
-                            id="context_event_end"
-                            max={clipDuration}
-                            min={0}
-                            step={0.1}
-                            type="number"
-                            value={selectedEvent.end}
-                            onChange={(event) => {
-                              const bounds = eventDurationBounds(selectedEvent.type);
-                              const rawEnd = clampClipTime(Number(event.target.value));
-                              const maxEnd = Math.min(
-                                clipDuration,
-                                selectedEvent.start + bounds.max,
-                              );
-                              const nextEnd = Math.min(
-                                maxEnd,
-                                Math.max(selectedEvent.start + bounds.min, rawEnd),
-                              );
-                              replaceEvent(selectedEvent.id || "", {
-                                end: Number(nextEnd.toFixed(2)),
-                              });
-                            }}
-                          />
-                        </div>
-                      </div>
-                      <p className="rounded-xl bg-slate-50 p-3 text-xs font-semibold text-slate-600">
-                        Durasi: {(selectedEvent.end - selectedEvent.start).toFixed(1)} detik
-                        {selectedEvent.reason ? ` / Reason: ${selectedEvent.reason}` : ""}
-                      </p>
-                    </>
-                  )}
+
+              {selectedEditorContext === "effect" && selectedEvent && (
+                <div className="space-y-3">
                   {selectedEvent.type === "punch_zoom" && (
                     <div>
-                      <label htmlFor="context_event_zoom">Zoom</label>
+                      <label htmlFor="inspector_punch_zoom">Zoom Level</label>
                       <input
-                        id="context_event_zoom"
+                        id="inspector_punch_zoom"
                         max={1.18}
                         min={1.01}
                         step={0.01}
@@ -6155,9 +6136,9 @@ export function TransformationPage() {
                   )}
                   {selectedEvent.type === "pattern_interrupt" && (
                     <div>
-                      <label htmlFor="context_event_pattern">Effect type</label>
+                      <label htmlFor="inspector_pattern_effect">Effect Type</label>
                       <select
-                        id="context_event_pattern"
+                        id="inspector_pattern_effect"
                         value={selectedEvent.effect || "quick_zoom_shift"}
                         onChange={(event) =>
                           replaceEvent(selectedEvent.id || "", { effect: event.target.value })
@@ -6168,20 +6149,17 @@ export function TransformationPage() {
                       </select>
                     </div>
                   )}
-                  {selectedEditorContext !== "hook" && (
-                    <button
-                      className="rounded-lg bg-red-50 px-3 py-2 text-xs font-black text-red-700"
-                      onClick={() => deleteEvent(selectedEvent.id || "")}
-                      type="button"
-                    >
-                      Hapus event
-                    </button>
-                  )}
-                </>
+                  <button
+                    className="rounded-lg bg-red-900/40 text-red-300 border border-red-800/60 w-full py-1.5 text-xs font-bold"
+                    onClick={() => deleteEvent(selectedEvent.id || "")}
+                    type="button"
+                  >
+                    Hapus Event
+                  </button>
+                </div>
               )}
             </ToolSection>
           )}
-
         </aside>
       </div>
 
