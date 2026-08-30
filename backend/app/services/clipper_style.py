@@ -139,6 +139,14 @@ DEFAULT_STYLE: dict[str, Any] = {
     "additional_audio_assets": [],
     "additional_audio_tracks": [],
     "caption_timeline": [],
+    "main_caption_style": None,
+    "caption_apply_to_all": True,
+    "track_locks": {},
+    "track_visibility": {},
+    "video_muted": False,
+    "video_visible": True,
+    "video_locked": False,
+    "audio_locked": False,
 }
 
 PRESET_DEFAULTS: dict[ClipperStylePreset, dict[str, Any]] = {
@@ -259,6 +267,21 @@ def normalize_clipper_style(config: dict | None, hook_fallback: str = "") -> dic
     normalized["video_track_deleted"] = bool(normalized.get("video_track_deleted", False))
     normalized["audio_track_deleted"] = bool(normalized.get("audio_track_deleted", False))
     normalized["video_framing"] = normalize_video_framing(normalized.get("video_framing"))
+    if "render_preset" in normalized and str(normalized["render_preset"]) in {
+        "blurred_background",
+        "center_crop",
+        "fit_background",
+        "picture_in_picture",
+    }:
+        normalized["render_preset"] = str(normalized["render_preset"])
+    if "video_adjustments" in normalized:
+        normalized["video_adjustments"] = normalize_video_adjustments(normalized.get("video_adjustments"))
+    if "video_speed" in normalized:
+        try:
+            video_speed = float(normalized["video_speed"])
+            normalized["video_speed"] = round(max(0.25, min(4.0, video_speed if math.isfinite(video_speed) else 1.0)), 2)
+        except (TypeError, ValueError):
+            normalized["video_speed"] = 1.0
     try:
         editor_state_version = int(normalized.get("editor_state_version") or 0)
     except (TypeError, ValueError):
@@ -288,10 +311,41 @@ def normalize_clipper_style(config: dict | None, hook_fallback: str = "") -> dic
     normalized["caption_timeline"] = normalize_caption_timeline(
         normalized.get("caption_timeline")
     )
+    if "main_caption_style" in normalized and isinstance(normalized["main_caption_style"], dict):
+        normalized["main_caption_style"] = dict(normalized["main_caption_style"])
+    if "caption_apply_to_all" in normalized:
+        normalized["caption_apply_to_all"] = bool(normalized["caption_apply_to_all"])
+    normalized["track_locks"] = dict(normalized.get("track_locks") or {}) if isinstance(normalized.get("track_locks"), dict) else {}
+    normalized["track_visibility"] = dict(normalized.get("track_visibility") or {}) if isinstance(normalized.get("track_visibility"), dict) else {}
+    normalized["video_muted"] = bool(normalized.get("video_muted", False))
+    normalized["video_visible"] = bool(normalized.get("video_visible", True))
+    normalized["video_locked"] = bool(normalized.get("video_locked", False))
+    normalized["audio_locked"] = bool(normalized.get("audio_locked", False))
     return normalized
 
 
-def normalize_video_framing(value: Any) -> dict[str, float]:
+def normalize_video_adjustments(value: Any) -> dict[str, float]:
+    adjustments = value if isinstance(value, dict) else {}
+
+    def finite_float(key: str, fallback: float) -> float:
+        try:
+            result = float(adjustments.get(key, fallback))
+        except (TypeError, ValueError):
+            return fallback
+        return result if math.isfinite(result) else fallback
+
+    return {
+        "brightness": round(max(-100.0, min(100.0, finite_float("brightness", 0.0))), 1),
+        "contrast": round(max(-100.0, min(100.0, finite_float("contrast", 0.0))), 1),
+        "saturation": round(max(-100.0, min(100.0, finite_float("saturation", 0.0))), 1),
+        "sharpness": round(max(0.0, min(100.0, finite_float("sharpness", 0.0))), 1),
+        "temperature": round(max(-100.0, min(100.0, finite_float("temperature", 0.0))), 1),
+        "vignette": round(max(0.0, min(100.0, finite_float("vignette", 0.0))), 1),
+        "blur": round(max(0.0, min(20.0, finite_float("blur", 0.0))), 1),
+    }
+
+
+def normalize_video_framing(value: Any) -> dict[str, Any]:
     framing = value if isinstance(value, dict) else {}
 
     def finite_float(key: str, fallback: float) -> float:
@@ -301,11 +355,37 @@ def normalize_video_framing(value: Any) -> dict[str, float]:
             return fallback
         return result if math.isfinite(result) else fallback
 
-    return {
+    normalized: dict[str, Any] = {
         "x": max(-40.0, min(40.0, finite_float("x", DEFAULT_VIDEO_FRAMING["x"]))),
         "y": max(-40.0, min(40.0, finite_float("y", DEFAULT_VIDEO_FRAMING["y"]))),
         "scale": max(1.0, min(2.0, finite_float("scale", DEFAULT_VIDEO_FRAMING["scale"]))),
     }
+    if "preset" in framing and str(framing["preset"]) in {
+        "blurred_background",
+        "center_crop",
+        "fit_background",
+        "picture_in_picture",
+        "clean_podcast",
+        "studio_podcast",
+        "talking_head",
+        "full_frame",
+    }:
+        normalized["preset"] = str(framing["preset"])
+    if "rotation" in framing:
+        normalized["rotation"] = round(max(-180.0, min(180.0, finite_float("rotation", 0.0))), 1)
+    if "flip_h" in framing:
+        normalized["flip_h"] = bool(framing["flip_h"])
+    if "flip_v" in framing:
+        normalized["flip_v"] = bool(framing["flip_v"])
+    if "opacity" in framing:
+        normalized["opacity"] = round(max(0.0, min(1.0, finite_float("opacity", 1.0))), 2)
+    if "blur_background" in framing:
+        normalized["blur_background"] = bool(framing["blur_background"])
+    if "blur_strength" in framing:
+        normalized["blur_strength"] = round(max(1.0, min(50.0, finite_float("blur_strength", 20.0))), 1)
+    if "background_color" in framing:
+        normalized["background_color"] = str(framing["background_color"])[:30]
+    return normalized
 
 
 def normalize_audio_settings(value: Any) -> dict[str, Any]:
@@ -322,11 +402,16 @@ def normalize_audio_settings(value: Any) -> dict[str, Any]:
         fade_out = float(settings.get("fade_out", 0.0))
     except (TypeError, ValueError):
         fade_out = 0.0
+    try:
+        speed = float(settings.get("speed", 1.0))
+    except (TypeError, ValueError):
+        speed = 1.0
     return {
         "volume": round(max(0.0, min(volume, 2.0)), 2),
         "muted": bool(settings.get("muted", False)),
-        "fade_in": round(max(0.0, min(fade_in, 5.0)), 2),
-        "fade_out": round(max(0.0, min(fade_out, 5.0)), 2),
+        "fade_in": round(max(0.0, min(fade_in, 10.0)), 2),
+        "fade_out": round(max(0.0, min(fade_out, 10.0)), 2),
+        "speed": round(max(0.5, min(speed, 2.0)), 2),
     }
 
 
@@ -368,13 +453,18 @@ def normalize_media_sequence(value: Any) -> list[dict[str, Any]]:
             continue
         if source_end - source_start < 0.1:
             continue
-        normalized.append(
-            {
-                "id": str(item.get("id") or f"media-{index}")[:80],
-                "source_start": round(source_start, 3),
-                "source_end": round(source_end, 3),
-            }
-        )
+        item_dict: dict[str, Any] = {
+            "id": str(item.get("id") or f"media-{index}")[:80],
+            "source_start": round(source_start, 3),
+            "source_end": round(source_end, 3),
+        }
+        if "locked" in item:
+            item_dict["locked"] = bool(item["locked"])
+        if "visible" in item:
+            item_dict["visible"] = bool(item["visible"])
+        if "muted" in item:
+            item_dict["muted"] = bool(item["muted"])
+        normalized.append(item_dict)
     return normalized
 
 
@@ -412,14 +502,23 @@ def normalize_caption_timeline(value: Any) -> list[dict[str, Any]]:
         text = normalize_indonesian_text(str(item.get("text") or ""))[:200].strip()
         if not text or end - start < 0.05:
             continue
-        normalized.append(
-            {
-                "id": str(item.get("id") or f"caption-{index}")[:80],
-                "start": round(start, 3),
-                "end": round(end, 3),
-                "text": text,
-            }
-        )
+        cue_dict: dict[str, Any] = {
+            "id": str(item.get("id") or f"caption-{index}")[:80],
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "text": text,
+        }
+        if "locked" in item:
+            cue_dict["locked"] = bool(item["locked"])
+        if "visible" in item:
+            cue_dict["visible"] = bool(item["visible"])
+        if item.get("type"):
+            cue_dict["type"] = str(item.get("type"))[:50]
+        if item.get("style_id"):
+            cue_dict["style_id"] = str(item.get("style_id"))[:50]
+        if isinstance(item.get("style_override"), dict):
+            cue_dict["style_override"] = item.get("style_override")
+        normalized.append(cue_dict)
     return normalized
 
 
@@ -463,6 +562,10 @@ def validate_effect_timeline(
                 "end": round(end, 2),
                 "reason": normalize_indonesian_text(str(event.get("reason") or ""))[:80],
             }
+            if "locked" in event:
+                normalized["locked"] = bool(event["locked"])
+            if "visible" in event:
+                normalized["visible"] = bool(event["visible"])
             if event.get("id"):
                 normalized["id"] = str(event["id"])[:120]
             if event_type == "punch_zoom":
@@ -481,6 +584,60 @@ def validate_effect_timeline(
                 normalized["effect"] = normalize_indonesian_text(
                     str(event.get("effect") or "quick_zoom_shift")
                 )[:40]
+            if event.get("position"):
+                normalized["position"] = str(event["position"])[:50]
+            if event.get("size"):
+                normalized["size"] = str(event["size"])[:50]
+            if event.get("preset"):
+                normalized["preset"] = str(event["preset"])[:50]
+            if event.get("font_family"):
+                normalized["font_family"] = str(event["font_family"])[:80]
+            if event.get("position_x_percent") is not None:
+                normalized["position_x_percent"] = round(float(event["position_x_percent"]), 2)
+            if event.get("position_y_percent") is not None:
+                normalized["position_y_percent"] = round(float(event["position_y_percent"]), 2)
+            if event.get("scale") is not None:
+                normalized["scale"] = round(float(event["scale"]), 3)
+            if event.get("font_size") is not None:
+                normalized["font_size"] = round(float(event["font_size"]), 1)
+            if event.get("font_weight") is not None:
+                normalized["font_weight"] = str(event["font_weight"])[:20]
+            if event.get("font_style") is not None:
+                normalized["font_style"] = str(event["font_style"])[:20]
+            if event.get("text_decoration") is not None:
+                normalized["text_decoration"] = str(event["text_decoration"])[:20]
+            if event.get("text_case") is not None:
+                normalized["text_case"] = str(event["text_case"])[:20]
+            if event.get("color") is not None:
+                normalized["color"] = str(event["color"])[:30]
+            if event.get("letter_spacing") is not None:
+                normalized["letter_spacing"] = round(float(event["letter_spacing"]), 2)
+            if event.get("line_height") is not None:
+                normalized["line_height"] = round(float(event["line_height"]), 2)
+            if event.get("text_align") is not None:
+                normalized["text_align"] = str(event["text_align"])[:20]
+            if event.get("opacity") is not None:
+                normalized["opacity"] = round(float(event["opacity"]), 2)
+            if event.get("stroke_enabled") is not None:
+                normalized["stroke_enabled"] = bool(event["stroke_enabled"])
+            if event.get("stroke_color") is not None:
+                normalized["stroke_color"] = str(event["stroke_color"])[:30]
+            if event.get("stroke_width") is not None:
+                normalized["stroke_width"] = round(float(event["stroke_width"]), 1)
+            if event.get("background_enabled") is not None:
+                normalized["background_enabled"] = bool(event["background_enabled"])
+            if event.get("background_color") is not None:
+                normalized["background_color"] = str(event["background_color"])[:30]
+            if event.get("background_opacity") is not None:
+                normalized["background_opacity"] = round(float(event["background_opacity"]), 2)
+            if event.get("background_radius") is not None:
+                normalized["background_radius"] = round(float(event["background_radius"]), 1)
+            if event.get("shadow_enabled") is not None:
+                normalized["shadow_enabled"] = bool(event["shadow_enabled"])
+            if event.get("shadow_color") is not None:
+                normalized["shadow_color"] = str(event["shadow_color"])[:30]
+            if event.get("shadow_blur") is not None:
+                normalized["shadow_blur"] = round(float(event["shadow_blur"]), 1)
             valid.append(normalized)
         except (TypeError, ValueError) as exc:
             logger.info("effect_timeline_event_skipped", skipped_event=event, error=str(exc))

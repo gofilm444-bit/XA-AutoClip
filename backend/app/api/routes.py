@@ -34,6 +34,8 @@ from app.schemas.api import (
     CandidateRead,
     CandidateSelectionRead,
     CandidateTitlePatch,
+    EditorAutoCaptionRequest,
+    EditorAutoCaptionResponse,
     EditorMediaAssetRead,
     HookTextRead,
     JobRead,
@@ -54,6 +56,7 @@ from app.schemas.api import (
     TransformationRead,
 )
 from app.services.captions import generate_social_caption
+from app.services.editor_captions import generate_editor_auto_captions
 from app.services.clipper_style import (
     default_clipper_style,
     generate_hook_text_for_clip,
@@ -1926,6 +1929,25 @@ def regenerate_caption(transformation_id: uuid.UUID, db: Session = Depends(get_d
     )
     db.commit()
     return plan
+
+
+@router.post(
+    "/transformations/{transformation_id}/auto-captions",
+    response_model=EditorAutoCaptionResponse,
+)
+def generate_auto_captions(
+    transformation_id: uuid.UUID,
+    payload: EditorAutoCaptionRequest,
+    db: Session = Depends(get_db),
+):
+    return generate_editor_auto_captions(
+        db=db,
+        transformation_id=transformation_id,
+        language=payload.language,
+        delete_current_captions=payload.delete_current_captions,
+        identify_filler_words=payload.identify_filler_words,
+        bilingual=payload.bilingual,
+    )
 
 
 @router.patch(

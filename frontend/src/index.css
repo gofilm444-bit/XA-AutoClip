@@ -103,4 +103,26 @@
   .editor-theme-light .editor-timeline [class*="bg-[#22252a]"] { background-color: #ffffff; }
   .editor-theme-light .timeline-playhead-line { background-color: #0f172a; }
   .editor-theme-light .timeline-resize-handle > span:first-child { background-color: #94a3b8; }
+
+  .wysiwyg-text-editor {
+    outline: none !important;
+    border: none !important;
+    box-shadow: none !important;
+    background: transparent !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    -webkit-user-select: text !important;
+    user-select: text !important;
+    cursor: text !important;
+    white-space: pre-wrap !important;
+    word-break: break-word !important;
+    overflow-wrap: break-word !important;
+  }
+  .wysiwyg-text-editor:empty:before {
+    content: attr(data-placeholder);
+    opacity: 0.45;
+    pointer-events: none;
+    display: inline-block;
+  }
 }
+

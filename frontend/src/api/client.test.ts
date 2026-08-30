@@ -96,4 +96,41 @@ describe("api error handling", () => {
     }
     vi.unstubAllGlobals();
   });
+
+  it("generateEditorAutoCaptions posts payload and returns result", async () => {
+    const mockResult = {
+      success: true,
+      message: "Berhasil membuat caption",
+      language: "id",
+      cues_count: 2,
+      cues: [
+        { id: "c1", start: 0, end: 2, text: "Halo" },
+        { id: "c2", start: 2, end: 4, text: "Dunia" },
+      ],
+      reused_transcript: true,
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        expect(url).toContain("/api/transformations/t-123/auto-captions");
+        expect(init?.method).toBe("POST");
+        const body = JSON.parse(String(init?.body));
+        expect(body.language).toBe("id");
+        expect(body.delete_current_captions).toBe(true);
+        return jsonResponse(200, mockResult);
+      }),
+    );
+    const { generateEditorAutoCaptions } = await import("../api/client");
+    const result = await generateEditorAutoCaptions("t-123", {
+      language: "id",
+      delete_current_captions: true,
+      identify_filler_words: false,
+      bilingual: "none",
+    });
+    expect(result.success).toBe(true);
+    expect(result.cues_count).toBe(2);
+    expect(result.cues[0].text).toBe("Halo");
+    vi.unstubAllGlobals();
+  });
 });
+

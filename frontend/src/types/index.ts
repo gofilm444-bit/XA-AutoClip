@@ -131,18 +131,49 @@ export type ClipperStyleConfig = {
   keyword_popup_enabled: boolean;
   style_intensity: "low" | "medium" | "high";
   effect_timeline?: Array<{
+    id?: string;
     type: string;
     start: number;
     end: number;
     zoom?: number;
     text?: string;
     reason?: string;
+    locked?: boolean;
+    visible?: boolean;
+    position?: string;
+    size?: string;
+    preset?: string;
+    font_family?: string;
+    position_x_percent?: number;
+    position_y_percent?: number;
+    scale?: number;
+    font_size?: number;
+    font_weight?: string | number;
+    font_style?: "normal" | "italic";
+    text_decoration?: "none" | "underline";
+    text_case?: "normal" | "uppercase" | "lowercase" | "titlecase";
+    color?: string;
+    letter_spacing?: number;
+    line_height?: number;
+    text_align?: "left" | "center" | "right";
+    opacity?: number;
+    stroke_enabled?: boolean;
+    stroke_color?: string;
+    stroke_width?: number;
+    background_enabled?: boolean;
+    background_color?: string;
+    background_opacity?: number;
+    background_radius?: number;
+    shadow_enabled?: boolean;
+    shadow_color?: string;
+    shadow_blur?: number;
   }>;
   audio_settings?: {
     volume: number;
     muted: boolean;
     fade_in: number;
     fade_out: number;
+    speed?: number;
   };
   media_trim?: {
     start: number;
@@ -153,33 +184,76 @@ export type ClipperStyleConfig = {
     id: string;
     source_start: number;
     source_end: number;
+    locked?: boolean;
+    visible?: boolean;
+    muted?: boolean;
   }>;
   video_sequence?: Array<{
     id: string;
     source_start: number;
     source_end: number;
+    locked?: boolean;
+    visible?: boolean;
   }>;
   audio_sequence?: Array<{
     id: string;
     source_start: number;
     source_end: number;
+    locked?: boolean;
+    muted?: boolean;
   }>;
   audio_extracted?: boolean;
   video_track_deleted?: boolean;
   audio_track_deleted?: boolean;
   video_framing?: {
+    preset?: "blurred_background" | "center_crop" | "fit_background" | "picture_in_picture" | "clean_podcast" | "studio_podcast" | "talking_head" | string;
     x: number;
     y: number;
     scale: number;
+    mode?: "cover" | "contain" | "custom";
+    rotation?: number;
+    flip_h?: boolean;
+    flip_v?: boolean;
+    opacity?: number;
+    blur_background?: boolean;
+    blur_strength?: number;
+    background_color?: string;
   };
+  crop_aspect_ratio?: "9:16" | "1:1" | "16:9" | "4:5";
+  video_adjustments?: {
+    brightness: number;
+    contrast: number;
+    saturation: number;
+    sharpness: number;
+    temperature: number;
+    vignette: number;
+    blur?: number;
+  };
+  video_speed?: number;
   editor_state_version?: number;
   video_sequence_initialized?: boolean;
   audio_sequence_initialized?: boolean;
   caption_timeline_initialized?: boolean;
   caption_sync_required?: boolean;
   effect_timeline_initialized?: boolean;
-  layer_order?: Array<"caption" | "hook" | "keyword" | "video">;
-  track_order?: Array<"caption" | "hook" | "keyword" | "punch" | "pattern" | "video" | "audio">;
+  layer_order?: Array<"caption" | "hook" | "keyword" | "punch" | "pattern" | "video" | "audio">;
+  visual_layer_order?: Array<"caption" | "hook" | "keyword" | "video">;
+  track_order?: Array<"text" | "overlay" | "video" | "audio" | string>;
+  track_locks?: {
+    text?: boolean;
+    overlay?: boolean;
+    video?: boolean;
+    audio?: boolean;
+  };
+  track_visibility?: {
+    text?: boolean;
+    overlay?: boolean;
+    video?: boolean;
+  };
+  video_muted?: boolean;
+  video_visible?: boolean;
+  video_locked?: boolean;
+  audio_locked?: boolean;
   editor_preferences?: {
     timeline_height?: number;
     timeline_zoom?: number;
@@ -200,6 +274,12 @@ export type ClipperStyleConfig = {
     start: number;
     end: number;
     volume: number;
+    speed?: number;
+    fade_in?: number;
+    fade_out?: number;
+    muted?: boolean;
+    locked?: boolean;
+    loop?: boolean;
   }>;
   audio_tracks?: Array<{
     id: string;
@@ -209,13 +289,26 @@ export type ClipperStyleConfig = {
     start: number;
     end: number;
     volume: number;
+    speed?: number;
+    fade_in?: number;
+    fade_out?: number;
+    muted?: boolean;
+    locked?: boolean;
+    loop?: boolean;
   }>;
   caption_timeline?: Array<{
     id: string;
     start: number;
     end: number;
     text: string;
+    locked?: boolean;
+    visible?: boolean;
+    type?: "main_caption" | string;
+    style_id?: string | null;
+    style_override?: Record<string, unknown> | null;
   }>;
+  main_caption_style?: Record<string, unknown>;
+  caption_apply_to_all?: boolean;
   editor_image_assets?: Array<{
     id: string;
     name: string;

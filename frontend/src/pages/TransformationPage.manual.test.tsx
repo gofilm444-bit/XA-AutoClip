@@ -43,12 +43,12 @@ describe("manual editor UX", () => {
     const onImport = vi.fn();
     render(<EditorMediaImportControls onImport={onImport} />);
 
-    expect(screen.getByText("+ Import Video")).toBeInTheDocument();
-    expect(screen.getByText("+ Import Audio")).toBeInTheDocument();
-    expect(screen.getByText("+ Import Gambar")).toBeInTheDocument();
+    expect(screen.getByLabelText("Import Video")).toBeInTheDocument();
+    expect(screen.getByLabelText("Import Audio")).toBeInTheDocument();
+    expect(screen.getByLabelText("Import Gambar")).toBeInTheDocument();
 
     const file = new File(["video"], "manual.mp4", { type: "video/mp4" });
-    fireEvent.change(screen.getByLabelText("+ Import Video"), {
+    fireEvent.change(screen.getByLabelText("Import Video"), {
       target: { files: [file] },
     });
 

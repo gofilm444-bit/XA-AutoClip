@@ -82,12 +82,13 @@ def test_keyword_overlay_text_skips_non_meaningful_mojibake():
 
 def test_audio_settings_are_clamped_and_safe():
     assert normalize_audio_settings(
-        {"volume": 9, "muted": True, "fade_in": -2, "fade_out": 12}
+        {"volume": 9, "muted": True, "fade_in": -2, "fade_out": 12, "speed": 5.0}
     ) == {
         "volume": 2.0,
         "muted": True,
         "fade_in": 0.0,
-        "fade_out": 5.0,
+        "fade_out": 10.0,
+        "speed": 2.0,
     }
 
 

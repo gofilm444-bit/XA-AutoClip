@@ -290,3 +290,27 @@ class RenderRead(BaseModel):
     error_message: str | None
     warning_message: str | None = None
     output_url: str | None = None
+
+
+class EditorAutoCaptionRequest(BaseModel):
+    language: Literal["id", "en", "auto"] = "id"
+    delete_current_captions: bool = True
+    identify_filler_words: bool = False
+    bilingual: str = "none"
+
+
+class CaptionCueRead(BaseModel):
+    id: str
+    start: float
+    end: float
+    text: str
+
+
+class EditorAutoCaptionResponse(BaseModel):
+    success: bool
+    message: str
+    language: str
+    cues_count: int
+    cues: list[CaptionCueRead]
+    reused_transcript: bool
+

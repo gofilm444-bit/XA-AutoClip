@@ -30,53 +30,61 @@ export function Layout() {
       <div className={editorMode ? "editor-shell min-h-screen bg-[#101214] text-zinc-100" : "min-h-screen bg-[#f7f8fc] text-slate-900"}>
         <header className={`editor-topbar sticky top-0 z-50 border-b backdrop-blur ${
           editorMode
-            ? "border-zinc-800 bg-[#17191c]/95 shadow-lg shadow-black/20"
+            ? "border-zinc-800 bg-[#17191c]/95 shadow-sm"
             : "border-slate-200 bg-white/95 shadow-sm"
         }`}>
-          <div className="flex h-16 items-center gap-3 px-4 sm:px-7">
+          <div className={`flex items-center gap-2 sm:gap-3 ${
+            editorMode ? "h-11 px-3 sm:px-4" : "h-16 px-4 sm:px-7"
+          }`}>
             <Link
               to="/"
-              className={`flex shrink-0 items-center gap-2 font-bold ${
-                editorMode ? "text-zinc-300 hover:text-cyan-300" : "text-slate-700 hover:text-violet-700"
+              className={`flex shrink-0 items-center gap-1.5 font-bold ${
+                editorMode ? "text-xs text-zinc-300 hover:text-cyan-300" : "text-sm text-slate-700 hover:text-violet-700"
               }`}
             >
-              <span className="text-2xl leading-none">{"<"}</span>
-              <span className="hidden sm:inline">Kembali ke beranda</span>
+              <span className={editorMode ? "text-lg leading-none" : "text-2xl leading-none"}>{"<"}</span>
+              <span className="hidden sm:inline">Kembali</span>
             </Link>
             {editorToolbar && (
               <div className="min-w-0 flex-1 text-center sm:text-left">
                 <div className="flex min-w-0 items-center justify-center gap-2 sm:justify-start">
-                  <p className={`min-w-0 truncate text-sm font-black sm:text-base ${editorMode ? "text-zinc-100" : "text-slate-950"}`}>
+                  <p className={`min-w-0 truncate font-black ${
+                    editorMode ? "text-xs sm:text-sm text-zinc-100" : "text-sm sm:text-base text-slate-950"
+                  }`}>
                     {editorToolbar.title}
                   </p>
                   {editorToolbar.badge}
                 </div>
                 {editorToolbar.meta && (
-                  <p className={`mt-0.5 truncate text-[11px] font-semibold sm:text-xs ${editorMode ? "text-zinc-500" : "text-slate-500"}`}>
+                  <p className={`truncate font-semibold ${
+                    editorMode ? "text-[10px] text-zinc-500" : "mt-0.5 text-[11px] sm:text-xs text-slate-500"
+                  }`}>
                     {editorToolbar.meta}
                   </p>
                 )}
               </div>
             )}
-            <div className="ml-auto flex shrink-0 items-center gap-3">
+            <div className="ml-auto flex shrink-0 items-center gap-2 sm:gap-3">
               {editorToolbar?.actions && (
-                <div className="hidden items-center gap-2 lg:flex">{editorToolbar.actions}</div>
+                <div className="hidden items-center gap-1.5 lg:flex">{editorToolbar.actions}</div>
               )}
               {editorToolbar?.compactActions && (
                 <details className="relative lg:hidden">
-                  <summary className="btn-secondary list-none px-3 py-2 text-sm">Aksi</summary>
-                  <div className="absolute right-0 top-11 z-50 w-56 space-y-2 rounded-xl border border-slate-200 bg-white p-3 shadow-xl">
+                  <summary className="btn-secondary list-none px-2.5 py-1 text-xs">Aksi</summary>
+                  <div className="absolute right-0 top-10 z-50 w-52 space-y-1.5 rounded-xl border border-zinc-700 bg-zinc-900 p-2.5 shadow-xl">
                     {editorToolbar.compactActions}
                   </div>
                 </details>
               )}
-              <Link to="/" className="hidden text-lg font-black tracking-tight sm:block">
+              <Link to="/" className={`hidden font-black tracking-tight sm:block ${
+                editorMode ? "text-sm" : "text-lg"
+              }`}>
                 <span className={editorMode ? "text-cyan-400" : "text-violet-600"}>XA</span> AutoClip
               </Link>
             </div>
           </div>
         </header>
-        <main className={editorMode ? "editor-main w-full p-2" : "mx-auto max-w-[1540px] px-4 py-7 sm:px-7 lg:px-10"}>
+        <main className={editorMode ? "editor-main w-full p-1 sm:p-1.5" : "mx-auto max-w-[1540px] px-4 py-7 sm:px-7 lg:px-10"}>
           <Outlet context={outletContext} />
         </main>
       </div>

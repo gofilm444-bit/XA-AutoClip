@@ -8,11 +8,21 @@ import {
   type SyntheticEvent,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
-import { Link, useNavigate, useOutletContext, useParams } from "react-router-dom";
-import { api, candidateVideoUrl, downloadUrl, mediaUrl, upload, uploadedAudioUrl, uploadMedia } from "../api/client";
+import { Link, useOutletContext, useParams } from "react-router-dom";
+import {
+  api,
+  candidateVideoUrl,
+  downloadUrl,
+  generateEditorAutoCaptions,
+  mediaUrl,
+  upload,
+  uploadedAudioUrl,
+  uploadMedia,
+} from "../api/client";
 import type { LayoutOutletContext } from "../components/Layout";
 import type {
   EditorMediaAsset,
@@ -35,10 +45,20 @@ import {
   TEXT_STYLE_PRESETS,
   getTextStylePreset,
   normalizeTextStylePreset,
-  resolveHookTextStylePreset,
   resolveTextOverlayStyle,
   type TextStylePresetKey,
 } from "../utils/textStylePresets";
+import {
+  CAPTION_TEMPLATES,
+  DEFAULT_MAIN_CAPTION_STYLE,
+  formatCaptionCase,
+  normalizeMainCaptionStyle,
+  resolveCaptionStyle,
+  type CaptionCueItem,
+  type CaptionTemplateCategory,
+  type MainCaptionStyle,
+} from "../utils/captionTemplates";
+import { packTimelineItemsIntoLanes } from "../utils/timelinePacking";
 
 type Render = {
   id: string;
@@ -59,41 +79,489 @@ type Render = {
 
 type EffectTimelineEvent = {
   id?: string;
-  type: "punch_zoom" | "keyword_popup" | string;
+  type: "punch_zoom" | "keyword_popup" | "pattern_interrupt" | "hook_text" | string;
   start: number;
   end: number;
+  locked?: boolean;
+  visible?: boolean;
   zoom?: number;
   text?: string;
   title?: string;
   content?: string;
   effect?: string;
   reason?: string;
+  position?: string;
+  size?: string;
+  preset?: TextStylePresetKey | string;
+  font_family?: string;
+  position_x_percent?: number;
+  position_y_percent?: number;
+  scale?: number;
+  font_size?: number;
+  font_weight?: string | number;
+  font_style?: "normal" | "italic";
+  text_decoration?: "none" | "underline";
+  text_case?: "normal" | "uppercase" | "lowercase" | "titlecase";
+  color?: string;
+  letter_spacing?: number;
+  line_height?: number;
+  text_align?: "left" | "center" | "right";
+  opacity?: number;
+  stroke_enabled?: boolean;
+  stroke_color?: string;
+  stroke_width?: number;
+  background_enabled?: boolean;
+  background_color?: string;
+  background_opacity?: number;
+  background_radius?: number;
+  shadow_enabled?: boolean;
+  shadow_color?: string;
+  shadow_blur?: number;
 };
 
-type EditorContext = "media" | "video" | "audio" | "caption" | "hook" | "keyword" | "effect" | "timeline" | "render";
-export type EditorNavTab = "autoclip" | "media" | "audio" | "text" | "caption" | "effect" | "templates";
+type EditorContext = "details" | "media" | "video" | "audio" | "caption" | "hook" | "keyword" | "effect" | "timeline" | "render";
+export type EditorNavTab =
+  | "autoclip"
+  | "media"
+  | "audio"
+  | "text"
+  | "stickers"
+  | "effects"
+  | "effect"
+  | "transitions"
+  | "caption"
+  | "templates";
 type EditorMediaKind = "video" | "audio" | "image";
+
+const defaultMusicTracks = [
+  { id: "mus-1", name: "Clean Corporate", duration: 60, desc: "Instrumen ceria dan modern untuk konten bisnis/edukasi" },
+  { id: "mus-2", name: "Soft Podcast Bed", duration: 90, desc: "Latar nada santai dan hangat untuk podcast obrolan" },
+  { id: "mus-3", name: "Upbeat Short", duration: 30, desc: "Ketukan dinamis untuk video pendek TikTok / Reels" },
+  { id: "mus-4", name: "Dramatic News", duration: 45, desc: "Ketegangan ritmik untuk cuplikan berita penting" },
+  { id: "mus-5", name: "Calm Ambient", duration: 120, desc: "Suasana tenang untuk konten vlog atau relaksasi" },
+];
+
+const textTemplates: Array<{
+  id: string;
+  label: string;
+  preset: TextStylePresetKey;
+  sample: string;
+  category: string;
+  tag?: string;
+}> = [
+  { id: "tpl-hook", label: "Viral Hook", preset: "yellow_viral", sample: "WAJIB TAHU INI!", category: "Trending", tag: "Viral" },
+  { id: "tpl-clean", label: "Clean Title", preset: "clean_white", sample: "Judul Modern", category: "Trending", tag: "Clean" },
+  { id: "tpl-thanks", label: "Thanks for Watching", preset: "clean_subtitle_pro", sample: "Thanks for Watching!", category: "Outro", tag: "Outro" },
+  { id: "tpl-qcomment", label: "Question Comment", preset: "clean_creator", sample: "Gimana menurut kalian?", category: "Social", tag: "Social" },
+  { id: "tpl-ri", label: "Republik Indonesia", preset: "authority_blue", sample: "REPUBLIK INDONESIA", category: "Trending", tag: "Title" },
+  { id: "tpl-news", label: "Breaking News", preset: "breaking_news", sample: "BREAKING NEWS", category: "Trending", tag: "News" },
+  { id: "tpl-podcast", label: "Podcast Quote", preset: "podcast_quote", sample: "“Kutipan Penting”", category: "Podcast", tag: "Quote" },
+  { id: "tpl-subtitle-box", label: "Subtitle Box", preset: "black_white", sample: "HIGHLIGHT BOX", category: "Box", tag: "Box" },
+  { id: "tpl-bold", label: "Big Bold Caption", preset: "white_bold_shadow", sample: "POIN UTAMA", category: "Bold", tag: "Bold" },
+  { id: "tpl-pop", label: "Pop Keyword", preset: "purple_pop", sample: "Pop Highlight", category: "Pop", tag: "Pop" },
+  { id: "tpl-lowerthird", label: "Lower Third", preset: "authority_blue", sample: "Nama & Jabatan", category: "Lower Third", tag: "Lower Third" },
+];
+
+const textEffectsList = [
+  { id: "fx-glow", label: "Glow Cyan", preset: "neon_cyan" as TextStylePresetKey, icon: "💡", sample: "Glow Effect", desc: "Cyan glow menyala terang" },
+  { id: "fx-shadow", label: "Deep Shadow", preset: "white_bold_shadow" as TextStylePresetKey, icon: "🌑", sample: "Shadow Effect", desc: "Drop shadow pekat kontras" },
+  { id: "fx-stroke", label: "Bold Stroke", preset: "bold_stroke_impact" as TextStylePresetKey, icon: "🔲", sample: "Stroke Effect", desc: "Garis luar tebal berani" },
+  { id: "fx-pop", label: "Yellow Pop", preset: "yellow_viral" as TextStylePresetKey, icon: "💥", sample: "Pop Effect", desc: "Kuning cerah popup viral" },
+  { id: "fx-neon", label: "Neon Glow", preset: "neon_cyan" as TextStylePresetKey, icon: "⚡", sample: "Neon Effect", desc: "Efek lampu neon futuristik" },
+  { id: "fx-bounce", label: "Bounce Accent", preset: "purple_pop" as TextStylePresetKey, icon: "🏀", sample: "Bounce Effect", desc: "Animasi punch aksen dinamis" },
+  { id: "fx-typewriter", label: "Typewriter", preset: "clean_white" as TextStylePresetKey, icon: "⌨️", sample: "Type Effect", desc: "Efek ketikan teks klasik" },
+];
+
+const stickerDirectories = [
+  { id: "trending", label: "Trending", icon: "🔥" },
+  { id: "emoji", label: "Emoji", icon: "😀" },
+  { id: "badges", label: "Badges", icon: "🏷️" },
+  { id: "arrows", label: "Arrows", icon: "➡️" },
+  { id: "shapes", label: "Shapes", icon: "⭕" },
+  { id: "social", label: "Social", icon: "💬" },
+  { id: "callouts", label: "Callouts", icon: "🗨️" },
+  { id: "yours", label: "Yours", icon: "📁" },
+] as const;
+
+const stickerItems: Array<{
+  id: string;
+  icon: string;
+  label: string;
+  category: string;
+  badge?: boolean;
+}> = [
+  // Arrows
+  { id: "stk-arrow-down", icon: "⬇️", label: "Panah Bawah", category: "arrows" },
+  { id: "stk-arrow-up", icon: "⬆️", label: "Panah Atas", category: "arrows" },
+  { id: "stk-arrow-right", icon: "➡️", label: "Panah Kanan", category: "arrows" },
+  { id: "stk-arrow-left", icon: "⬅️", label: "Panah Kiri", category: "arrows" },
+  { id: "stk-target", icon: "🎯", label: "Target Pin", category: "arrows" },
+  { id: "stk-pin", icon: "📌", label: "Pin Lokasi", category: "arrows" },
+  // Shapes
+  { id: "stk-circle-red", icon: "⭕", label: "Lingkaran Merah", category: "shapes" },
+  { id: "stk-circle-fill", icon: "🔴", label: "Titik Rekam", category: "shapes" },
+  { id: "stk-square", icon: "🔲", label: "Kotak Sorotan", category: "shapes" },
+  { id: "stk-star", icon: "⭐", label: "Bintang Emas", category: "shapes" },
+  { id: "stk-sparkles", icon: "✨", label: "Kilau Sparkles", category: "shapes" },
+  { id: "stk-check", icon: "✅", label: "Checklist", category: "shapes" },
+  { id: "stk-cross", icon: "❌", label: "Silang Merah", category: "shapes" },
+  // Trending & Emoji
+  { id: "stk-fire", icon: "🔥", label: "Api Viral", category: "trending" },
+  { id: "stk-bulb", icon: "💡", label: "Ide Baru", category: "trending" },
+  { id: "stk-shock", icon: "😱", label: "Kaget", category: "emoji" },
+  { id: "stk-mindblown", icon: "🤯", label: "Mindblown", category: "emoji" },
+  { id: "stk-laugh", icon: "😂", label: "Ketawa", category: "emoji" },
+  { id: "stk-clap", icon: "👏", label: "Tepuk Tangan", category: "emoji" },
+  { id: "stk-100", icon: "💯", label: "Seratus", category: "trending" },
+  { id: "stk-rocket", icon: "🚀", label: "Roket", category: "trending" },
+  // Badges / Labels
+  { id: "stk-lbl-hot", icon: "🔥 HOT", label: "Label HOT", category: "badges", badge: true },
+  { id: "stk-lbl-new", icon: "✨ NEW", label: "Label NEW", category: "badges", badge: true },
+  { id: "stk-lbl-viral", icon: "⚡ VIRAL", label: "Label VIRAL", category: "badges", badge: true },
+  { id: "stk-lbl-top", icon: "👑 TOP", label: "Label TOP", category: "badges", badge: true },
+  { id: "stk-lbl-pro", icon: "💎 PRO", label: "Label PRO", category: "badges", badge: true },
+  // Callouts
+  { id: "stk-bubble", icon: "💬", label: "Bubble Chat", category: "callouts" },
+  { id: "stk-quote", icon: "🗨️", label: "Balon Obrolan", category: "callouts" },
+  { id: "stk-alert", icon: "⚠️", label: "Peringatan", category: "callouts" },
+  { id: "stk-exclaim", icon: "❗", label: "Tanda Seru", category: "callouts" },
+  { id: "stk-bell", icon: "🔔", label: "Lonceng Sub", category: "callouts" },
+  { id: "stk-horn", icon: "📢", label: "Pengeras Suara", category: "callouts" },
+  // Social
+  { id: "stk-like", icon: "👍", label: "Jempol Like", category: "social" },
+  { id: "stk-heart", icon: "❤️", label: "Hati Cinta", category: "social" },
+  { id: "stk-phone", icon: "📱", label: "Smartphone", category: "social" },
+  { id: "stk-cam", icon: "📸", label: "Kamera", category: "social" },
+  { id: "stk-music", icon: "🎵", label: "Musik Nada", category: "social" },
+];
+
+const transitionDirectories = [
+  { id: "trending", label: "Trending", icon: "🔥" },
+  { id: "basic", label: "Basic", icon: "✂️" },
+  { id: "slide", label: "Slide", icon: "↔️" },
+  { id: "zoom", label: "Zoom", icon: "🔍" },
+  { id: "blur", label: "Blur", icon: "🌫️" },
+  { id: "glitch", label: "Glitch", icon: "⚡" },
+  { id: "classic", label: "Classic", icon: "🎞️" },
+] as const;
+
+const transitionItems = [
+  { id: "tr-cut", name: "Cut", category: "basic", icon: "✂️", desc: "Potongan instan antar klip video" },
+  { id: "tr-fade", name: "Fade Black", category: "basic", icon: "⬛", desc: "Transisi memudar halus ke hitam" },
+  { id: "tr-fade-white", name: "Fade White", category: "basic", icon: "⬜", desc: "Transisi memudar terang ke putih" },
+  { id: "tr-cross", name: "Cross Dissolve", category: "basic", icon: "🔀", desc: "Peleburan halus dua frame berdampingan" },
+  { id: "tr-flash", name: "White Flash", category: "trending", icon: "⚡", desc: "Kilatan cahaya putih dramatis" },
+  { id: "tr-slide-l", name: "Slide Left", category: "slide", icon: "⬅️", desc: "Geser masuk dari kanan ke kiri" },
+  { id: "tr-slide-r", name: "Slide Right", category: "slide", icon: "➡️", desc: "Geser masuk dari kiri ke kanan" },
+  { id: "tr-slide-u", name: "Slide Up", category: "slide", icon: "⬆️", desc: "Geser masuk dari bawah ke atas" },
+  { id: "tr-slide-d", name: "Slide Down", category: "slide", icon: "⬇️", desc: "Geser masuk dari atas ke bawah" },
+  { id: "tr-zoom-in", name: "Zoom In", category: "zoom", icon: "🔍", desc: "Mendekat cepat ke frame berikutnya" },
+  { id: "tr-zoom-out", name: "Zoom Out", category: "zoom", icon: "🔎", desc: "Menjauh dinamis dari frame sebelumnya" },
+  { id: "tr-blur-fade", name: "Blur Fade", category: "blur", icon: "🌫️", desc: "Transisi kabur fokus modern halus" },
+  { id: "tr-glitch", name: "Glitch Cut", category: "glitch", icon: "📺", desc: "Distorsi sinyal digital chromatic glitch" },
+  { id: "tr-wipe-l", name: "Wipe Left", category: "classic", icon: "🎞️", desc: "Sapuan linear klasik dari sisi kanan" },
+];
+
+const sfxList = [
+  { id: "sfx-whoosh", label: "Whoosh", category: "Whoosh", icon: "💨", desc: "Suara desiran transisi cepat", sound: "whoosh" as const },
+  { id: "sfx-pop", label: "Pop", category: "Pop", icon: "🎈", desc: "Suara pop munculan elemen", sound: "pop" as const },
+  { id: "sfx-click", label: "Click", category: "Click", icon: "🖱️", desc: "Suara klik tombol modern", sound: "click" as const },
+  { id: "sfx-hit", label: "Hit Impact", category: "Hit", icon: "🥊", desc: "Suara benturan punchy", sound: "hit" as const },
+  { id: "sfx-notif", label: "Notification", category: "Notification", icon: "🔔", desc: "Suara notifikasi bel aplikasi", sound: "notification" as const },
+  { id: "sfx-camera", label: "Camera Shutter", category: "Camera", icon: "📸", desc: "Suara jepretan kamera potret", sound: "shutter" as const },
+];
+
+const visualEffectsList = [
+  { id: "ef-punch", type: "punch_zoom" as const, label: "Punch Zoom", icon: "🔍", desc: "Zoom fokus penegas kata kunci", category: "zoom", effectName: "punch_zoom" },
+  { id: "ef-quick-zoom", type: "pattern_interrupt" as const, label: "Quick Zoom", icon: "🔎", desc: "Zoom instan dramatis penegas momen", category: "zoom", effectName: "quick_zoom" },
+  { id: "ef-flash", type: "pattern_interrupt" as const, label: "Flash Cut", icon: "✨", desc: "Kilatan cahaya putih memotong momen", category: "light", effectName: "flash_cut" },
+  { id: "ef-light-leak", type: "pattern_interrupt" as const, label: "Light Leak", icon: "💡", desc: "Sinar hangat anamorphic flare", category: "light", effectName: "light_leak" },
+  { id: "ef-shake", type: "pattern_interrupt" as const, label: "Quick Shake", icon: "📳", desc: "Goncangan halus dinamis kamera", category: "shake", effectName: "quick_shake" },
+  { id: "ef-earthquake", type: "pattern_interrupt" as const, label: "Earthquake", icon: "🌋", desc: "Getaran kuat multi-axis dramatis", category: "shake", effectName: "earthquake" },
+  { id: "ef-blur-pulse", type: "pattern_interrupt" as const, label: "Blur Pulse", icon: "🌫️", desc: "Denyut fokus lembut visual", category: "blur", effectName: "blur_pulse" },
+  { id: "ef-glitch-pop", type: "pattern_interrupt" as const, label: "Glitch Pop", icon: "📺", desc: "Distorsi sinyal digital singkat", category: "glitch", effectName: "glitch_pop" },
+  { id: "ef-digital-noise", type: "pattern_interrupt" as const, label: "Digital Noise", icon: "📡", desc: "Noise scanline digital artistik", category: "glitch", effectName: "digital_noise" },
+  { id: "ef-freeze-flash", type: "pattern_interrupt" as const, label: "Freeze Flash", icon: "❄️", desc: "Jeda sesaat dramatis sebelum transisi", category: "trending", effectName: "freeze_flash" },
+];
+
+const mediaDirectories = [
+  { id: "import", label: "Import", icon: "📥" },
+  { id: "project_media", label: "Project Media", icon: "📁" },
+  { id: "video", label: "Video", icon: "🎬" },
+  { id: "audio", label: "Audio", icon: "🎵" },
+  { id: "images", label: "Images", icon: "🖼️" },
+] as const;
+
+const audioDirectories = [
+  { id: "music", label: "Music", icon: "🎵" },
+  { id: "sfx", label: "Sound effects", icon: "🔊" },
+  { id: "yours", label: "Yours", icon: "📁" },
+  { id: "import", label: "Import", icon: "📥" },
+  { id: "copyright", label: "Copyright", icon: "🛡️" },
+] as const;
+
+const textDirectories = [
+  { id: "add_text", label: "Add text", icon: "➕" },
+  { id: "yours", label: "Yours", icon: "👤" },
+  { id: "text_effects", label: "Text effects", icon: "✨" },
+  { id: "text_template", label: "Text template", icon: "📋" },
+  { id: "auto_captions", label: "Auto captions", icon: "💬" },
+  { id: "local_captions", label: "Local captions", icon: "📄" },
+] as const;
+
+const effectDirectories = [
+  { id: "video_effects", label: "All Effects", icon: "✨" },
+  { id: "trending", label: "Trending", icon: "🔥" },
+  { id: "zoom", label: "Zoom", icon: "🔍" },
+  { id: "shake", label: "Shake", icon: "📳" },
+  { id: "glitch", label: "Glitch", icon: "⚡" },
+  { id: "blur", label: "Blur", icon: "🌫️" },
+  { id: "light", label: "Light", icon: "💡" },
+] as const;
+
+const captionDirectories = [
+  { id: "auto_captions", label: "Auto captions", icon: "🤖" },
+  { id: "templates", label: "Templates", icon: "🎨" },
+  { id: "auto_lyrics", label: "Auto lyrics", icon: "🎵" },
+  { id: "add_captions", label: "Add captions", icon: "➕" },
+  { id: "local_captions", label: "Local captions", icon: "📄" },
+] as const;
+
+function LeftPanelDirectoryLayout<T extends string>({
+  directories,
+  activeDirectory,
+  onSelectDirectory,
+  children,
+}: {
+  directories: readonly { readonly id: T; readonly label: string; readonly icon?: string; readonly badge?: string }[];
+  activeDirectory: T;
+  onSelectDirectory: (id: T) => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="flex flex-1 min-h-0 w-full h-full">
+      {/* 1. Sub-Directory Sidebar */}
+      <div className="w-28 shrink-0 border-r border-zinc-800/80 bg-[#131518] p-1.5 flex flex-col gap-0.5 overflow-y-auto no-scrollbar">
+        {directories.map((dir) => {
+          const isActive = activeDirectory === dir.id;
+          return (
+            <button
+              key={dir.id}
+              type="button"
+              onClick={() => onSelectDirectory(dir.id)}
+              className={`flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-left text-[11px] font-bold transition ${
+                isActive
+                  ? "bg-[#23272e] text-cyan-400 border border-cyan-500/30 shadow-sm"
+                  : "text-zinc-400 hover:bg-zinc-800/60 hover:text-zinc-200"
+              }`}
+            >
+              {dir.icon && <span className="text-xs shrink-0">{dir.icon}</span>}
+              <span className="truncate flex-1">{dir.label}</span>
+              {dir.badge && (
+                <span className="rounded bg-cyan-400/20 px-1 py-0.2 text-[8px] font-black text-cyan-300">
+                  {dir.badge}
+                </span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* 2. Content / Library Area */}
+      <div className="flex-1 min-w-0 p-3 space-y-3 overflow-y-auto custom-scrollbar bg-[#17191c]">
+        {children}
+      </div>
+    </div>
+  );
+}
+
+let sharedAudioCtx: AudioContext | null = null;
+function getAudioContext(): AudioContext | null {
+  try {
+    if (!sharedAudioCtx || sharedAudioCtx.state === "closed") {
+      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      if (AudioCtx) {
+        sharedAudioCtx = new AudioCtx();
+      }
+    }
+    if (sharedAudioCtx && sharedAudioCtx.state === "suspended") {
+      void sharedAudioCtx.resume();
+    }
+    return sharedAudioCtx;
+  } catch (err) {
+    console.warn("WebAudio context unavailable", err);
+    return null;
+  }
+}
+
+function playSynthesizedSound(
+  soundType: "whoosh" | "pop" | "click" | "hit" | "notification" | "shutter" | "music_preview",
+  volume = 1,
+) {
+  try {
+    const ctx = getAudioContext();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    const gainNode = ctx.createGain();
+    const safeVolume = Math.min(1, Math.max(0, volume));
+    gainNode.gain.setValueAtTime(safeVolume, now);
+    gainNode.connect(ctx.destination);
+
+    if (soundType === "whoosh") {
+      const bufferSize = ctx.sampleRate * 0.45;
+      const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+      const data = buffer.getChannelData(0);
+      for (let i = 0; i < bufferSize; i++) {
+        data[i] = Math.random() * 2 - 1;
+      }
+      const noise = ctx.createBufferSource();
+      noise.buffer = buffer;
+
+      const filter = ctx.createBiquadFilter();
+      filter.type = "bandpass";
+      filter.frequency.setValueAtTime(250, now);
+      filter.frequency.exponentialRampToValueAtTime(1600, now + 0.22);
+      filter.frequency.exponentialRampToValueAtTime(200, now + 0.45);
+      filter.Q.setValueAtTime(3.5, now);
+
+      gainNode.gain.setValueAtTime(0.01, now);
+      gainNode.gain.linearRampToValueAtTime(0.7 * safeVolume, now + 0.22);
+      gainNode.gain.exponentialRampToValueAtTime(0.001, now + 0.45);
+
+      noise.connect(filter);
+      filter.connect(gainNode);
+      noise.start(now);
+      noise.stop(now + 0.45);
+    } else if (soundType === "pop") {
+      const osc = ctx.createOscillator();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(800, now);
+      osc.frequency.exponentialRampToValueAtTime(140, now + 0.15);
+
+      gainNode.gain.setValueAtTime(0.85 * safeVolume, now);
+      gainNode.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
+
+      osc.connect(gainNode);
+      osc.start(now);
+      osc.stop(now + 0.15);
+    } else if (soundType === "click") {
+      const osc = ctx.createOscillator();
+      osc.type = "triangle";
+      osc.frequency.setValueAtTime(2200, now);
+      osc.frequency.exponentialRampToValueAtTime(500, now + 0.04);
+
+      gainNode.gain.setValueAtTime(0.6 * safeVolume, now);
+      gainNode.gain.exponentialRampToValueAtTime(0.001, now + 0.04);
+
+      osc.connect(gainNode);
+      osc.start(now);
+      osc.stop(now + 0.04);
+    } else if (soundType === "hit") {
+      const osc = ctx.createOscillator();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(180, now);
+      osc.frequency.exponentialRampToValueAtTime(45, now + 0.35);
+
+      gainNode.gain.setValueAtTime(0.9 * safeVolume, now);
+      gainNode.gain.exponentialRampToValueAtTime(0.001, now + 0.4);
+
+      osc.connect(gainNode);
+      osc.start(now);
+      osc.stop(now + 0.4);
+    } else if (soundType === "notification") {
+      const osc1 = ctx.createOscillator();
+      const osc2 = ctx.createOscillator();
+      osc1.type = "sine";
+      osc2.type = "sine";
+      osc1.frequency.setValueAtTime(1046.5, now);
+      osc2.frequency.setValueAtTime(1567.98, now);
+
+      gainNode.gain.setValueAtTime(0.5 * safeVolume, now);
+      gainNode.gain.exponentialRampToValueAtTime(0.001, now + 0.65);
+
+      osc1.connect(gainNode);
+      osc2.connect(gainNode);
+      osc1.start(now);
+      osc2.start(now);
+      osc1.stop(now + 0.65);
+      osc2.stop(now + 0.65);
+    } else if (soundType === "shutter") {
+      const click1 = ctx.createOscillator();
+      click1.type = "square";
+      click1.frequency.setValueAtTime(1200, now);
+      click1.frequency.exponentialRampToValueAtTime(300, now + 0.05);
+
+      const click2 = ctx.createOscillator();
+      click2.type = "triangle";
+      click2.frequency.setValueAtTime(950, now + 0.07);
+      click2.frequency.exponentialRampToValueAtTime(220, now + 0.13);
+
+      gainNode.gain.setValueAtTime(0.5 * safeVolume, now);
+      gainNode.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
+
+      click1.connect(gainNode);
+      click2.connect(gainNode);
+      click1.start(now);
+      click1.stop(now + 0.05);
+      click2.start(now + 0.07);
+      click2.stop(now + 0.14);
+    } else if (soundType === "music_preview") {
+      const freqs = [261.63, 329.63, 392.0, 523.25, 440.0, 349.23];
+      freqs.forEach((f, idx) => {
+        if (!ctx) return;
+        const osc = ctx.createOscillator();
+        const noteGain = ctx.createGain();
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(f, now + idx * 0.22);
+        noteGain.gain.setValueAtTime(0, now + idx * 0.22);
+        noteGain.gain.linearRampToValueAtTime(0.25 * safeVolume, now + idx * 0.22 + 0.04);
+        noteGain.gain.exponentialRampToValueAtTime(0.001, now + idx * 0.22 + 0.5);
+        osc.connect(noteGain);
+        noteGain.connect(gainNode);
+        osc.start(now + idx * 0.22);
+        osc.stop(now + idx * 0.22 + 0.55);
+      });
+    }
+  } catch (err) {
+    console.warn("WebAudio synthesis playback error:", err);
+  }
+}
+
+function sfxIdToSoundType(id: string): "whoosh" | "pop" | "click" | "hit" | "notification" | "shutter" {
+  if (id === "sfx-1" || id.includes("whoosh")) return "whoosh";
+  if (id === "sfx-2" || id.includes("pop")) return "pop";
+  if (id === "sfx-3" || id.includes("click")) return "click";
+  if (id === "sfx-4" || id.includes("hit") || id.includes("impact")) return "hit";
+  if (id === "sfx-5" || id.includes("notification") || id.includes("bell")) return "notification";
+  return "shutter";
+}
 
 const editorMediaInputConfig: Record<
   EditorMediaKind,
-  { accept: string; label: string }
+  { accept: string; label: string; icon: string; shortLabel: string }
 > = {
   video: {
     accept: ".mp4,.mov,.webm,video/mp4,video/quicktime,video/webm",
     label: "Import Video",
+    icon: "🎥",
+    shortLabel: "Video",
   },
   audio: {
     accept: ".mp3,.wav,.m4a,audio/mpeg,audio/wav,audio/mp4",
     label: "Import Audio",
+    icon: "🎵",
+    shortLabel: "Audio",
   },
   image: {
     accept: ".png,.jpg,.jpeg,.webp,.gif,image/png,image/jpeg,image/webp",
     label: "Import Gambar",
+    icon: "🖼️",
+    shortLabel: "Gambar",
   },
 };
 
 export function EditorMediaImportControls({
-  className = "grid grid-cols-1 gap-2 sm:grid-cols-3",
+  className = "flex items-center gap-1.5",
   disabled = false,
   onImport,
   uploadingKind = null,
@@ -108,17 +576,27 @@ export function EditorMediaImportControls({
       {(Object.keys(editorMediaInputConfig) as EditorMediaKind[]).map((kind) => {
         const config = editorMediaInputConfig[kind];
         return (
-          <label className="relative" key={kind}>
+          <label
+            className="relative flex-1 min-w-0"
+            key={kind}
+            title={config.label}
+          >
             <span
-              className={`btn-secondary flex min-h-10 w-full cursor-pointer items-center justify-center px-3 py-2 text-center text-xs font-black ${
+              className={`flex h-8 w-full cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-zinc-700/80 bg-[#22252a] px-2 py-1 text-center text-xs font-bold text-zinc-200 transition hover:border-cyan-500/60 hover:bg-[#2b2f36] hover:text-cyan-300 ${
                 disabled ? "pointer-events-none opacity-50" : ""
               }`}
+              title={config.label}
             >
-              {uploadingKind === kind ? "Mengimpor..." : `+ ${config.label}`}
+              <span className="text-xs">{config.icon}</span>
+              {uploadingKind === kind ? (
+                <span className="text-[10px] animate-pulse">Upload...</span>
+              ) : (
+                <span className="text-[11px] font-semibold truncate">{config.shortLabel}</span>
+              )}
             </span>
             <input
               accept={config.accept}
-              aria-label={`+ ${config.label}`}
+              aria-label={config.label}
               className="sr-only"
               disabled={disabled}
               onChange={(event) => {
@@ -140,15 +618,148 @@ type AudioSettings = {
   muted: boolean;
   fade_in: number;
   fade_out: number;
+  speed?: number;
 };
 
 type VideoFraming = {
+  preset?: "blurred_background" | "center_crop" | "fit_background" | "picture_in_picture" | "clean_podcast" | "studio_podcast" | "talking_head" | string;
   x: number;
   y: number;
   scale: number;
+  rotation?: number;
+  flip_h?: boolean;
+  flip_v?: boolean;
+  opacity?: number;
+  blur_background?: boolean;
+  blur_strength?: number;
+  background_color?: string;
 };
 
-const defaultVideoFraming: VideoFraming = { x: 0, y: 0, scale: 1 };
+const defaultVideoFraming: VideoFraming = {
+  preset: "blurred_background",
+  x: 0,
+  y: 0,
+  scale: 1,
+  rotation: 0,
+  flip_h: false,
+  flip_v: false,
+  opacity: 1,
+  blur_background: true,
+  blur_strength: 20,
+  background_color: "#000000",
+};
+
+type VideoAdjustments = {
+  brightness: number;
+  contrast: number;
+  saturation: number;
+  sharpness: number;
+  temperature: number;
+  vignette: number;
+  blur: number;
+};
+
+const defaultVideoAdjustments: VideoAdjustments = {
+  brightness: 0,
+  contrast: 0,
+  saturation: 0,
+  sharpness: 0,
+  temperature: 0,
+  vignette: 0,
+  blur: 0,
+};
+
+export function WysiwygInlineTextEditor({
+  value,
+  onChange,
+  onBlur,
+  placeholder = "Ketik teks...",
+  className = "",
+  style = {},
+  autoFocus = true,
+}: {
+  value: string;
+  onChange: (nextText: string) => void;
+  onBlur?: () => void;
+  placeholder?: string;
+  className?: string;
+  style?: CSSProperties;
+  autoFocus?: boolean;
+}) {
+  const ref = useRef<HTMLSpanElement>(null);
+  const isComposingRef = useRef(false);
+
+  useLayoutEffect(() => {
+    if (ref.current) {
+      if (document.activeElement !== ref.current && ref.current.textContent !== value) {
+        ref.current.textContent = value;
+      }
+    }
+  }, [value]);
+
+  useEffect(() => {
+    if (autoFocus && ref.current) {
+      ref.current.focus();
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(ref.current);
+      range.collapse(false);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    }
+  }, [autoFocus]);
+
+  return (
+    <span
+      ref={ref}
+      contentEditable="plaintext-only"
+      suppressContentEditableWarning
+      data-placeholder={placeholder}
+      className={`wysiwyg-text-editor ${className}`}
+      style={{
+        display: "inline-block",
+        outline: "none",
+        border: "none",
+        background: "transparent",
+        padding: 0,
+        margin: 0,
+        boxShadow: "none",
+        whiteSpace: "pre-wrap",
+        wordBreak: "break-word",
+        overflowWrap: "break-word",
+        cursor: "text",
+        userSelect: "text",
+        WebkitUserSelect: "text",
+        minWidth: "1ch",
+        ...style,
+      }}
+      onCompositionStart={() => {
+        isComposingRef.current = true;
+      }}
+      onCompositionEnd={(e) => {
+        isComposingRef.current = false;
+        onChange(e.currentTarget.textContent || "");
+      }}
+      onInput={(e) => {
+        if (!isComposingRef.current) {
+          onChange(e.currentTarget.textContent || "");
+        }
+      }}
+      onPaste={(e) => {
+        e.preventDefault();
+        const text = e.clipboardData.getData("text/plain");
+        document.execCommand("insertText", false, text);
+      }}
+      onPointerDown={(e) => e.stopPropagation()}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+      }}
+      onBlur={() => {
+        if (onBlur) onBlur();
+      }}
+    />
+  );
+}
 
 function normalizeVideoFraming(value: unknown): VideoFraming {
   const raw = value && typeof value === "object" ? (value as Partial<VideoFraming>) : {};
@@ -157,9 +768,34 @@ function normalizeVideoFraming(value: unknown): VideoFraming {
     return Number.isFinite(numeric) ? numeric : fallback;
   };
   return {
+    preset: typeof raw.preset === "string" ? raw.preset : undefined,
     x: Math.max(-40, Math.min(40, finiteOr(raw.x, defaultVideoFraming.x))),
     y: Math.max(-40, Math.min(40, finiteOr(raw.y, defaultVideoFraming.y))),
-    scale: Math.max(1, Math.min(2, finiteOr(raw.scale, defaultVideoFraming.scale))),
+    scale: Math.max(0.5, Math.min(2.5, finiteOr(raw.scale, defaultVideoFraming.scale))),
+    rotation: Math.max(-180, Math.min(180, finiteOr(raw.rotation, defaultVideoFraming.rotation || 0))),
+    flip_h: Boolean(raw.flip_h),
+    flip_v: Boolean(raw.flip_v),
+    opacity: Math.max(0, Math.min(1, finiteOr(raw.opacity, defaultVideoFraming.opacity || 1))),
+    blur_background: raw.blur_background !== undefined ? Boolean(raw.blur_background) : Boolean(defaultVideoFraming.blur_background),
+    blur_strength: Math.max(1, Math.min(50, finiteOr(raw.blur_strength, defaultVideoFraming.blur_strength || 20))),
+    background_color: typeof raw.background_color === "string" ? raw.background_color : "#000000",
+  };
+}
+
+function normalizeVideoAdjustments(value: unknown): VideoAdjustments {
+  const raw = value && typeof value === "object" ? (value as Partial<VideoAdjustments>) : {};
+  const finiteOr = (candidate: unknown, fallback: number) => {
+    const numeric = Number(candidate);
+    return Number.isFinite(numeric) ? numeric : fallback;
+  };
+  return {
+    brightness: Math.max(-100, Math.min(100, finiteOr(raw.brightness, 0))),
+    contrast: Math.max(-100, Math.min(100, finiteOr(raw.contrast, 0))),
+    saturation: Math.max(-100, Math.min(100, finiteOr(raw.saturation, 0))),
+    sharpness: Math.max(0, Math.min(100, finiteOr(raw.sharpness, 0))),
+    temperature: Math.max(-100, Math.min(100, finiteOr(raw.temperature, 0))),
+    vignette: Math.max(0, Math.min(100, finiteOr(raw.vignette, 0))),
+    blur: Math.max(0, Math.min(20, finiteOr(raw.blur, 0))),
   };
 }
 
@@ -172,6 +808,9 @@ type MediaSequenceSegment = {
   id: string;
   sourceStart: number;
   sourceEnd: number;
+  locked?: boolean;
+  visible?: boolean;
+  muted?: boolean;
 };
 
 type EditableCaptionCue = {
@@ -179,6 +818,11 @@ type EditableCaptionCue = {
   start: number;
   end: number;
   text: string;
+  locked?: boolean;
+  visible?: boolean;
+  type?: string;
+  style_id?: string | null;
+  style_override?: Record<string, unknown> | null;
 };
 
 type CopiedTimedItem =
@@ -207,19 +851,23 @@ type AdditionalAudioTrack = {
   start: number;
   end: number;
   volume: number;
+  muted?: boolean;
+  locked?: boolean;
+  fade_in?: number;
+  fade_out?: number;
+  speed?: number;
+  base_duration?: number;
+  loop?: boolean;
 };
 
-type TimelineTrackKey = "caption" | "hook" | "keyword" | "video" | "audio" | "punch" | "pattern";
+type TimelineTrackKey = "text" | "overlay" | "video" | "audio" | "caption" | "hook" | "keyword" | "punch" | "pattern";
 type VisualLayerTrack = "caption" | "hook" | "keyword" | "video";
 
 const defaultTrackOrder: TimelineTrackKey[] = [
-  "caption",
-  "hook",
-  "keyword",
+  "text",
+  "overlay",
   "video",
   "audio",
-  "punch",
-  "pattern",
 ];
 
 const defaultVisualLayerOrder: VisualLayerTrack[] = ["caption", "hook", "keyword", "video"];
@@ -234,7 +882,25 @@ function normalizeOrderedTracks<T extends string>(value: unknown, defaults: read
 }
 
 function normalizeTrackOrder(value: unknown): TimelineTrackKey[] {
-  return normalizeOrderedTracks(value, defaultTrackOrder);
+  const canonicalOrder: TimelineTrackKey[] = ["text", "overlay", "video", "audio"];
+  if (!Array.isArray(value)) return canonicalOrder;
+  const mapped = value.map((t) =>
+    t === "caption" || t === "hook" || t === "keyword"
+      ? "text"
+      : t === "punch" || t === "pattern"
+      ? "overlay"
+      : t
+  );
+  const videoIndex = mapped.indexOf("video");
+  const overlayIndex = mapped.indexOf("overlay");
+  if (videoIndex !== -1 && overlayIndex !== -1 && overlayIndex > videoIndex) {
+    return canonicalOrder;
+  }
+  const unique = mapped.filter(
+    (track, index): track is TimelineTrackKey =>
+      canonicalOrder.includes(track as TimelineTrackKey) && mapped.indexOf(track) === index,
+  );
+  return [...unique, ...canonicalOrder.filter((track) => !unique.includes(track))];
 }
 
 function normalizeVisualLayerOrder(value: unknown): VisualLayerTrack[] {
@@ -255,6 +921,9 @@ type TimelineItem = {
   title: string;
   colorClass: string;
   active?: boolean;
+  locked?: boolean;
+  visible?: boolean;
+  muted?: boolean;
 };
 
 type SourceMetadata = {
@@ -544,39 +1213,21 @@ function normalizeHookTextFont(value: unknown): HookTextFont {
     : "clean_sans";
 }
 
-function hookOverlayTextSizeClass(
-  text: string,
-  requestedSize: HookTextSize,
-  template: HookTextTemplate,
-) {
-  const wordCount = text.trim().split(/\s+/).filter(Boolean).length;
-  const characterCount = text.trim().length;
-  const isLong = characterCount > 52 || wordCount > 10;
-  const isMedium = characterCount > 36 || wordCount > 7;
-
-  if (template === "breaking_news") {
-    if (isLong) return "text-[10px] md:text-xs";
-    if (isMedium) return "text-xs md:text-sm";
-    return requestedSize === "large" ? "text-sm md:text-base" : "text-xs md:text-sm";
-  }
-  if (isLong) return "text-xs md:text-sm";
-  if (isMedium) return "text-sm md:text-base";
-  return requestedSize === "large" ? "text-base md:text-lg" : "text-sm md:text-base";
-}
-
 const defaultAudioSettings: AudioSettings = {
   volume: 1,
   muted: false,
   fade_in: 0,
   fade_out: 0,
+  speed: 1,
 };
 
 function normalizeAudioSettings(value: Partial<AudioSettings> | undefined): AudioSettings {
   return {
     volume: Math.max(0, Math.min(2, Number(value?.volume ?? defaultAudioSettings.volume))),
     muted: Boolean(value?.muted ?? defaultAudioSettings.muted),
-    fade_in: Math.max(0, Math.min(5, Number(value?.fade_in ?? defaultAudioSettings.fade_in))),
-    fade_out: Math.max(0, Math.min(5, Number(value?.fade_out ?? defaultAudioSettings.fade_out))),
+    fade_in: Math.max(0, Math.min(10, Number(value?.fade_in ?? defaultAudioSettings.fade_in))),
+    fade_out: Math.max(0, Math.min(10, Number(value?.fade_out ?? defaultAudioSettings.fade_out))),
+    speed: Math.max(0.5, Math.min(2, Number(value?.speed ?? defaultAudioSettings.speed ?? 1))),
   };
 }
 
@@ -764,15 +1415,6 @@ function isRenderPreset(value: unknown): value is RenderPreset {
   return typeof value === "string" && renderPresetValues.includes(value as RenderPreset);
 }
 
-const stylePresets = [
-  { value: "clean_podcast", label: "Clean Podcast" },
-  { value: "viral_shorts", label: "Viral Shorts" },
-  { value: "story_drama", label: "Story / Drama" },
-  { value: "education_explainer", label: "Edukasi / Explainer" },
-  { value: "meme_comedy", label: "Meme / Comedy" },
-  { value: "custom", label: "Custom" },
-] as const;
-
 const styleDefaults = {
   clean_podcast: {
     clipper_style_preset: "clean_podcast",
@@ -935,13 +1577,6 @@ function eventWidth(start: number, end: number, duration: number) {
   return `${Math.max(0.7, Math.min(100, ((end - start) / Math.max(1, duration)) * 100))}%`;
 }
 
-function eventDurationBounds(type: string) {
-  if (type === "keyword_popup") return { min: 0.6, max: 3 };
-  if (type === "hook_text") return { min: 1, max: 5 };
-  if (type === "pattern_interrupt") return { min: 0.4, max: 2 };
-  return { min: 0.4, max: 2 };
-}
-
 function editableEventId(event: EffectTimelineEvent, index: number) {
   return event.id || `${event.type}-${event.start.toFixed(2)}-${event.end.toFixed(2)}-${index}`;
 }
@@ -966,14 +1601,6 @@ function sanitizeKeywordInput(text: string) {
     .filter(Boolean)
     .slice(0, 4);
   return words.join(" ");
-}
-
-function isValidKeyword(text: string) {
-  const clean = sanitizeKeywordInput(text);
-  if (!clean) return false;
-  const words = clean.toLowerCase().split(/\s+/);
-  if (words.length === 1 && keywordStopwords.has(words[0])) return false;
-  return words.some((word) => word.length >= 3 || /\d/.test(word));
 }
 
 function getCaptionPreviewText(text: string) {
@@ -1038,57 +1665,12 @@ function normalizeCaptionStyleConfig(value: unknown): CaptionStyleConfig {
   };
 }
 
-function captionPositionClass(position: CaptionStyleConfig["position"]) {
-  if (position === "top") return "top-[10%]";
-  if (position === "center") return "top-1/2 -translate-y-1/2";
-  if (position === "center_lower") return "bottom-[16%]";
-  return "bottom-[10%]";
-}
-
-function captionSizeClass(
-  fontSize: CaptionStyleConfig["fontSize"],
-  preset?: CaptionStylePreset,
-  wordCount = 0,
-) {
-  if (wordCount > 12) return "text-[10px] md:text-xs";
-  if (wordCount > 8) return "text-xs md:text-sm";
-  if (wordCount > MAX_CAPTION_WORDS) return "text-sm";
-  if (preset === "tiktok_bold") return "text-base md:text-lg";
-  if (preset === "yellow_pop") return "text-base md:text-lg";
-  if (fontSize === "large") return "text-base md:text-lg";
-  if (fontSize === "small") return "text-xs md:text-sm";
-  return "text-sm md:text-base";
-}
-
-function captionWeightClass(fontWeight: CaptionStyleConfig["fontWeight"]) {
-  if (fontWeight === "bold") return "font-black";
-  if (fontWeight === "semibold") return "font-bold";
-  return "font-semibold";
-}
-
-function captionTextShadow(style: CaptionStyleConfig) {
-  if (style.preset === "tiktok_bold") {
-    return "-1.25px -1.25px 0 #000, 1.25px -1.25px 0 #000, -1.25px 1.25px 0 #000, 1.25px 1.25px 0 #000, 0 3px 8px rgba(0,0,0,0.72)";
-  }
-  if (style.preset === "yellow_pop") {
-    return "-1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, 0 3px 8px rgba(0,0,0,0.68)";
-  }
-  return [
-    style.outlineEnabled
-      ? "0 1px 2px #000, 1px 0 1px #000, -1px 0 1px #000, 0 -1px 1px #000"
-      : "",
-    style.shadowEnabled ? "0 4px 10px rgba(0,0,0,0.55)" : "",
-  ]
-    .filter(Boolean)
-    .join(", ");
-}
-
-function activeCaptionCue(
-  cues: Array<{ id?: string; start: number; end: number; text: string }>,
+function activeCaptionCue<T extends { id?: string; start: number; end: number; text: string }>(
+  cues: T[],
   currentTime: number,
-) {
+): T | undefined {
   const boundaryTolerance = 0.04;
-  return cues.reduce<(typeof cues)[number] | undefined>((active, cue) => {
+  return cues.reduce<T | undefined>((active, cue) => {
     const inRange =
       currentTime >= cue.start - boundaryTolerance &&
       currentTime < cue.end + boundaryTolerance;
@@ -1241,6 +1823,96 @@ function renderLabel(render?: Render, renderedPreviewAvailable = false) {
   return renderStatusLabels[render.status] || render.status;
 }
 
+function SourceNavTabStrip({
+  tabs,
+  activeTab,
+  onSelectTab,
+}: {
+  tabs: Array<{ id: EditorNavTab; label: string; icon: string }>;
+  activeTab: EditorNavTab;
+  onSelectTab: (tab: EditorNavTab) => void;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [canScrollLeft, setCanScrollLeft] = useState(false);
+  const [canScrollRight, setCanScrollRight] = useState(false);
+
+  const checkScroll = useCallback(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    setCanScrollLeft(el.scrollLeft > 2);
+    setCanScrollRight(el.scrollLeft + el.clientWidth < el.scrollWidth - 2);
+  }, []);
+
+  useEffect(() => {
+    checkScroll();
+    const el = containerRef.current;
+    if (!el) return;
+    el.addEventListener("scroll", checkScroll, { passive: true });
+    window.addEventListener("resize", checkScroll);
+    return () => {
+      el.removeEventListener("scroll", checkScroll);
+      window.removeEventListener("resize", checkScroll);
+    };
+  }, [checkScroll, tabs]);
+
+  const scrollBy = (offset: number) => {
+    containerRef.current?.scrollBy({ left: offset, behavior: "smooth" });
+  };
+
+  return (
+    <div className="relative flex h-full min-w-0 items-center overflow-hidden border-r border-zinc-800/40 px-1 xl:border-r-0">
+      {/* Left Arrow Button */}
+      {canScrollLeft && (
+        <button
+          type="button"
+          onClick={() => scrollBy(-120)}
+          aria-label="Scroll tab ke kiri"
+          title="Scroll tab ke kiri"
+          className="absolute left-0.5 z-10 flex h-7 w-6 sm:w-7 items-center justify-center rounded-md border border-zinc-700/80 bg-[#1e2126] text-sm sm:text-base font-black text-zinc-200 shadow-md transition hover:border-cyan-400 hover:bg-[#282c34] hover:text-cyan-300 active:scale-95"
+        >
+          ‹
+        </button>
+      )}
+
+      {/* Tabs Viewport */}
+      <div
+        ref={containerRef}
+        className="flex items-center gap-1 overflow-x-auto no-scrollbar scroll-smooth py-0.5 px-0.5"
+        style={{ scrollbarWidth: "none", msOverflowStyle: "none" }}
+      >
+        {tabs.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            onClick={() => onSelectTab(tab.id)}
+            className={`flex shrink-0 items-center gap-1 rounded-md px-2 py-0.5 text-xs font-bold transition-all whitespace-nowrap ${
+              activeTab === tab.id
+                ? "bg-[#22252b] text-cyan-300 shadow-sm ring-1 ring-cyan-500/40 font-black"
+                : "text-zinc-400 hover:bg-[#1c1f24] hover:text-zinc-200"
+            }`}
+          >
+            <span className="text-xs opacity-90">{tab.icon}</span>
+            <span>{tab.label}</span>
+          </button>
+        ))}
+      </div>
+
+      {/* Right Arrow Button */}
+      {canScrollRight && (
+        <button
+          type="button"
+          onClick={() => scrollBy(120)}
+          aria-label="Scroll tab ke kanan"
+          title="Scroll tab ke kanan"
+          className="absolute right-0.5 z-10 flex h-7 w-6 sm:w-7 items-center justify-center rounded-md border border-zinc-700/80 bg-[#1e2126] text-sm sm:text-base font-black text-zinc-200 shadow-md transition hover:border-cyan-400 hover:bg-[#282c34] hover:text-cyan-300 active:scale-95"
+        >
+          ›
+        </button>
+      )}
+    </div>
+  );
+}
+
 function ToolSection({
   title,
   children,
@@ -1249,11 +1921,11 @@ function ToolSection({
   children: ReactNode;
 }) {
   return (
-    <section className="rounded-xl border border-zinc-700 bg-[#25282d] p-3 shadow-sm shadow-black/20">
-      <h3 className="text-xs font-black uppercase tracking-[0.12em] text-zinc-400">
+    <section className="rounded-lg border border-zinc-700/80 bg-[#22252a] p-2.5 shadow-sm shadow-black/20">
+      <h3 className="text-[11px] font-black uppercase tracking-[0.1em] text-zinc-400">
         {title}
       </h3>
-      <div className="mt-2.5 space-y-2.5">{children}</div>
+      <div className="mt-2 space-y-2">{children}</div>
     </section>
   );
 }
@@ -1296,7 +1968,15 @@ function AccordionSection({
 }
 
 function TimelineTrack({
-  label,
+  trackKey = "text",
+  locked = false,
+  onToggleLock,
+  visible = true,
+  onToggleVisibility,
+  muted = false,
+  onToggleMute,
+  muteDisabled = false,
+  muteTooltip,
   items,
   duration,
   playheadPercent,
@@ -1317,13 +1997,20 @@ function TimelineTrack({
   selectedItemId,
   selected = false,
   emptyText = "Tidak ada event",
-  onMoveUp,
-  onMoveDown,
-  canMoveUp = false,
-  canMoveDown = false,
   order,
+  transitions,
+  onTransitionClick,
 }: {
-  label: string;
+  trackKey?: "text" | "overlay" | "video" | "audio";
+  locked?: boolean;
+  onToggleLock?: () => void;
+  visible?: boolean;
+  onToggleVisibility?: () => void;
+  muted?: boolean;
+  onToggleMute?: () => void;
+  muteDisabled?: boolean;
+  muteTooltip?: string;
+  label?: string;
   items: TimelineItem[];
   duration: number;
   playheadPercent?: number;
@@ -1365,56 +2052,198 @@ function TimelineTrack({
   canMoveUp?: boolean;
   canMoveDown?: boolean;
   order?: number;
+  transitions?: Array<{
+    id: string;
+    eventId: string;
+    time: number;
+    duration: number;
+    name: string;
+    effect: string;
+    active: boolean;
+    selected: boolean;
+    beforeNumber: number;
+    afterNumber: number;
+  }>;
+  onTransitionClick?: (eventId: string) => void;
 }) {
+  const isText = trackKey === "text";
+  const isOverlay = trackKey === "overlay";
+  const isVideo = trackKey === "video";
+  const isAudio = trackKey === "audio";
+
   return (
     <div
-      className="grid grid-cols-[112px_minmax(0,1fr)] items-center gap-3"
+      className="grid grid-cols-[104px_minmax(0,1fr)] items-center gap-2"
       style={typeof order === "number" ? { order } : undefined}
     >
-      <div className={`flex min-w-0 items-center gap-1 text-xs font-black uppercase tracking-wide ${
-        selected ? "text-cyan-300" : "text-zinc-500"
+      {/* COMPACT ICON-ONLY LANE HEADER */}
+      <div className={`flex items-center gap-1 px-1 py-0.5 rounded-lg select-none ${
+        selected ? "bg-cyan-950/40 border border-cyan-800/40" : "bg-transparent"
       }`}>
-        <span className="min-w-0 flex-1 truncate">{label}</span>
-        {onMoveUp && (
+        {/* 1. Category Icon Badge */}
+        {isText && (
+          <span
+            className="flex size-6 shrink-0 items-center justify-center rounded bg-cyan-950/80 border border-cyan-800/60 text-cyan-300 shadow-sm"
+            title="Track Text & Caption"
+          >
+            <svg className="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="4 7 4 4 20 4 20 7" />
+              <line x1="9" y1="20" x2="15" y2="20" />
+              <line x1="12" y1="4" x2="12" y2="20" />
+            </svg>
+          </span>
+        )}
+        {isOverlay && (
+          <span
+            className="flex size-6 shrink-0 items-center justify-center rounded bg-fuchsia-950/80 border border-fuchsia-800/60 text-fuchsia-300 shadow-sm"
+            title="Track Overlay & Sticker"
+          >
+            <svg className="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <polygon points="12 2 2 7 12 12 22 7 12 2" />
+              <polyline points="2 17 12 22 22 17" />
+              <polyline points="2 12 12 17 22 12" />
+            </svg>
+          </span>
+        )}
+        {isVideo && (
+          <span
+            className="flex size-6 shrink-0 items-center justify-center rounded bg-blue-950/80 border border-blue-800/60 text-blue-300 shadow-sm"
+            title="Track Video"
+          >
+            <svg className="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <polygon points="23 7 16 12 23 17 23 7" />
+              <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+            </svg>
+          </span>
+        )}
+        {isAudio && (
+          <span
+            className="flex size-6 shrink-0 items-center justify-center rounded bg-emerald-950/80 border border-emerald-800/60 text-emerald-300 shadow-sm"
+            title="Track Audio"
+          >
+            <svg className="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M9 18V5l12-2v13" />
+              <circle cx="6" cy="18" r="3" />
+              <circle cx="18" cy="16" r="3" />
+            </svg>
+          </span>
+        )}
+
+        {/* 2. Lock / Unlock Toggle Button */}
+        <button
+          type="button"
+          aria-label={locked ? "Buka kunci track" : "Kunci track"}
+          onClick={(event) => {
+            event.stopPropagation();
+            onToggleLock?.();
+          }}
+          title={locked ? "Buka kunci track" : "Kunci track"}
+          className={`flex size-6 shrink-0 items-center justify-center rounded transition ${
+            locked
+              ? "bg-amber-500/20 text-amber-300 border border-amber-500/40"
+              : "text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
+          }`}
+        >
+          {locked ? (
+            <svg className="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+              <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+            </svg>
+          ) : (
+            <svg className="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+              <path d="M7 11V7a5 5 0 0 1 9.9-1" />
+            </svg>
+          )}
+        </button>
+
+        {/* 3. Show / Hide (Eye) Toggle Button (Text, Overlay, Video) */}
+        {!isAudio && (
           <button
-            aria-label={`Naikkan track ${label}`}
-            className="rounded px-1 text-[11px] text-zinc-400 hover:bg-zinc-700 hover:text-cyan-300 disabled:opacity-25"
-            disabled={!canMoveUp}
+            type="button"
+            aria-label={visible !== false ? "Sembunyikan track" : "Tampilkan track"}
             onClick={(event) => {
               event.stopPropagation();
-              onMoveUp();
+              onToggleVisibility?.();
             }}
-            title="Naik"
-            type="button"
+            title={visible !== false ? "Sembunyikan track" : "Tampilkan track"}
+            className={`flex size-6 shrink-0 items-center justify-center rounded transition ${
+              visible === false
+                ? "bg-zinc-800 text-zinc-500 border border-zinc-700"
+                : "text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+            }`}
           >
-            ↑
+            {visible === false ? (
+              <svg className="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" />
+                <line x1="1" y1="1" x2="23" y2="23" />
+              </svg>
+            ) : (
+              <svg className="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8z" />
+                <circle cx="12" cy="12" r="3" />
+              </svg>
+            )}
           </button>
         )}
-        {onMoveDown && (
+
+        {/* 4. Speaker / Mute Toggle Button (Video, Audio) */}
+        {(isVideo || isAudio) && (
           <button
-            aria-label={`Turunkan track ${label}`}
-            className="rounded px-1 text-[11px] text-zinc-400 hover:bg-zinc-700 hover:text-cyan-300 disabled:opacity-25"
-            disabled={!canMoveDown}
+            type="button"
+            disabled={muteDisabled}
+            aria-label={
+              muteDisabled
+                ? (muteTooltip || "Audio sudah dipisah ke track AUDIO")
+                : muted
+                ? "Aktifkan suara track"
+                : "Mute track"
+            }
             onClick={(event) => {
               event.stopPropagation();
-              onMoveDown();
+              if (!muteDisabled) onToggleMute?.();
             }}
-            title="Turun"
-            type="button"
+            title={
+              muteDisabled
+                ? (muteTooltip || "Audio sudah dipisah ke track AUDIO")
+                : muted
+                ? "Aktifkan suara track"
+                : "Mute track"
+            }
+            className={`flex size-6 shrink-0 items-center justify-center rounded transition ${
+              muteDisabled
+                ? "opacity-25 cursor-not-allowed text-zinc-600"
+                : muted
+                ? "bg-rose-500/20 text-rose-400 border border-rose-500/40"
+                : "text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+            }`}
           >
-            ↓
+            {muted ? (
+              <svg className="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                <line x1="23" y1="9" x2="17" y2="15" />
+                <line x1="17" y1="9" x2="23" y2="15" />
+              </svg>
+            ) : (
+              <svg className="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07" />
+              </svg>
+            )}
           </button>
         )}
       </div>
+
+      {/* TRACK LANE BODY */}
       <div
         className={`relative h-8 touch-none overflow-hidden rounded-md border bg-[#22252a] ${
           selected ? "border-cyan-400 ring-1 ring-cyan-400/40" : "border-zinc-700"
-        }`}
-        onPointerCancel={onPointerCancel}
-        onPointerDown={onPointerDown}
-        onPointerLeave={onPointerLeave}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
+        } ${visible === false ? "opacity-40 border-dashed" : ""}`}
+        onPointerCancel={locked ? undefined : onPointerCancel}
+        onPointerDown={locked ? undefined : onPointerDown}
+        onPointerLeave={locked ? undefined : onPointerLeave}
+        onPointerMove={locked ? undefined : onPointerMove}
+        onPointerUp={locked ? undefined : onPointerUp}
       >
         {typeof playheadPercent === "number" && (
           <span
@@ -1423,86 +2252,131 @@ function TimelineTrack({
           />
         )}
         {items.length ? (
-          items.map((item) => (
-            <div
-              key={item.id}
-              className={`absolute top-1/2 h-4 -translate-y-1/2 rounded-md px-2 text-[10px] font-black leading-4 shadow-sm ${
-                item.id === selectedItemId || item.eventId === selectedItemId
-                  ? "z-20 ring-2 ring-cyan-300 ring-offset-1 ring-offset-[#22252a]"
-                  : item.active
-                    ? "ring-1 ring-white ring-offset-1 ring-offset-[#22252a]"
+          items.map((item) => {
+            const isItemLocked = locked || Boolean(item.locked);
+            const isItemVisible = (visible !== false) && (item.visible !== false);
+            return (
+              <div
+                key={item.id}
+                className={`absolute top-1/2 h-4 -translate-y-1/2 rounded-md px-2 text-[10px] font-black leading-4 shadow-sm ${
+                  item.id === selectedItemId || item.eventId === selectedItemId
+                    ? "z-20 ring-2 ring-cyan-300 ring-offset-1 ring-offset-[#22252a]"
+                    : item.active
+                      ? "ring-1 ring-white ring-offset-1 ring-offset-[#22252a]"
+                      : ""
+                } ${
+                  isItemLocked
+                    ? "cursor-not-allowed border border-dashed border-amber-300/40 opacity-75"
+                    : item.editable
+                    ? "cursor-move"
+                    : item.selectable
+                    ? "cursor-pointer"
                     : ""
-              } ${item.editable ? "cursor-move" : item.selectable ? "cursor-pointer" : ""} ${item.colorClass}`}
-              style={{
-                left: eventLeft(item.start, duration),
-                width: eventWidth(item.start, item.end, duration),
-              }}
-              onClick={(event) => {
-                if (!item.editable && !item.selectable) return;
-                event.stopPropagation();
-                onItemClick?.(item);
-              }}
-              onContextMenu={(event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                onItemContextMenu?.(event, item);
-              }}
-              onPointerDown={(event) => {
-                if (event.button !== 0) {
+                } ${
+                  !isItemVisible ? "opacity-35 border-dashed" : ""
+                } ${item.colorClass}`}
+                style={{
+                  left: eventLeft(item.start, duration),
+                  width: eventWidth(item.start, item.end, duration),
+                  minWidth: "14px",
+                }}
+                onClick={(event) => {
+                  if (!item.editable && !item.selectable) return;
                   event.stopPropagation();
-                  return;
-                }
-                if (!item.editable) {
-                  if (item.selectable) {
-                    event.preventDefault();
+                  onItemClick?.(item);
+                }}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  onItemContextMenu?.(event, item);
+                }}
+                onPointerDown={(event) => {
+                  if (event.button !== 0 || isItemLocked) {
                     event.stopPropagation();
+                    return;
                   }
-                  return;
-                }
-                event.stopPropagation();
-                onItemPointerDown?.(event, item);
-              }}
-              onPointerMove={(event) => {
-                if (!item.editable) return;
-                event.stopPropagation();
-                onItemPointerMove?.(event, item);
-              }}
-              onPointerUp={(event) => {
-                if (!item.editable) return;
-                event.stopPropagation();
-                onItemPointerUp?.(event, item);
-              }}
-              title={item.title}
-            >
-              <span className="block truncate">{item.label}</span>
-              {resizable && (item.id === selectedItemId || item.eventId === selectedItemId) && (
-                <>
-                  <span
-                    aria-label="Tarik ujung kiri track"
-                    className="absolute -left-0.5 top-0 z-20 h-full w-2 cursor-ew-resize rounded-l bg-white shadow-[0_0_0_1px_rgba(0,0,0,0.45)]"
-                    onPointerDown={(event) => onItemResizePointerDown?.(event, item, "left")}
-                    onPointerMove={onItemResizePointerMove}
-                    onPointerUp={onItemResizePointerUp}
-                    onPointerCancel={onItemResizePointerUp}
-                    title="Tarik untuk mengubah awal bagian"
-                  />
-                  <span
-                    aria-label="Tarik ujung kanan track"
-                    className="absolute -right-0.5 top-0 z-20 h-full w-2 cursor-ew-resize rounded-r bg-white shadow-[0_0_0_1px_rgba(0,0,0,0.45)]"
-                    onPointerDown={(event) => onItemResizePointerDown?.(event, item, "right")}
-                    onPointerMove={onItemResizePointerMove}
-                    onPointerUp={onItemResizePointerUp}
-                    onPointerCancel={onItemResizePointerUp}
-                    title="Tarik untuk mengubah akhir bagian"
-                  />
-                </>
-              )}
-            </div>
-          ))
+                  if (!item.editable) {
+                    if (item.selectable) {
+                      event.preventDefault();
+                      event.stopPropagation();
+                    }
+                    return;
+                  }
+                  event.stopPropagation();
+                  onItemPointerDown?.(event, item);
+                }}
+                onPointerMove={(event) => {
+                  if (!item.editable || isItemLocked) return;
+                  event.stopPropagation();
+                  onItemPointerMove?.(event, item);
+                }}
+                onPointerUp={(event) => {
+                  if (!item.editable || isItemLocked) return;
+                  event.stopPropagation();
+                  onItemPointerUp?.(event, item);
+                }}
+                title={isItemLocked ? `${item.title || item.label} [Terkunci]` : item.title}
+              >
+                <span className="flex items-center gap-1 truncate">
+                  {isItemLocked && <span className="text-[9px] opacity-80 shrink-0">🔒</span>}
+                  <span className="truncate">{item.label}</span>
+                </span>
+                {resizable && !isItemLocked && (item.id === selectedItemId || item.eventId === selectedItemId) && (
+                  <>
+                    <span
+                      aria-label="Tarik ujung kiri track"
+                      className="absolute -left-0.5 top-0 z-20 h-full w-2 cursor-ew-resize rounded-l bg-white shadow-[0_0_0_1px_rgba(0,0,0,0.45)]"
+                      onPointerDown={(event) => onItemResizePointerDown?.(event, item, "left")}
+                      onPointerMove={onItemResizePointerMove}
+                      onPointerUp={onItemResizePointerUp}
+                      onPointerCancel={onItemResizePointerUp}
+                      title="Tarik untuk mengubah awal bagian"
+                    />
+                    <span
+                      aria-label="Tarik ujung kanan track"
+                      className="absolute -right-0.5 top-0 z-20 h-full w-2 cursor-ew-resize rounded-r bg-white shadow-[0_0_0_1px_rgba(0,0,0,0.45)]"
+                      onPointerDown={(event) => onItemResizePointerDown?.(event, item, "right")}
+                      onPointerMove={onItemResizePointerMove}
+                      onPointerUp={onItemResizePointerUp}
+                      onPointerCancel={onItemResizePointerUp}
+                      title="Tarik untuk mengubah akhir bagian"
+                    />
+                  </>
+                )}
+              </div>
+            );
+          })
         ) : (
           <span className="absolute left-3 top-1/2 -translate-y-1/2 text-xs font-semibold text-zinc-600">
             {emptyText}
           </span>
+        )}
+        {transitions && transitions.length > 0 && (
+          transitions.map((trans) => {
+            const leftPercent = (trans.time / duration) * 100;
+            return (
+              <div
+                key={trans.id}
+                className={`absolute top-1/2 -translate-y-1/2 -translate-x-1/2 z-30 flex h-5 w-5 items-center justify-center rounded border transition-all duration-150 cursor-pointer shadow-md select-none ${
+                  trans.selected
+                    ? "bg-cyan-400 text-slate-950 border-white ring-2 ring-cyan-300 ring-offset-1 ring-offset-[#181a1e] scale-110 shadow-cyan-500/50"
+                    : trans.active
+                    ? "bg-indigo-500 text-white border-white ring-2 ring-white animate-pulse scale-110"
+                    : "bg-[#181a1e] text-cyan-300 border-cyan-400/90 hover:bg-cyan-500/20 hover:scale-110 hover:border-cyan-300"
+                }`}
+                style={{
+                  left: `${leftPercent}%`,
+                }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onTransitionClick?.(trans.eventId);
+                }}
+                title={`Transisi: ${trans.name}\nDi antara Klip ${trans.beforeNumber} dan Klip ${trans.afterNumber}\nKlik untuk mengatur transisi`}
+              >
+                <span className="text-[11px] font-black leading-none">⇄</span>
+              </div>
+            );
+          })
         )}
       </div>
     </div>
@@ -1513,6 +2387,8 @@ function PresetVideo({
   src,
   preset,
   framing = defaultVideoFraming,
+  adjustments = defaultVideoAdjustments,
+  speed = 1.0,
   controls = false,
   audioMuted = false,
   audioVolume = 1,
@@ -1525,8 +2401,10 @@ function PresetVideo({
   onSeeked,
 }: {
   src: string;
-  preset: RenderPreset;
+  preset: "blurred_background" | "center_crop" | "fit_background" | "picture_in_picture" | "clean_podcast" | RenderPreset | string;
   framing?: VideoFraming;
+  adjustments?: VideoAdjustments;
+  speed?: number;
   controls?: boolean;
   audioMuted?: boolean;
   audioVolume?: number;
@@ -1539,93 +2417,918 @@ function PresetVideo({
   onSeeked?: (currentTime: number) => void;
 }) {
   const safeFraming = normalizeVideoFraming(framing);
+  const safeAdjustments = normalizeVideoAdjustments(adjustments);
+  const clampedSpeed = Math.max(0.25, Math.min(4.0, Number(speed) || 1.0));
+  const localVideoRef = useRef<HTMLVideoElement | null>(null);
+  const bgVideoRef = useRef<HTMLVideoElement | null>(null);
+
+  useEffect(() => {
+    const el = localVideoRef.current;
+    if (!el) return;
+    if (el.playbackRate !== clampedSpeed) {
+      el.playbackRate = clampedSpeed;
+    }
+  }, [clampedSpeed]);
+
+  useEffect(() => {
+    const el = localVideoRef.current;
+    if (!el) return;
+    el.volume = Math.min(1, Math.max(0, audioVolume));
+    el.muted = audioMuted;
+  }, [audioVolume, audioMuted]);
+
+  // Keep background blur video in sync with foreground video
+  const syncBgVideo = useCallback(() => {
+    if (localVideoRef.current && bgVideoRef.current) {
+      const cur = localVideoRef.current.currentTime;
+      if (Math.abs(bgVideoRef.current.currentTime - cur) > 0.15) {
+        bgVideoRef.current.currentTime = cur;
+      }
+    }
+  }, []);
+
+  const blurBgEnabled = safeFraming.blur_background || preset === "blurred_background";
+  const blurPx = safeFraming.blur_strength || 20;
+  const bgColor = safeFraming.background_color || "#000000";
+
+  useEffect(() => {
+    if (localVideoRef.current && bgVideoRef.current) {
+      bgVideoRef.current.currentTime = localVideoRef.current.currentTime;
+    }
+  }, [src, blurBgEnabled]);
+
+  const setCombinedRef = useCallback(
+    (node: HTMLVideoElement | null) => {
+      localVideoRef.current = node;
+      if (typeof videoRef === "function") {
+        videoRef(node);
+      } else if (videoRef && typeof videoRef === "object") {
+        (videoRef as React.MutableRefObject<HTMLVideoElement | null>).current = node;
+      }
+      if (node) {
+        if (node.playbackRate !== clampedSpeed) {
+          node.playbackRate = clampedSpeed;
+        }
+        node.volume = Math.min(1, Math.max(0, audioVolume));
+        node.muted = audioMuted;
+        if (bgVideoRef.current) {
+          bgVideoRef.current.currentTime = node.currentTime;
+        }
+      }
+    },
+    [videoRef, clampedSpeed, audioVolume, audioMuted],
+  );
+
+  // Compute CSS filter from adjustments
+  const filterParts: string[] = [];
+  if (safeAdjustments.brightness !== 0) {
+    filterParts.push(`brightness(${1 + safeAdjustments.brightness / 100})`);
+  }
+  if (safeAdjustments.contrast !== 0) {
+    filterParts.push(`contrast(${1 + safeAdjustments.contrast / 100})`);
+  }
+  if (safeAdjustments.saturation !== 0) {
+    filterParts.push(`saturate(${1 + safeAdjustments.saturation / 100})`);
+  }
+  if (safeAdjustments.blur > 0) {
+    filterParts.push(`blur(${safeAdjustments.blur}px)`);
+  }
+  if (safeAdjustments.temperature !== 0) {
+    filterParts.push(`hue-rotate(${safeAdjustments.temperature * 0.3}deg)`);
+    if (safeAdjustments.temperature > 0) {
+      filterParts.push(`sepia(${safeAdjustments.temperature * 0.2}%)`);
+    }
+  }
+  const computedFilter = filterParts.length > 0 ? filterParts.join(" ") : undefined;
+
+  // Compute transform
+  const transformList: string[] = [];
+  if (safeFraming.x !== 0 || safeFraming.y !== 0) {
+    transformList.push(`translate3d(${safeFraming.x}%, ${safeFraming.y}%, 0)`);
+  }
+  if (safeFraming.scale !== 1) {
+    transformList.push(`scale(${safeFraming.scale})`);
+  }
+  if (safeFraming.rotation && safeFraming.rotation !== 0) {
+    transformList.push(`rotate(${safeFraming.rotation}deg)`);
+  }
+  if (safeFraming.flip_h || safeFraming.flip_v) {
+    transformList.push(`scale(${safeFraming.flip_h ? -1 : 1}, ${safeFraming.flip_v ? -1 : 1})`);
+  }
+  const computedTransform = transformList.length > 0 ? transformList.join(" ") : undefined;
+
   const cropFocusX = 50 - safeFraming.x;
   const cropFocusY = 50 - safeFraming.y;
   const centerCropFramingStyle: CSSProperties = {
+    objectFit: "cover",
     objectPosition: `${cropFocusX}% ${cropFocusY}%`,
-    transform: `scale(${safeFraming.scale})`,
+    transform: computedTransform || `scale(${safeFraming.scale})`,
     transformOrigin: `${cropFocusX}% ${cropFocusY}%`,
+    opacity: safeFraming.opacity,
+    filter: computedFilter,
     transition: "object-position 120ms ease-out, transform 120ms ease-out",
   };
-  const containedForegroundFramingStyle: CSSProperties = {
-    transform: `translate3d(${safeFraming.x}%, ${safeFraming.y}%, 0) scale(${safeFraming.scale})`,
+
+  const podcastCropX = 50 - safeFraming.x;
+  const podcastCropY = 32 - safeFraming.y;
+  const cleanPodcastFramingStyle: CSSProperties = {
+    objectFit: "cover",
+    objectPosition: `${podcastCropX}% ${podcastCropY}%`,
+    transform: computedTransform || `scale(${Math.max(1.05, safeFraming.scale)})`,
+    transformOrigin: `${podcastCropX}% ${podcastCropY}%`,
+    opacity: safeFraming.opacity,
+    filter: computedFilter,
+    transition: "object-position 120ms ease-out, transform 120ms ease-out",
+  };
+
+  const talkingHeadCropX = 50 - safeFraming.x;
+  const talkingHeadCropY = 24 - safeFraming.y;
+  const talkingHeadFramingStyle: CSSProperties = {
+    objectFit: "cover",
+    objectPosition: `${talkingHeadCropX}% ${talkingHeadCropY}%`,
+    transform: computedTransform || `scale(${Math.max(1.15, safeFraming.scale)})`,
+    transformOrigin: `${talkingHeadCropX}% ${talkingHeadCropY}%`,
+    opacity: safeFraming.opacity,
+    filter: computedFilter,
+    transition: "object-position 120ms ease-out, transform 120ms ease-out",
+  };
+
+  const studioPodcastFramingStyle: CSSProperties = {
+    objectFit: "contain",
+    transform:
+      computedTransform ||
+      `translate3d(${safeFraming.x}%, ${safeFraming.y}%, 0) scale(${Math.max(1.05, safeFraming.scale)})`,
     transformOrigin: "center center",
+    opacity: safeFraming.opacity,
+    filter: computedFilter,
     transition: "transform 120ms ease-out",
   };
+
+  const containedForegroundFramingStyle: CSSProperties = {
+    objectFit: "contain",
+    transform:
+      computedTransform ||
+      `translate3d(${safeFraming.x}%, ${safeFraming.y}%, 0) scale(${safeFraming.scale})`,
+    transformOrigin: "center center",
+    opacity: safeFraming.opacity,
+    filter: computedFilter,
+    transition: "transform 120ms ease-out",
+  };
+
+  const fitFramingStyle: CSSProperties = {
+    objectFit: "contain",
+    transform: computedTransform,
+    transformOrigin: "center center",
+    opacity: safeFraming.opacity,
+    filter: computedFilter,
+    transition: "transform 120ms ease-out",
+  };
+
   const playbackProps = {
-    onPlay,
-    onPause,
+    onPlay: () => {
+      const el = localVideoRef.current;
+      if (el && el.playbackRate !== clampedSpeed) {
+        el.playbackRate = clampedSpeed;
+      }
+      if (bgVideoRef.current) {
+        bgVideoRef.current.playbackRate = clampedSpeed;
+        bgVideoRef.current.currentTime = el?.currentTime || 0;
+        void bgVideoRef.current.play().catch(() => {});
+      }
+      onPlay?.();
+    },
+    onPause: () => {
+      if (bgVideoRef.current) {
+        bgVideoRef.current.pause();
+        syncBgVideo();
+      }
+      onPause?.();
+    },
     onLoadedMetadata: (event: SyntheticEvent<HTMLVideoElement>) => {
       event.currentTarget.volume = Math.min(1, Math.max(0, audioVolume));
+      event.currentTarget.playbackRate = clampedSpeed;
+      if (bgVideoRef.current) {
+        bgVideoRef.current.playbackRate = clampedSpeed;
+        bgVideoRef.current.currentTime = event.currentTarget.currentTime;
+      }
       onLoadedMetadata?.(event.currentTarget.currentTime);
     },
-    onTimeUpdate: (event: SyntheticEvent<HTMLVideoElement>) =>
-      onTimeUpdate?.(event.currentTarget.currentTime),
-    onSeeked: (event: SyntheticEvent<HTMLVideoElement>) =>
-      onSeeked?.(event.currentTarget.currentTime),
+    onTimeUpdate: (event: SyntheticEvent<HTMLVideoElement>) => {
+      syncBgVideo();
+      onTimeUpdate?.(event.currentTarget.currentTime);
+    },
+    onSeeked: (event: SyntheticEvent<HTMLVideoElement>) => {
+      if (bgVideoRef.current) {
+        bgVideoRef.current.currentTime = event.currentTarget.currentTime;
+      }
+      onSeeked?.(event.currentTarget.currentTime);
+    },
   };
-  if (preset === "center_crop") {
-    return (
-      <video
-        className={`h-full w-full object-cover ${className}`}
-        controls={controls}
-        muted={!controls || audioMuted}
-        preload="metadata"
-        ref={videoRef}
-        src={src}
-        style={centerCropFramingStyle}
-        {...playbackProps}
-      />
-    );
-  }
-  if (preset === "fit_background") {
-    return (
-      <video
-        className={`h-full w-full bg-black object-contain ${className}`}
-        controls={controls}
-        muted={!controls || audioMuted}
-        preload="metadata"
-        ref={videoRef}
-        src={src}
-        {...playbackProps}
-      />
-    );
-  }
+
   return (
-    <div className={`relative h-full w-full overflow-hidden bg-black ${className}`}>
-      <video
-        className="absolute inset-0 h-full w-full scale-110 object-cover blur-xl opacity-75"
-        muted
-        preload="metadata"
-        src={src}
-      />
-      <video
-        className={
-          preset === "picture_in_picture"
-            ? "absolute bottom-4 left-1/2 h-[46%] w-[82%] -translate-x-1/2 rounded-lg border-2 border-white/80 bg-black object-contain shadow-xl"
-            : "relative h-full w-full object-contain"
-        }
-        controls={controls}
-        muted={!controls || audioMuted}
-        preload="metadata"
-        ref={videoRef}
-        src={src}
-        style={preset === "blurred_background" ? containedForegroundFramingStyle : undefined}
-        {...playbackProps}
-      />
+    <div
+      className={`relative h-full w-full overflow-hidden ${className}`}
+      style={{ backgroundColor: bgColor }}
+    >
+      {blurBgEnabled && (
+        <video
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-0 h-full w-full scale-125 object-cover opacity-80"
+          style={{ filter: `blur(${blurPx}px)` }}
+          muted
+          playsInline
+          preload="auto"
+          ref={bgVideoRef}
+          src={src}
+        />
+      )}
+      {preset === "center_crop" ? (
+        <video
+          className="h-full w-full object-cover"
+          controls={controls}
+          muted={!controls || audioMuted}
+          preload="metadata"
+          ref={setCombinedRef}
+          src={src}
+          style={centerCropFramingStyle}
+          {...playbackProps}
+        />
+      ) : preset === "clean_podcast" ? (
+        <video
+          className="h-full w-full object-cover"
+          controls={controls}
+          muted={!controls || audioMuted}
+          preload="metadata"
+          ref={setCombinedRef}
+          src={src}
+          style={cleanPodcastFramingStyle}
+          {...playbackProps}
+        />
+      ) : preset === "talking_head" ? (
+        <video
+          className="h-full w-full object-cover"
+          controls={controls}
+          muted={!controls || audioMuted}
+          preload="metadata"
+          ref={setCombinedRef}
+          src={src}
+          style={talkingHeadFramingStyle}
+          {...playbackProps}
+        />
+      ) : preset === "studio_podcast" ? (
+        <video
+          className="h-full w-full object-contain"
+          controls={controls}
+          muted={!controls || audioMuted}
+          preload="metadata"
+          ref={setCombinedRef}
+          src={src}
+          style={studioPodcastFramingStyle}
+          {...playbackProps}
+        />
+      ) : preset === "fit_background" ? (
+        <video
+          className="h-full w-full object-contain"
+          controls={controls}
+          muted={!controls || audioMuted}
+          preload="metadata"
+          ref={setCombinedRef}
+          src={src}
+          style={fitFramingStyle}
+          {...playbackProps}
+        />
+      ) : (
+        <video
+          className={
+            preset === "picture_in_picture"
+              ? "absolute bottom-4 left-1/2 h-[46%] w-[82%] -translate-x-1/2 rounded-xl border-2 border-white/80 bg-black object-contain shadow-2xl"
+              : "relative h-full w-full object-contain"
+          }
+          controls={controls}
+          muted={!controls || audioMuted}
+          preload="metadata"
+          ref={setCombinedRef}
+          src={src}
+          style={containedForegroundFramingStyle}
+          {...playbackProps}
+        />
+      )}
+      {safeAdjustments.vignette > 0 && (
+        <div
+          className="pointer-events-none absolute inset-0"
+          style={{
+            background: `radial-gradient(circle, transparent 40%, rgba(0,0,0,${
+              safeAdjustments.vignette / 100
+            }) 100%)`,
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+type VideoFramingPresetDefinition = {
+  id: string;
+  label: string;
+  subLabel: string;
+  desc: string;
+  renderPreset: RenderPreset;
+  clipperStylePreset?: string;
+  blurBackground?: boolean;
+};
+
+const videoFramingPresets: VideoFramingPresetDefinition[] = [
+  {
+    id: "blurred_background",
+    label: "Latar Buram",
+    subLabel: "Fit + Blur BG",
+    desc: "Video landscape di tengah dengan latar blur vertikal",
+    renderPreset: "blurred_background",
+    clipperStylePreset: "blurred_background",
+    blurBackground: true,
+  },
+  {
+    id: "center_crop",
+    label: "Potong Tengah",
+    subLabel: "Fill 9:16 Crop",
+    desc: "Center crop fokus subjek utama memenuhi layar",
+    renderPreset: "center_crop",
+    clipperStylePreset: "center_crop",
+    blurBackground: false,
+  },
+  {
+    id: "fit_background",
+    label: "Video Penuh",
+    subLabel: "Fit Letterbox",
+    desc: "Seluruh frame terlihat dengan letterbox atas-bawah",
+    renderPreset: "fit_background",
+    clipperStylePreset: "fit_background",
+    blurBackground: false,
+  },
+  {
+    id: "clean_podcast",
+    label: "Clean Podcast",
+    subLabel: "Portrait Headshot",
+    desc: "Framing rapi untuk podcast portrait 9:16",
+    renderPreset: "center_crop",
+    clipperStylePreset: "clean_podcast",
+    blurBackground: false,
+  },
+  {
+    id: "studio_podcast",
+    label: "Studio Podcast",
+    subLabel: "Studio Blur BG",
+    desc: "Framing studio podcast dengan background blur & video proporsional",
+    renderPreset: "blurred_background",
+    clipperStylePreset: "studio_podcast",
+    blurBackground: true,
+  },
+  {
+    id: "talking_head",
+    label: "Talking Head",
+    subLabel: "Presenter Focus",
+    desc: "Fokus portrait presenter / creator di area atas kanvas",
+    renderPreset: "center_crop",
+    clipperStylePreset: "talking_head",
+    blurBackground: false,
+  },
+  {
+    id: "picture_in_picture",
+    label: "Picture in Picture",
+    subLabel: "Inset Video (PiP)",
+    desc: "Video inset kecil di atas latar canvas",
+    renderPreset: "picture_in_picture",
+    clipperStylePreset: "picture_in_picture",
+    blurBackground: false,
+  },
+];
+
+function FramingThumbnailPreview({ presetId }: { presetId: string }) {
+  if (presetId === "blurred_background") {
+    return (
+      <div className="relative aspect-[9/16] h-[68px] w-[38px] shrink-0 overflow-hidden rounded bg-slate-950 border border-zinc-700/60 shadow-inner flex items-center justify-center">
+        {/* Blurred background representation */}
+        <div className="absolute inset-0 bg-gradient-to-tr from-cyan-900/70 via-indigo-900/60 to-blue-800/70 blur-[3px] scale-125 opacity-80" />
+        {/* Centered horizontal letterbox video bar */}
+        <div className="relative z-10 w-[92%] h-[38%] rounded-[2px] bg-gradient-to-r from-blue-500 to-indigo-500 border border-white/50 shadow flex items-center justify-center">
+          <span className="text-[7px] font-black text-white/90 leading-none">16:9</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (presetId === "center_crop") {
+    return (
+      <div className="relative aspect-[9/16] h-[68px] w-[38px] shrink-0 overflow-hidden rounded bg-gradient-to-b from-blue-600 via-indigo-600 to-cyan-600 border border-zinc-700/60 shadow-inner flex items-center justify-center">
+        {/* Full 9:16 fill with center crop guide */}
+        <div className="w-[82%] h-[88%] rounded-[2px] border border-dashed border-white/70 bg-white/10 flex flex-col items-center justify-center">
+          <div className="size-3 rounded-full bg-white/40 mb-0.5" />
+          <div className="w-4 h-1.5 rounded-t-full bg-white/40" />
+        </div>
+      </div>
+    );
+  }
+
+  if (presetId === "fit_background") {
+    return (
+      <div className="relative aspect-[9/16] h-[68px] w-[38px] shrink-0 overflow-hidden rounded bg-black border border-zinc-700/60 shadow-inner flex flex-col justify-between py-1 items-center">
+        {/* Dark letterbox top band */}
+        <div className="w-full h-1.5 bg-zinc-900/80" />
+        {/* Centered horizontal video */}
+        <div className="w-[92%] h-[40%] rounded-[2px] bg-blue-600 border border-zinc-500 shadow flex items-center justify-center">
+          <span className="text-[6px] font-black text-white/90 leading-none">FIT</span>
+        </div>
+        {/* Dark letterbox bottom band */}
+        <div className="w-full h-1.5 bg-zinc-900/80" />
+      </div>
+    );
+  }
+
+  if (presetId === "clean_podcast") {
+    return (
+      <div className="relative aspect-[9/16] h-[68px] w-[38px] shrink-0 overflow-hidden rounded bg-zinc-900 border border-zinc-700/60 shadow-inner flex items-center justify-center">
+        {/* Clean podcast safe area + portrait silhouette */}
+        <div className="w-[84%] h-[88%] rounded-[3px] border border-cyan-500/40 bg-cyan-950/20 flex flex-col items-center justify-center p-0.5">
+          <div className="size-3.5 rounded-full bg-cyan-400/60 mb-0.5" />
+          <div className="w-5 h-2 rounded-t-full bg-cyan-400/50" />
+          <div className="mt-0.5 w-5 h-1 rounded bg-amber-400/70" />
+        </div>
+      </div>
+    );
+  }
+
+  if (presetId === "studio_podcast") {
+    return (
+      <div className="relative aspect-[9/16] h-[68px] w-[38px] shrink-0 overflow-hidden rounded bg-slate-950 border border-zinc-700/60 shadow-inner flex items-center justify-center">
+        {/* Studio blur gradient */}
+        <div className="absolute inset-0 bg-gradient-to-tr from-cyan-950 via-slate-900 to-indigo-950 blur-[2px] scale-125 opacity-90" />
+        {/* Centered studio box with mic icon */}
+        <div className="relative z-10 w-[88%] h-[50%] rounded-[2px] bg-zinc-900/90 border border-cyan-500/50 shadow flex flex-col items-center justify-center">
+          <span className="text-[9px] leading-none mb-0.5">🎙️</span>
+          <span className="text-[5.5px] font-black text-cyan-300 leading-none">STUDIO</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (presetId === "talking_head") {
+    return (
+      <div className="relative aspect-[9/16] h-[68px] w-[38px] shrink-0 overflow-hidden rounded bg-gradient-to-b from-slate-900 via-indigo-950 to-zinc-950 border border-zinc-700/60 shadow-inner flex flex-col items-center pt-1.5">
+        {/* Upper presenter portrait focus */}
+        <div className="w-[78%] h-[65%] rounded-[3px] border border-cyan-400/80 bg-cyan-900/30 flex flex-col items-center justify-center shadow-sm">
+          <div className="size-3.5 rounded-full bg-cyan-400/80 mb-0.5 ring-1 ring-cyan-300/40" />
+          <div className="w-5 h-2 rounded-t-full bg-cyan-400/70" />
+        </div>
+        <div className="mt-1 w-6 h-1 rounded bg-zinc-700/60" />
+      </div>
+    );
+  }
+
+  if (presetId === "picture_in_picture") {
+    return (
+      <div className="relative aspect-[9/16] h-[68px] w-[38px] shrink-0 overflow-hidden rounded bg-zinc-950 border border-zinc-700/60 shadow-inner p-0.5 flex flex-col justify-between">
+        {/* Main background canvas */}
+        <div className="w-full h-[40%] rounded-[2px] bg-zinc-800/70 border border-zinc-700/50" />
+        {/* Small Inset Video (PiP) */}
+        <div className="w-[84%] mx-auto h-[44%] rounded-[2px] bg-blue-600 border border-white/90 shadow-md flex items-center justify-center">
+          <span className="text-[6px] font-black text-white leading-none">PiP</span>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="aspect-[9/16] h-[68px] w-[38px] shrink-0 rounded bg-zinc-800 border border-zinc-700 flex items-center justify-center text-xs text-zinc-400">
+      📱
+    </div>
+  );
+}
+
+function TransitionThumbnailPreview({
+  transitionId,
+  isDemoing,
+}: {
+  transitionId: string;
+  isDemoing?: boolean;
+}) {
+  const animClass = isDemoing ? "animate-pulse scale-105" : "";
+
+  if (transitionId === "tr-cut") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-zinc-950 border border-zinc-700/60 shadow-inner flex items-center justify-center ${animClass}`}>
+        <div className="absolute inset-y-0 left-0 w-1/2 bg-blue-600/70 flex items-center justify-center">
+          <span className="text-[9px] font-black text-white/80">A</span>
+        </div>
+        <div className="absolute inset-y-0 right-0 w-1/2 bg-purple-600/70 flex items-center justify-center">
+          <span className="text-[9px] font-black text-white/80">B</span>
+        </div>
+        <div className="relative z-10 h-full w-[2px] bg-white shadow flex items-center justify-center">
+          <span className="text-[10px] bg-zinc-900 rounded-full px-0.5 border border-white/60">✂️</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (transitionId === "tr-fade") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-black border border-zinc-700/60 shadow-inner flex items-center justify-center ${animClass}`}>
+        <div className="absolute inset-0 bg-gradient-to-r from-blue-700/40 via-black to-indigo-700/40" />
+        <div className="relative z-10 size-8 rounded-full bg-black/90 border border-zinc-700/80 flex items-center justify-center shadow-lg">
+          <div className="size-4 rounded-full bg-black border border-zinc-600" />
+        </div>
+      </div>
+    );
+  }
+
+  if (transitionId === "tr-fade-white") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-indigo-950 border border-zinc-700/60 shadow-inner flex items-center justify-center ${animClass}`}>
+        <div className="absolute inset-0 bg-gradient-to-r from-blue-900/60 via-white/80 to-purple-900/60" />
+        <div className="relative z-10 size-8 rounded-full bg-white/90 shadow-xl flex items-center justify-center">
+          <div className="size-3 rounded-full bg-white ring-2 ring-white/60" />
+        </div>
+      </div>
+    );
+  }
+
+  if (transitionId === "tr-cross") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-zinc-950 border border-zinc-700/60 shadow-inner flex items-center justify-center ${animClass}`}>
+        <div className="absolute left-2 size-9 rounded bg-cyan-500/60 border border-cyan-300/60 flex items-center justify-center text-[8px] font-black text-white">
+          A
+        </div>
+        <div className="absolute right-2 size-9 rounded bg-fuchsia-500/60 border border-fuchsia-300/60 flex items-center justify-center text-[8px] font-black text-white">
+          B
+        </div>
+        <div className="relative z-10 text-[11px] font-black text-white bg-black/50 px-1 py-0.5 rounded border border-white/20">
+          🔀
+        </div>
+      </div>
+    );
+  }
+
+  if (transitionId === "tr-flash") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-slate-950 border border-zinc-700/60 shadow-inner flex items-center justify-center ${animClass}`}>
+        <div className="absolute inset-0 bg-radial from-white via-cyan-400/40 to-transparent" />
+        <div className="relative z-10 flex size-9 items-center justify-center rounded-full bg-white/90 shadow-[0_0_15px_rgba(255,255,255,0.9)]">
+          <span className="text-sm">⚡</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (transitionId === "tr-slide-l") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-zinc-950 border border-zinc-700/60 shadow-inner flex items-center justify-between px-2 ${animClass}`}>
+        <div className="h-9 w-9 rounded bg-blue-600/80 border border-blue-400/60 flex items-center justify-center text-[8px] font-bold text-white shadow">
+          A
+        </div>
+        <div className="flex items-center text-cyan-400 font-black text-sm animate-pulse">
+          ⬅️
+        </div>
+        <div className="h-9 w-9 rounded bg-indigo-600/80 border border-indigo-400/60 flex items-center justify-center text-[8px] font-bold text-white shadow">
+          B
+        </div>
+      </div>
+    );
+  }
+
+  if (transitionId === "tr-slide-r") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-zinc-950 border border-zinc-700/60 shadow-inner flex items-center justify-between px-2 ${animClass}`}>
+        <div className="h-9 w-9 rounded bg-indigo-600/80 border border-indigo-400/60 flex items-center justify-center text-[8px] font-bold text-white shadow">
+          A
+        </div>
+        <div className="flex items-center text-cyan-400 font-black text-sm animate-pulse">
+          ➡️
+        </div>
+        <div className="h-9 w-9 rounded bg-blue-600/80 border border-blue-400/60 flex items-center justify-center text-[8px] font-bold text-white shadow">
+          B
+        </div>
+      </div>
+    );
+  }
+
+  if (transitionId === "tr-slide-u") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-zinc-950 border border-zinc-700/60 shadow-inner flex flex-col items-center justify-between py-1 ${animClass}`}>
+        <div className="h-4 w-16 rounded bg-blue-600/80 border border-blue-400/60 flex items-center justify-center text-[7px] font-bold text-white">
+          A
+        </div>
+        <div className="text-cyan-400 font-black text-xs">⬆️</div>
+        <div className="h-4 w-16 rounded bg-purple-600/80 border border-purple-400/60 flex items-center justify-center text-[7px] font-bold text-white">
+          B
+        </div>
+      </div>
+    );
+  }
+
+  if (transitionId === "tr-slide-d") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-zinc-950 border border-zinc-700/60 shadow-inner flex flex-col items-center justify-between py-1 ${animClass}`}>
+        <div className="h-4 w-16 rounded bg-purple-600/80 border border-purple-400/60 flex items-center justify-center text-[7px] font-bold text-white">
+          A
+        </div>
+        <div className="text-cyan-400 font-black text-xs">⬇️</div>
+        <div className="h-4 w-16 rounded bg-blue-600/80 border border-blue-400/60 flex items-center justify-center text-[7px] font-bold text-white">
+          B
+        </div>
+      </div>
+    );
+  }
+
+  if (transitionId === "tr-zoom-in") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-zinc-950 border border-zinc-700/60 shadow-inner flex items-center justify-center ${animClass}`}>
+        <div className="absolute size-12 rounded border border-dashed border-cyan-500/40" />
+        <div className="absolute size-8 rounded border border-dashed border-cyan-400/70 bg-cyan-950/30" />
+        <div className="relative z-10 size-4 rounded bg-cyan-400 shadow flex items-center justify-center text-[7px] font-black text-black">
+          +
+        </div>
+      </div>
+    );
+  }
+
+  if (transitionId === "tr-zoom-out") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-zinc-950 border border-zinc-700/60 shadow-inner flex items-center justify-center ${animClass}`}>
+        <div className="absolute size-4 rounded bg-indigo-500/60 border border-indigo-400/70" />
+        <div className="relative z-10 size-10 rounded border border-dashed border-indigo-300/80 flex items-center justify-center text-[8px] font-black text-indigo-300">
+          -
+        </div>
+      </div>
+    );
+  }
+
+  if (transitionId === "tr-cross-zoom") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-slate-950 border border-zinc-700/60 shadow-inner flex items-center justify-center ${animClass}`}>
+        <div className="absolute inset-0 bg-radial from-cyan-500/50 via-purple-600/30 to-transparent blur-[2px]" />
+        <div className="relative z-10 size-8 rounded-full border-2 border-dashed border-white/80 flex items-center justify-center shadow-lg">
+          <span className="text-xs">🌀</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (transitionId === "tr-blur-fade") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-slate-900 border border-zinc-700/60 shadow-inner flex items-center justify-center ${animClass}`}>
+        <div className="absolute inset-2 rounded bg-gradient-to-tr from-cyan-600 to-indigo-600 blur-[4px] opacity-80" />
+        <div className="relative z-10 rounded-md bg-black/40 px-2 py-0.5 backdrop-blur-sm border border-white/30 text-[9px] font-bold text-white">
+          🌫️ Blur
+        </div>
+      </div>
+    );
+  }
+
+  if (transitionId === "tr-radial-blur") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-zinc-950 border border-zinc-700/60 shadow-inner flex items-center justify-center ${animClass}`}>
+        <div className="absolute size-11 rounded-full border-2 border-dashed border-cyan-400/60 animate-spin" />
+        <div className="relative z-10 size-6 rounded-full bg-gradient-to-tr from-cyan-500 to-indigo-500 flex items-center justify-center text-[9px]">
+          💫
+        </div>
+      </div>
+    );
+  }
+
+  if (transitionId === "tr-glitch") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-black border border-zinc-700/60 shadow-inner flex flex-col justify-center gap-0.5 px-2 ${animClass}`}>
+        <div className="h-2 w-full bg-cyan-400/80 -translate-x-1 shadow-[0_0_8px_rgba(34,211,238,0.8)]" />
+        <div className="h-3 w-full bg-fuchsia-500/80 translate-x-1 flex items-center justify-center text-[7px] font-mono font-black text-black">
+          GLITCH
+        </div>
+        <div className="h-1.5 w-full bg-amber-400/80 -translate-x-0.5" />
+      </div>
+    );
+  }
+
+  if (transitionId === "tr-scanline") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-slate-950 border border-zinc-700/60 shadow-inner flex flex-col justify-between py-1 px-1.5 ${animClass}`}>
+        <div className="h-0.5 w-full bg-cyan-400/40" />
+        <div className="h-0.5 w-full bg-cyan-400/70" />
+        <div className="text-center font-mono text-[8px] font-bold text-cyan-300">
+          📺 CRT SCAN
+        </div>
+        <div className="h-0.5 w-full bg-cyan-400/70" />
+        <div className="h-0.5 w-full bg-cyan-400/40" />
+      </div>
+    );
+  }
+
+  if (transitionId === "tr-wipe-l") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-zinc-950 border border-zinc-700/60 shadow-inner flex items-center ${animClass}`}>
+        <div className="h-full w-3/5 bg-gradient-to-r from-blue-700 to-cyan-500 flex items-center justify-center text-[8px] font-bold text-white shadow-md">
+          WIPE
+        </div>
+        <div className="h-full w-2/5 bg-zinc-900" />
+      </div>
+    );
+  }
+
+  if (transitionId === "tr-clock-wipe") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-zinc-950 border border-zinc-700/60 shadow-inner flex items-center justify-center ${animClass}`}>
+        <div className="size-10 rounded-full bg-gradient-to-tr from-cyan-500 via-indigo-600 to-zinc-900 border border-white/40 flex items-center justify-center">
+          <div className="size-1 rounded-full bg-white shadow" />
+          <div className="absolute h-4 w-0.5 bg-white origin-bottom -translate-y-2" />
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="h-16 w-full rounded-md bg-zinc-900 border border-zinc-700 flex items-center justify-center text-xs text-zinc-400">
+      🎞️
+    </div>
+  );
+}
+
+function EffectThumbnailPreview({
+  effectId,
+  isDemoing,
+}: {
+  effectId: string;
+  isDemoing?: boolean;
+}) {
+  const animClass = isDemoing ? "animate-pulse scale-105" : "";
+
+  if (effectId === "ef-punch") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-slate-950 border border-zinc-700/60 shadow-inner flex items-center justify-center ${animClass}`}>
+        <div className="absolute size-11 rounded-full border border-dashed border-cyan-400/80 bg-cyan-950/30 flex items-center justify-center">
+          <div className="size-5 rounded-full bg-cyan-400/50" />
+        </div>
+        <div className="relative z-10 rounded bg-cyan-500 px-1 py-0.2 text-[7px] font-black text-black shadow">
+          1.25x
+        </div>
+      </div>
+    );
+  }
+
+  if (effectId === "ef-quick-zoom") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-zinc-950 border border-zinc-700/60 shadow-inner p-1.5 flex flex-col justify-between ${animClass}`}>
+        <div className="flex justify-between text-cyan-400 font-mono text-[8px] leading-none">
+          <span>⌜</span>
+          <span>⌝</span>
+        </div>
+        <div className="mx-auto size-7 rounded bg-blue-600/70 border border-cyan-400/70 flex items-center justify-center text-[8px] font-black text-white shadow">
+          🔍
+        </div>
+        <div className="flex justify-between text-cyan-400 font-mono text-[8px] leading-none">
+          <span>⌞</span>
+          <span>⌟</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (effectId === "ef-pattern") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-zinc-950 border border-zinc-700/60 shadow-inner flex items-center justify-center gap-1.5 ${animClass}`}>
+        <div className="h-10 w-2.5 -skew-x-12 bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.6)]" />
+        <div className="h-10 w-2.5 -skew-x-12 bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.6)]" />
+        <div className="h-10 w-2.5 -skew-x-12 bg-fuchsia-500 shadow-[0_0_8px_rgba(217,70,239,0.6)]" />
+      </div>
+    );
+  }
+
+  if (effectId === "ef-flash") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-slate-950 border border-zinc-700/60 shadow-inner flex items-center justify-center ${animClass}`}>
+        <div className="absolute inset-0 bg-radial from-white via-amber-300/40 to-transparent" />
+        <div className="relative z-10 size-8 rounded-full bg-white shadow-[0_0_16px_rgba(255,255,255,1)] flex items-center justify-center">
+          <span className="text-xs">✨</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (effectId === "ef-light-leak") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-slate-950 border border-zinc-700/60 shadow-inner flex items-center justify-center ${animClass}`}>
+        <div className="absolute -top-3 -right-3 size-14 rounded-full bg-gradient-to-br from-amber-400 via-rose-500 to-transparent blur-[4px] opacity-90" />
+        <div className="absolute -bottom-3 -left-3 size-12 rounded-full bg-gradient-to-tr from-cyan-400 to-transparent blur-[4px] opacity-70" />
+        <div className="relative z-10 rounded bg-black/40 px-1.5 py-0.5 border border-white/20 text-[8px] font-bold text-amber-200">
+          💡 Flare
+        </div>
+      </div>
+    );
+  }
+
+  if (effectId === "ef-shake") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-zinc-950 border border-zinc-700/60 shadow-inner flex items-center justify-center ${animClass}`}>
+        <div className="absolute size-9 rounded border border-rose-500/80 -translate-x-1.5 -translate-y-0.5 opacity-70" />
+        <div className="absolute size-9 rounded border border-cyan-400/80 translate-x-1.5 translate-y-0.5 opacity-70" />
+        <div className="relative z-10 size-9 rounded border border-white/90 bg-zinc-800/80 flex items-center justify-center text-xs shadow-md">
+          📳
+        </div>
+      </div>
+    );
+  }
+
+  if (effectId === "ef-earthquake") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-zinc-950 border border-zinc-700/60 shadow-inner flex flex-col items-center justify-center ${animClass}`}>
+        <div className="text-[9px] font-black text-rose-400 tracking-wider">
+          ⚡ RUMBLE ⚡
+        </div>
+        <div className="mt-0.5 flex gap-1 items-center">
+          <span className="text-xs">🌋</span>
+          <div className="h-1.5 w-10 rounded bg-gradient-to-r from-rose-500 via-amber-400 to-rose-500 animate-pulse" />
+        </div>
+      </div>
+    );
+  }
+
+  if (effectId === "ef-blur-pulse") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-slate-900 border border-zinc-700/60 shadow-inner flex items-center justify-center ${animClass}`}>
+        <div className="absolute inset-1 rounded bg-gradient-to-tr from-cyan-600 via-indigo-600 to-purple-600 blur-[5px] opacity-80" />
+        <div className="relative z-10 size-6 rounded-full bg-cyan-300/80 border border-white shadow flex items-center justify-center text-[8px]">
+          🌫️
+        </div>
+      </div>
+    );
+  }
+
+  if (effectId === "ef-soft-glow") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-slate-950 border border-zinc-700/60 shadow-inner flex items-center justify-center ${animClass}`}>
+        <div className="absolute inset-0 bg-gradient-to-tr from-rose-950/60 via-purple-900/50 to-cyan-950/60 blur-[3px]" />
+        <div className="relative z-10 size-7 rounded-full bg-rose-400/70 border border-white/60 shadow-[0_0_12px_rgba(251,113,133,0.8)] flex items-center justify-center text-[9px]">
+          🌸
+        </div>
+      </div>
+    );
+  }
+
+  if (effectId === "ef-glitch-pop") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-black border border-zinc-700/60 shadow-inner flex flex-col justify-center gap-0.5 px-2 ${animClass}`}>
+        <div className="h-2 w-4/5 bg-cyan-400/90 shadow-[0_0_6px_rgba(34,211,238,0.8)] translate-x-2" />
+        <div className="h-3 w-full bg-fuchsia-600/90 -translate-x-1 flex items-center justify-center text-[7px] font-mono font-black text-white">
+          POP
+        </div>
+        <div className="h-2 w-3/5 bg-amber-400/90 translate-x-1" />
+      </div>
+    );
+  }
+
+  if (effectId === "ef-digital-noise") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-zinc-950 border border-zinc-700/60 shadow-inner flex flex-col items-center justify-center gap-1 p-1 ${animClass}`}>
+        <div className="font-mono text-[8px] font-bold text-emerald-400 tracking-widest">
+          01011001
+        </div>
+        <div className="h-1 w-full bg-emerald-500/40" />
+        <div className="font-mono text-[7px] text-zinc-400">
+          DIGITAL NOISE
+        </div>
+      </div>
+    );
+  }
+
+  if (effectId === "ef-freeze-flash") {
+    return (
+      <div className={`relative h-16 w-full overflow-hidden rounded-md bg-sky-950 border border-zinc-700/60 shadow-inner flex items-center justify-center ${animClass}`}>
+        <div className="absolute inset-0 bg-gradient-to-tr from-cyan-400/40 via-sky-200/50 to-white/70" />
+        <div className="relative z-10 flex items-center gap-1 rounded bg-black/60 px-1.5 py-0.5 border border-cyan-300 text-[8px] font-bold text-cyan-200 shadow">
+          <span>❄️</span>
+          <span>FREEZE</span>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="h-16 w-full rounded-md bg-zinc-900 border border-zinc-700 flex items-center justify-center text-xs text-zinc-400">
+      ✨
     </div>
   );
 }
 
 export function TransformationPage() {
   const { transformationId = "" } = useParams();
-  const navigate = useNavigate();
   const layout = useOutletContext<LayoutOutletContext>();
   const client = useQueryClient();
   const [draft, setDraft] = useState<Transformation>();
   const [report, setReport] = useState<OriginalityReport>();
   const [render, setRender] = useState<Render>();
   const [preset, setPreset] = useState<RenderPreset>("blurred_background");
+  const [spokenLanguage, setSpokenLanguage] = useState<string>("id");
+  const [bilingualMode, setBilingualMode] = useState<string>("none");
+  const [identifyFillerWords, setIdentifyFillerWords] = useState<boolean>(false);
+  const [deleteCurrentCaptions, setDeleteCurrentCaptions] = useState<boolean>(true);
+  const [autoCaptionGenerating, setAutoCaptionGenerating] = useState<boolean>(false);
+  const [autoCaptionError, setAutoCaptionError] = useState<string>("");
   const subtitleLanguage = "id" as const;
   const [captionCopied, setCaptionCopied] = useState(false);
   const [uploadTitle, setUploadTitle] = useState("");
@@ -1640,10 +3343,36 @@ export function TransformationPage() {
     percent: number;
     time: number;
   } | null>(null);
-  const [timelineZoom, setTimelineZoom] = useState(1);
+  const [timelineZoomPercent, setTimelineZoomPercent] = useState<number>(() => {
+    try {
+      const saved = Number(window.localStorage.getItem("xa_timeline_zoom_percent"));
+      if (Number.isFinite(saved) && saved >= 25 && saved <= 400) {
+        return Math.round(saved / 25) * 25;
+      }
+    } catch {
+      // fallback to default 100%
+    }
+    return 100;
+  });
+
+  const updateTimelineZoomPercent = (value: number | ((prev: number) => number)) => {
+    setTimelineZoomPercent((prev) => {
+      const nextRaw = typeof value === "function" ? value(prev) : value;
+      const clamped = Math.max(25, Math.min(400, Math.round(nextRaw / 25) * 25));
+      try {
+        window.localStorage.setItem("xa_timeline_zoom_percent", String(clamped));
+      } catch {
+        // ignore
+      }
+      return clamped;
+    });
+  };
+
+  const timelineZoom = timelineZoomPercent / 100;
+  const [timelineAddMenuOpen, setTimelineAddMenuOpen] = useState(false);
   const [timelineHeight, setTimelineHeight] = useState(() => {
     const saved = Number(window.localStorage.getItem("autoclip-timeline-height"));
-    return Number.isFinite(saved) && saved >= 220 ? saved : 320;
+    return Number.isFinite(saved) && saved >= 180 ? saved : 230;
   });
   const [editorTheme, setEditorTheme] = useState<"dark" | "light">(() =>
     window.localStorage.getItem("autoclip-editor-theme") === "light" ? "light" : "dark",
@@ -1661,10 +3390,89 @@ export function TransformationPage() {
   const [selectedCaptionId, setSelectedCaptionId] = useState<string | null>(null);
   const [selectedMediaSegmentId, setSelectedMediaSegmentId] = useState<string | null>(null);
   const [selectedAdditionalAudioTrackId, setSelectedAdditionalAudioTrackId] = useState<string | null>(null);
-  const [audioLibraryTab, setAudioLibraryTab] = useState<"music" | "sfx" | "uploads">("music");
+  const [mediaDirectory, setMediaDirectory] = useState<"import" | "project_media" | "video" | "audio" | "images">("import");
+  const [audioDirectory, setAudioDirectory] = useState<"music" | "sfx" | "yours" | "import" | "copyright">("music");
+  const [textDirectory, setTextDirectory] = useState<"add_text" | "yours" | "text_effects" | "text_template" | "auto_captions" | "local_captions">("add_text");
+  const [stickerDirectory, setStickerDirectory] = useState<string>("trending");
+  const [transitionDirectory, setTransitionDirectory] = useState<string>("trending");
+  const [effectDirectory, setEffectDirectory] = useState<string>("video_effects");
+  const [captionDirectory, setCaptionDirectory] = useState<"auto_captions" | "templates" | "auto_lyrics" | "add_captions" | "local_captions">("auto_captions");
+
+  const [textSearch, setTextSearch] = useState<string>("");
+  const [audioSearch, setAudioSearch] = useState<string>("");
+  const [effectSearch, setEffectSearch] = useState<string>("");
+  const [stickerSearch, setStickerSearch] = useState<string>("");
+  const [transitionSearch, setTransitionSearch] = useState<string>("");
+  const [videoInspectorTab, setVideoInspectorTab] = useState<"video" | "adjust" | "speed" | "audio">("video");
+  const [audioInspectorTab, setAudioInspectorTab] = useState<"audio" | "fade" | "speed" | "timing">("audio");
+  const [textInspectorTab, setTextInspectorTab] = useState<"text" | "animation" | "tracking" | "tts">("text");
+  const [captionInspectorTab, setCaptionInspectorTab] = useState<"captions" | "text" | "animation" | "tracking" | "tts">("captions");
+  const [captionTextSubTab, setCaptionTextSubTab] = useState<"basic" | "templates" | "effects">("basic");
+  const [captionAnimationSubTab, setCaptionAnimationSubTab] = useState<"in" | "out" | "loop" | "captions">("captions");
+  const [captionTemplateCategory, setCaptionTemplateCategory] = useState<CaptionTemplateCategory>("All");
+  const [captionCueSearch, setCaptionCueSearch] = useState<string>("");
+  const [effectInspectorTab, setEffectInspectorTab] = useState<"effect" | "timing">("effect");
   const [activeNavTab, setActiveNavTab] = useState<EditorNavTab>("media");
-  const [activeTextSubTab, setActiveTextSubTab] = useState<"presets" | "hook" | "keyword">("presets");
-  const [activeEffectSubTab, setActiveEffectSubTab] = useState<"style" | "punch" | "pattern">("style");
+  const [libraryPreviewAudioId, setLibraryPreviewAudioId] = useState<string | null>(null);
+  const [previewingTransitionId, setPreviewingTransitionId] = useState<string | null>(null);
+  const [previewingEffectId, setPreviewingEffectId] = useState<string | null>(null);
+  const [previewDemoTransition, setPreviewDemoTransition] = useState<{
+    effect: string;
+    name: string;
+  } | null>(null);
+  const [demoTransitionProgress, setDemoTransitionProgress] = useState<number>(0);
+
+  const triggerTransitionDemo = (item: (typeof transitionItems)[number]) => {
+    setPreviewingTransitionId(item.id);
+    const effectType = item.name.toLowerCase().replace(/\s+/g, "_");
+    setPreviewDemoTransition({ effect: effectType, name: item.name });
+    setDemoTransitionProgress(0);
+
+    const durationMs = 1200;
+    const startTime = performance.now();
+
+    const animFrame = () => {
+      const elapsed = performance.now() - startTime;
+      const progress = Math.min(1, elapsed / durationMs);
+      setDemoTransitionProgress(progress);
+      if (progress < 1) {
+        requestAnimationFrame(animFrame);
+      } else {
+        setTimeout(() => {
+          setPreviewDemoTransition(null);
+          setPreviewingTransitionId((cur) => (cur === item.id ? null : cur));
+          setDemoTransitionProgress(0);
+        }, 80);
+      }
+    };
+    requestAnimationFrame(animFrame);
+  };
+
+  const triggerEffectDemo = (item: (typeof visualEffectsList)[number]) => {
+    setPreviewingEffectId(item.id);
+    const effectType = (item.effectName || item.label).toLowerCase().replace(/\s+/g, "_");
+    setPreviewDemoTransition({ effect: effectType, name: item.label });
+    setDemoTransitionProgress(0);
+
+    const durationMs = 1200;
+    const startTime = performance.now();
+
+    const animFrame = () => {
+      const elapsed = performance.now() - startTime;
+      const progress = Math.min(1, elapsed / durationMs);
+      setDemoTransitionProgress(progress);
+      if (progress < 1) {
+        requestAnimationFrame(animFrame);
+      } else {
+        setTimeout(() => {
+          setPreviewDemoTransition(null);
+          setPreviewingEffectId((cur) => (cur === item.id ? null : cur));
+          setDemoTransitionProgress(0);
+        }, 80);
+      }
+    };
+    requestAnimationFrame(animFrame);
+  };
   const [audioUploadProgress, setAudioUploadProgress] = useState(0);
   const [audioUploading, setAudioUploading] = useState(false);
   const [exportModalOpen, setExportModalOpen] = useState(false);
@@ -1706,6 +3514,8 @@ export function TransformationPage() {
   } | null>(null);
   const previewVideoRef = useRef<HTMLVideoElement | null>(null);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+  const activeAudioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
+  const lastTriggeredSfxRef = useRef<Set<string>>(new Set());
   const previewTimeRef = useRef(0);
   const previewClockFrameRef = useRef<number | null>(null);
   const previewClockLastUpdateRef = useRef(0);
@@ -1736,6 +3546,22 @@ export function TransformationPage() {
     edge: "left" | "right";
     trackLeft: number;
     trackWidth: number;
+  } | null>(null);
+  const previewCanvasContainerRef = useRef<HTMLDivElement | null>(null);
+  const canvasManipulationRef = useRef<{
+    pointerId: number;
+    mode: "drag" | "resize";
+    handle?: "tl" | "tr" | "bl" | "br";
+    targetType: "hook" | "sticker" | "keyword" | "caption";
+    targetId: string;
+    startX: number;
+    startY: number;
+    initialPosX: number;
+    initialPosY: number;
+    initialScale: number;
+    initialFontSize?: number;
+    canvasWidth: number;
+    canvasHeight: number;
   } | null>(null);
   const undoStackRef = useRef<Transformation[]>([]);
   const redoStackRef = useRef<Transformation[]>([]);
@@ -1852,7 +3678,8 @@ export function TransformationPage() {
             );
           }
           if (Number.isFinite(savedZoom)) {
-            setTimelineZoom(Math.max(1, Math.min(4, savedZoom)));
+            const zoomPercent = savedZoom <= 4 ? savedZoom * 100 : savedZoom;
+            updateTimelineZoomPercent(zoomPercent);
           }
           if (preferences.theme === "dark" || preferences.theme === "light") {
             setEditorTheme(preferences.theme);
@@ -1888,6 +3715,32 @@ export function TransformationPage() {
     audio.muted = previewAudioSettings.muted;
     audio.volume = previewAudioSettings.volume > 1 ? 1 : previewAudioSettings.volume;
   }, [previewAudioSettings.muted, previewAudioSettings.volume]);
+
+  const previewVideoSpeed = Math.max(
+    0.25,
+    Math.min(4, Number(draft?.clipper_style_config?.video_speed || 1.0)),
+  );
+  const previewAudioSpeed = Math.max(
+    0.5,
+    Math.min(2.0, Number(draft?.clipper_style_config?.audio_settings?.speed || 1.0)),
+  );
+  useEffect(() => {
+    if (previewVideoRef.current) {
+      const clamped = Math.max(0.25, Math.min(4.0, previewVideoSpeed || 1.0));
+      if (previewVideoRef.current.playbackRate !== clamped) {
+        previewVideoRef.current.playbackRate = clamped;
+      }
+    }
+  }, [previewVideoSpeed]);
+
+  useEffect(() => {
+    if (previewAudioRef.current) {
+      const targetSpeed = Math.max(0.5, Math.min(2.0, previewAudioSpeed || 1.0));
+      if (previewAudioRef.current.playbackRate !== targetSpeed) {
+        previewAudioRef.current.playbackRate = targetSpeed;
+      }
+    }
+  }, [previewAudioSpeed]);
   useEffect(() => {
     document.documentElement.dataset.editorTheme = editorTheme;
     window.localStorage.setItem("autoclip-editor-theme", editorTheme);
@@ -2004,10 +3857,12 @@ export function TransformationPage() {
         start: roundTime(cue.start),
         end: roundTime(cue.end, roundTime(cue.start) + 0.1),
         text: String(cue.text || ""),
+        type: cue.type || "main_caption",
+        style_id: cue.style_id || null,
+        style_override: cue.style_override || null,
       })),
-      caption_style: captionStyle,
-      caption_max_words: captionStyle.maxWords,
-      caption_max_chars: captionStyle.maxChars,
+      main_caption_style: mainCaptionStyle,
+      caption_apply_to_all: captionApplyToAll,
       effect_timeline: editableEffectTimeline.map((event) => ({
         ...event,
         start: roundTime(event.start),
@@ -2021,7 +3876,7 @@ export function TransformationPage() {
       audio_tracks: [...additionalAudioTracks],
       editor_preferences: {
         timeline_height: Math.round(timelineHeight),
-        timeline_zoom: timelineZoom,
+        timeline_zoom: timelineZoomPercent,
         theme: editorTheme,
       },
     };
@@ -2174,7 +4029,7 @@ export function TransformationPage() {
     saveInFlightCount,
     timelineDirty,
     timelineHeight,
-    timelineZoom,
+    timelineZoomPercent,
     triggerAutosave,
   ]);
   const regenerate = useMutation({
@@ -2218,6 +4073,57 @@ export function TransformationPage() {
       setRender(undefined);
       client.invalidateQueries({ queryKey: ["latest-render", transformationId] });
       setMessage("Hook video berhasil dibuat ulang.");
+    },
+  });
+  const generateAutoCaptionsMutation = useMutation({
+    mutationFn: async () => {
+      setAutoCaptionGenerating(true);
+      setAutoCaptionError("");
+      return generateEditorAutoCaptions(transformationId, {
+        language: (spokenLanguage as "id" | "en" | "auto") || "id",
+        delete_current_captions: deleteCurrentCaptions,
+        identify_filler_words: identifyFillerWords,
+        bilingual: bilingualMode,
+      });
+    },
+    onSuccess: (res) => {
+      setAutoCaptionGenerating(false);
+      if (res.cues) {
+        setTimelineError("");
+        setEditorDirty(true);
+        setTimelineDirty(true);
+        setRenderDirty(true);
+        setRender(undefined);
+        setDraft((current) =>
+          current
+            ? {
+                ...current,
+                clipper_style_config: {
+                  ...styleDefaults.clean_podcast,
+                  ...(current.clipper_style_config || {}),
+                  caption_timeline_initialized: true,
+                  caption_timeline: res.cues.map((cue) => ({
+                    ...cue,
+                    start: Math.max(0, cue.start),
+                    end: Math.max(0, cue.end),
+                  })),
+                },
+              }
+            : current,
+        );
+        if (res.cues.length > 0) {
+          setSelectedCaptionId(res.cues[0].id);
+          setSelectedEditorContext("caption");
+        }
+      }
+      setMessage(res.message);
+      setAutosaveWakeRevision((r) => r + 1);
+    },
+    onError: (err: unknown) => {
+      setAutoCaptionGenerating(false);
+      const errorMsg = err instanceof Error ? err.message : "Gagal membuat auto caption.";
+      setAutoCaptionError(errorMsg);
+      setMessage(`Error: ${errorMsg}`);
     },
   });
   const applySource = useMutation({
@@ -2324,11 +4230,6 @@ export function TransformationPage() {
       setExportAwaitingHd(false);
       setMessage("Export gagal.");
     },
-  });
-  const reprocess = useMutation({
-    mutationFn: () =>
-      api(`/api/projects/${draft?.project_id}/reprocess`, { method: "POST" }),
-    onSuccess: () => navigate(`/projects/${draft?.project_id}`),
   });
   const monitoredRenderId = exportRenderId || render?.id || (
     latestRender.data && ["queued", "running"].includes(latestRender.data.status)
@@ -2513,7 +4414,7 @@ export function TransformationPage() {
         )} / ${formatTime(context.data.clip_duration_seconds)}`;
     const badge = (
       <span
-        className={`shrink-0 rounded-full px-2 py-1 text-[10px] font-black uppercase ${editorSaveStatusClass}`}
+        className={`shrink-0 rounded-md px-1.5 py-0.5 text-[9px] font-bold uppercase ${editorSaveStatusClass}`}
         title={editorSaveStatusTitle}
       >
         {editorSaveStatusLabel}
@@ -2522,12 +4423,12 @@ export function TransformationPage() {
     const actions = (
       <>
         {!toolbarManualEditorMode && (
-          <Link className="btn-secondary px-3 py-2 text-sm" to={`/jobs/${draft.project_id}/clips`}>
+          <Link className="btn-secondary px-2.5 py-1 text-xs font-bold" to={`/jobs/${draft.project_id}/clips`}>
             Kembali ke Klip
           </Link>
         )}
         <button
-          className="btn px-3 py-2 text-sm"
+          className="btn px-2.5 py-1 text-xs font-bold"
           disabled={!canStartExport}
           onClick={openExportModal}
           title={exportDisabledReason}
@@ -2541,14 +4442,14 @@ export function TransformationPage() {
       <>
         {!toolbarManualEditorMode && (
           <Link
-            className="btn-secondary block w-full px-3 py-2 text-center text-sm"
+            className="btn-secondary block w-full px-2.5 py-1 text-center text-xs font-bold"
             to={`/jobs/${draft.project_id}/clips`}
           >
             Kembali ke Klip
           </Link>
         )}
         <button
-          className="btn w-full px-3 py-2 text-sm"
+          className="btn w-full px-2.5 py-1 text-xs font-bold"
           disabled={!canStartExport}
           onClick={openExportModal}
           title={exportDisabledReason}
@@ -2593,7 +4494,6 @@ export function TransformationPage() {
         ? render
         : undefined
     : undefined;
-  const transcriptionReady = !context.data.transcription_is_demo;
   const set = (key: keyof Transformation, value: unknown) => {
     recordEditorHistory(draft, `field:${String(key)}`);
     setEditorDirty(true);
@@ -2617,43 +4517,6 @@ export function TransformationPage() {
         : current,
     );
   };
-  const setCaptionStyle = (changes: Partial<CaptionStyleConfig>) => {
-    recordEditorHistory(draft, "caption-style");
-    setEditorDirty(true);
-    setRenderDirty(true);
-    setRender(undefined);
-    setDraft((current) => {
-      if (!current) return current;
-      const currentStyle = normalizeCaptionStyleConfig(
-        current.clipper_style_config?.caption_style,
-      );
-      return {
-        ...current,
-        clipper_style_config: {
-          ...styleDefaults.clean_podcast,
-          ...(current.clipper_style_config || {}),
-          caption_style: normalizeCaptionStyleConfig({
-            ...currentStyle,
-            ...changes,
-          }),
-          caption_max_words:
-            changes.maxWords ??
-            current.clipper_style_config?.caption_max_words ??
-            currentStyle.maxWords,
-          caption_max_chars:
-            changes.maxChars ??
-            current.clipper_style_config?.caption_max_chars ??
-            currentStyle.maxChars,
-        },
-      };
-    });
-  };
-  const selectPreset = (value: RenderPreset) => {
-    setPreset(value);
-    setRenderDirty(true);
-    setRender(undefined);
-    setStyle("render_preset", value);
-  };
   const currentSaveError = saveFailure
     ? save.error || autosave.error || new Error(saveFailureMessage || "Gagal menyimpan editor.")
     : null;
@@ -2676,6 +4539,143 @@ export function TransformationPage() {
     ...styleDefaults.clean_podcast,
     ...(draft.clipper_style_config || {}),
     caption_style: normalizeCaptionStyleConfig(draft.clipper_style_config?.caption_style),
+    main_caption_style: normalizeMainCaptionStyle(draft.clipper_style_config?.main_caption_style as Partial<MainCaptionStyle> | undefined),
+    caption_apply_to_all: draft.clipper_style_config?.caption_apply_to_all ?? true,
+  };
+  const mainCaptionStyle: MainCaptionStyle = normalizeMainCaptionStyle(
+    styleConfig.main_caption_style as Partial<MainCaptionStyle> | undefined,
+  );
+  const captionApplyToAll: boolean = styleConfig.caption_apply_to_all ?? true;
+
+  const updateMainCaptionStyle = (changes: Partial<MainCaptionStyle>) => {
+    recordEditorHistory(draft, "main-caption-style");
+    setEditorDirty(true);
+    setTimelineDirty(true);
+    setRenderDirty(true);
+    setRender(undefined);
+
+    if (captionApplyToAll) {
+      setDraft((current) => {
+        if (!current) return current;
+        const currentMain = normalizeMainCaptionStyle(
+          current.clipper_style_config?.main_caption_style as Partial<MainCaptionStyle> | undefined,
+        );
+        const nextMain = normalizeMainCaptionStyle({
+          ...currentMain,
+          ...changes,
+        });
+        return {
+          ...current,
+          clipper_style_config: {
+            ...styleDefaults.clean_podcast,
+            ...(current.clipper_style_config || {}),
+            main_caption_style: nextMain,
+          },
+        };
+      });
+    } else if (selectedCaptionId) {
+      setDraft((current) => {
+        if (!current) return current;
+        const cues = Array.isArray(current.clipper_style_config?.caption_timeline)
+          ? [...current.clipper_style_config.caption_timeline]
+          : [];
+        const nextCues = cues.map((cue) => {
+          if (cue.id === selectedCaptionId) {
+            const currentOverride = cue.style_override || {};
+            return {
+              ...cue,
+              style_override: {
+                ...currentOverride,
+                ...changes,
+              },
+            };
+          }
+          return cue;
+        });
+        return {
+          ...current,
+          clipper_style_config: {
+            ...styleDefaults.clean_podcast,
+            ...(current.clipper_style_config || {}),
+            caption_timeline: nextCues,
+          },
+        };
+      });
+    }
+  };
+
+  const setCaptionApplyToAll = (val: boolean) => {
+    recordEditorHistory(draft, "caption-apply-to-all");
+    setEditorDirty(true);
+    setTimelineDirty(true);
+    setDraft((current) =>
+      current
+        ? {
+            ...current,
+            clipper_style_config: {
+              ...styleDefaults.clean_podcast,
+              ...(current.clipper_style_config || {}),
+              caption_apply_to_all: val,
+            },
+          }
+        : current,
+    );
+  };
+
+  const applyCurrentStyleToAllCaptions = () => {
+    recordEditorHistory(draft, "apply-style-to-all");
+    setEditorDirty(true);
+    setTimelineDirty(true);
+    setDraft((current) => {
+      if (!current) return current;
+      const cues = Array.isArray(current.clipper_style_config?.caption_timeline)
+        ? [...current.clipper_style_config.caption_timeline]
+        : [];
+      const selectedCue = cues.find((c) => c.id === selectedCaptionId);
+      const activeStyle = resolveCaptionStyle(selectedCue, mainCaptionStyle, false);
+      const cleanCues = cues.map((cue) => ({
+        ...cue,
+        style_override: null,
+      }));
+      return {
+        ...current,
+        clipper_style_config: {
+          ...styleDefaults.clean_podcast,
+          ...(current.clipper_style_config || {}),
+          main_caption_style: activeStyle,
+          caption_timeline: cleanCues,
+          caption_apply_to_all: true,
+        },
+      };
+    });
+    setMessage("Style caption berhasil diterapkan ke semua cue.");
+  };
+
+  const resetCaptionStyle = () => {
+    recordEditorHistory(draft, "reset-caption-style");
+    setEditorDirty(true);
+    setTimelineDirty(true);
+    setDraft((current) => {
+      if (!current) return current;
+      const cues = Array.isArray(current.clipper_style_config?.caption_timeline)
+        ? [...current.clipper_style_config.caption_timeline]
+        : [];
+      const cleanCues = cues.map((cue) => ({
+        ...cue,
+        style_override: null,
+      }));
+      return {
+        ...current,
+        clipper_style_config: {
+          ...styleDefaults.clean_podcast,
+          ...(current.clipper_style_config || {}),
+          main_caption_style: { ...DEFAULT_MAIN_CAPTION_STYLE },
+          caption_timeline: cleanCues,
+          caption_apply_to_all: true,
+        },
+      };
+    });
+    setMessage("Style caption direset ke default.");
   };
   const manualEditorMode = isManualEditorTransformation(draft);
   const savedEditorStateVersion = Number(styleConfig.editor_state_version || 0);
@@ -2692,11 +4692,151 @@ export function TransformationPage() {
       previous: videoFraming,
       next: nextFraming,
     });
-    setStyle("video_framing", {
-      x: Number(nextFraming.x.toFixed(2)),
-      y: Number(nextFraming.y.toFixed(2)),
-      scale: Number(nextFraming.scale.toFixed(2)),
+    setStyle("video_framing", nextFraming);
+  };
+  const effectiveFramingPreset: "blurred_background" | "center_crop" | "fit_background" | "clean_podcast" | "studio_podcast" | "talking_head" | "picture_in_picture" =
+    (videoFraming.preset &&
+    ["blurred_background", "center_crop", "fit_background", "clean_podcast", "studio_podcast", "talking_head", "picture_in_picture"].includes(videoFraming.preset)
+      ? (videoFraming.preset as "blurred_background" | "center_crop" | "fit_background" | "clean_podcast" | "studio_podcast" | "talking_head" | "picture_in_picture")
+      : undefined) ||
+    (styleConfig.clipper_style_preset === "studio_podcast" ? "studio_podcast" : undefined) ||
+    (styleConfig.clipper_style_preset === "talking_head" ? "talking_head" : undefined) ||
+    (styleConfig.clipper_style_preset === "clean_podcast" ? "clean_podcast" : undefined) ||
+    (videoFraming.blur_background ? "blurred_background" : undefined) ||
+    (styleConfig.render_preset as "blurred_background" | "center_crop" | "fit_background" | "picture_in_picture" | undefined) ||
+    (preset as "blurred_background" | "center_crop" | "fit_background" | "picture_in_picture") ||
+    "blurred_background";
+  const isFramingPresetActive = (id: string) => {
+    return effectiveFramingPreset === id;
+  };
+  const applyVideoFramingPreset = (presetId: string) => {
+    recordEditorHistory(draft, `framing-preset-${presetId}`, true);
+    setEditorDirty(true);
+    setTimelineDirty(true);
+    setRenderDirty(true);
+    setRender(undefined);
+    setExportValidatedRenderId(null);
+    setExportAwaitingHd(false);
+
+    let targetRenderPreset: RenderPreset = "blurred_background";
+    let targetClipperPreset = presetId;
+    let nextFramingPatch: Partial<VideoFraming> = {
+      preset: presetId,
+    };
+
+    if (presetId === "blurred_background") {
+      targetRenderPreset = "blurred_background";
+      targetClipperPreset = "blurred_background";
+      nextFramingPatch = {
+        preset: "blurred_background",
+        blur_background: true,
+        scale: 1,
+        x: 0,
+        y: 0,
+      };
+    } else if (presetId === "center_crop") {
+      targetRenderPreset = "center_crop";
+      targetClipperPreset = "center_crop";
+      nextFramingPatch = {
+        preset: "center_crop",
+        blur_background: false,
+        scale: 1,
+        x: 0,
+        y: 0,
+      };
+    } else if (presetId === "fit_background") {
+      targetRenderPreset = "fit_background";
+      targetClipperPreset = "fit_background";
+      nextFramingPatch = {
+        preset: "fit_background",
+        blur_background: false,
+        scale: 1,
+        x: 0,
+        y: 0,
+      };
+    } else if (presetId === "clean_podcast") {
+      targetRenderPreset = "center_crop";
+      targetClipperPreset = "clean_podcast";
+      nextFramingPatch = {
+        preset: "clean_podcast",
+        blur_background: false,
+        scale: 1,
+        x: 0,
+        y: 0,
+      };
+    } else if (presetId === "studio_podcast") {
+      targetRenderPreset = "blurred_background";
+      targetClipperPreset = "studio_podcast";
+      nextFramingPatch = {
+        preset: "studio_podcast",
+        blur_background: true,
+        scale: 1.05,
+        x: 0,
+        y: 0,
+      };
+    } else if (presetId === "talking_head") {
+      targetRenderPreset = "center_crop";
+      targetClipperPreset = "talking_head";
+      nextFramingPatch = {
+        preset: "talking_head",
+        blur_background: false,
+        scale: 1.15,
+        x: 0,
+        y: 0,
+      };
+    } else if (presetId === "picture_in_picture") {
+      targetRenderPreset = "picture_in_picture";
+      targetClipperPreset = "picture_in_picture";
+      nextFramingPatch = {
+        preset: "picture_in_picture",
+        blur_background: false,
+      };
+    }
+
+    setPreset(targetRenderPreset);
+    setDraft((current) => {
+      if (!current) return current;
+      const currentFraming = normalizeVideoFraming(current.clipper_style_config?.video_framing);
+      const updatedFraming = normalizeVideoFraming({
+        ...currentFraming,
+        ...nextFramingPatch,
+      });
+      return {
+        ...current,
+        clipper_style_config: {
+          ...styleDefaults.clean_podcast,
+          ...(current.clipper_style_config || {}),
+          render_preset: targetRenderPreset,
+          clipper_style_preset: targetClipperPreset,
+          video_framing: updatedFraming,
+        },
+      };
     });
+
+    const matched = videoFramingPresets.find((p) => p.id === presetId);
+    setMessage(`Preset framing "${matched?.label || presetId}" aktif.`);
+  };
+  const videoAdjustments = normalizeVideoAdjustments(styleConfig.video_adjustments);
+  const setVideoAdjustments = (changes: Partial<VideoAdjustments>) => {
+    const nextAdjustments = normalizeVideoAdjustments({ ...videoAdjustments, ...changes });
+    setStyle("video_adjustments", nextAdjustments);
+  };
+  const videoSpeed = Math.max(0.25, Math.min(4, Number(styleConfig.video_speed || 1.0)));
+  const setVideoSpeed = (speed: number) => {
+    const clamped = Number(Math.max(0.25, Math.min(4, speed)).toFixed(2));
+    if (previewVideoRef.current) {
+      previewVideoRef.current.playbackRate = clamped;
+    }
+    setStyle("video_speed", clamped);
+  };
+  const audioSettings = normalizeAudioSettings(styleConfig.audio_settings);
+  const setAudioSettings = (changes: Partial<AudioSettings>) => {
+    const next = normalizeAudioSettings({ ...audioSettings, ...changes });
+    if (previewAudioRef.current && next.speed !== undefined) {
+      previewAudioRef.current.playbackRate = next.speed;
+    }
+    setTimelineDirty(true);
+    setStyle("audio_settings", next);
   };
   const moveTimelineTrack = (track: TimelineTrackKey, direction: -1 | 1) => {
     const index = trackOrder.indexOf(track);
@@ -2707,6 +4847,18 @@ export function TransformationPage() {
     setTimelineDirty(true);
     setStyle("track_order", nextOrder);
   };
+  const videoMuted = Boolean(styleConfig.video_muted);
+
+  const toggleVideoMuted = () => {
+    if (audioExtracted) return;
+    const next = !videoMuted;
+    setStyle("video_muted", next);
+    if (previewVideoRef.current) {
+      previewVideoRef.current.muted = next || audioSettings.muted;
+    }
+    setMessage(next ? "Audio video dibisukan (mute)." : "Audio video diaktifkan kembali.");
+  };
+
   const visualLayerZIndex = (track: VisualLayerTrack) =>
     20 + visualLayerOrder.length - visualLayerOrder.indexOf(track);
   const additionalAudioAssets = (Array.isArray(styleConfig.additional_audio_assets)
@@ -2777,20 +4929,56 @@ export function TransformationPage() {
       : audioSequenceInitialized
         ? configuredAudioSequence
         : (configuredAudioSequence.length ? configuredAudioSequence : videoSequence);
-  const layoutSequence = (sequence: MediaSequenceSegment[]) => {
+  const layoutSequence = (sequence: MediaSequenceSegment[], speed: number = 1.0) => {
+    const s = Math.max(0.25, Math.min(4.0, Number.isFinite(speed) && speed > 0 ? speed : 1.0));
     let offset = 0;
     const segments = sequence.map((segment, index) => {
       const start = offset;
-      const end = start + (segment.sourceEnd - segment.sourceStart);
+      const baseDuration = Math.max(0, segment.sourceEnd - segment.sourceStart);
+      const effectiveDuration = baseDuration / s;
+      const end = start + effectiveDuration;
       offset = end;
-      return { ...segment, start, end, number: index + 1 };
+      return {
+        ...segment,
+        start,
+        end,
+        baseDuration,
+        effectiveDuration,
+        speed: s,
+        number: index + 1,
+      };
     });
     return { segments, duration: offset };
   };
-  const videoLayout = layoutSequence(videoSequence);
-  const audioLayout = layoutSequence(audioSequence);
+  const videoLayout = layoutSequence(videoSequence, videoSpeed);
+  const audioLayout = layoutSequence(
+    audioSequence,
+    audioExtracted ? (audioSettings.speed || 1.0) : videoSpeed,
+  );
   const videoSegments = videoLayout.segments;
   const audioSegments = audioLayout.segments;
+  const videoClipBoundaries = (() => {
+    if (videoSegments.length < 2) return [];
+    const boundaries: Array<{
+      index: number;
+      time: number;
+      beforeSegment: (typeof videoSegments)[number];
+      afterSegment: (typeof videoSegments)[number];
+      boundaryId: string;
+    }> = [];
+    for (let i = 0; i < videoSegments.length - 1; i++) {
+      const before = videoSegments[i];
+      const after = videoSegments[i + 1];
+      boundaries.push({
+        index: i,
+        time: before.end,
+        beforeSegment: before,
+        afterSegment: after,
+        boundaryId: `${before.id || i}:${after.id || i + 1}`,
+      });
+    }
+    return boundaries;
+  })();
   const activeMediaTrack = audioExtracted && selectedEditorContext === "audio" ? "audio" : "video";
   const mediaSequence = activeMediaTrack === "audio" ? audioSequence : videoSequence;
   const mediaSegments = activeMediaTrack === "audio" ? audioSegments : videoSegments;
@@ -2818,11 +5006,6 @@ export function TransformationPage() {
     renderedPreviewAvailable && activeRender
       ? `${downloadUrl(activeRender.id)}?v=${activeRender.id}-${activeRender.status}-${activeRender.width}x${activeRender.height}-${activeRender.file_size_bytes || 0}`
       : null;
-  const audioSettings = normalizeAudioSettings(styleConfig.audio_settings);
-  const setAudioSettings = (changes: Partial<AudioSettings>) => {
-    setTimelineDirty(true);
-    setStyle("audio_settings", normalizeAudioSettings({ ...audioSettings, ...changes }));
-  };
   const updateAdditionalAudioLibrary = (
     assets: AdditionalAudioAsset[],
     tracks: AdditionalAudioTrack[],
@@ -2921,7 +5104,7 @@ export function TransformationPage() {
         [...additionalAudioAssets.filter((item) => item.id !== asset.id), asset],
         additionalAudioTracks,
       );
-      setAudioLibraryTab("uploads");
+      setAudioDirectory("yours");
       setMessage(`${asset.name} ditambahkan ke Upload Saya.`);
     } catch (uploadError) {
       setTimelineError(
@@ -2960,6 +5143,44 @@ export function TransformationPage() {
     setSelectedEditorContext("audio");
     setMessage(`${track.label} ditambahkan pada ${formatTimePrecise(start)}.`);
   };
+  const updateAdditionalAudioTrack = (
+    trackId: string,
+    patch: Partial<AdditionalAudioTrack>,
+  ) => {
+    if (patch.speed !== undefined) {
+      const audioEl = activeAudioElementsRef.current.get(trackId);
+      if (audioEl) {
+        audioEl.playbackRate = Math.max(0.5, Math.min(2.0, patch.speed));
+      }
+    }
+    const nextTracks = additionalAudioTracks.map((t) => {
+      if (t.id !== trackId) return t;
+      const baseDuration = t.base_duration || Math.max(0.1, t.end - t.start);
+      return { ...t, base_duration: baseDuration, ...patch };
+    });
+    updateAdditionalAudioLibrary(additionalAudioAssets, nextTracks);
+    setTimelineError("");
+    setEditorDirty(true);
+    setTimelineDirty(true);
+  };
+  const deleteAdditionalAudioTrack = (trackId: string) => {
+    const audioEl = activeAudioElementsRef.current.get(trackId);
+    if (audioEl) {
+      audioEl.pause();
+      audioEl.src = "";
+      activeAudioElementsRef.current.delete(trackId);
+    }
+    lastTriggeredSfxRef.current.delete(trackId);
+    const nextTracks = additionalAudioTracks.filter((t) => t.id !== trackId);
+    updateAdditionalAudioLibrary(additionalAudioAssets, nextTracks);
+    if (selectedAdditionalAudioTrackId === trackId) {
+      setSelectedAdditionalAudioTrackId(null);
+    }
+    setTimelineError("");
+    setEditorDirty(true);
+    setTimelineDirty(true);
+    setMessage("Track audio dihapus dari timeline.");
+  };
   const hookFallbackText = safeHookPreview(
     styleConfig.hook_text || draft.original_hook || context.data.candidate_title || "",
   );
@@ -2974,15 +5195,6 @@ export function TransformationPage() {
   const hookTextSize: HookTextSize = styleConfig.hook_text_size === "large" ? "large" : "normal";
   const hookTextFont = normalizeHookTextFont(styleConfig.hook_text_font);
   const activeHookFont = hookTextFonts.find((font) => font.value === hookTextFont) || hookTextFonts[0];
-  const hookTextStylePreset = resolveHookTextStylePreset(
-    hookTextTemplate,
-    styleConfig.hook_text_style_preset,
-  );
-  const keywordTextStylePreset = normalizeTextStylePreset(
-    styleConfig.keyword_text_style_preset ?? "yellow_viral",
-  );
-  const hookUnifiedTextStyle = resolveTextOverlayStyle(hookTextStylePreset);
-  const keywordUnifiedTextStyle = resolveTextOverlayStyle(keywordTextStylePreset);
   const keywordPreview = previewKeywords(
     context.data.candidate_transcript,
     draft.original_hook,
@@ -3000,21 +5212,12 @@ export function TransformationPage() {
     clipDuration,
     keywordPreview,
   );
-  const liveKeywordEvent = activeTimelineEvent(
-    effectTimeline,
-    "keyword_popup",
-    previewTime,
-    previewPlaying,
-  );
   const livePunchEvent = activeTimelineEvent(
     effectTimeline,
     "punch_zoom",
     previewTime,
     previewPlaying,
   );
-  const keywordSkipped =
-    Boolean(styleConfig.keyword_popup_enabled) &&
-    !effectTimeline.some((event) => event.type === "keyword_popup" && event.text);
   const baseEffectTimeline = mediaResizePreview?.events || effectTimeline;
   const configuredEffectTimeline = !effectTimelineInitialized &&
     styleConfig.hook_text_enabled && hookFallbackText &&
@@ -3031,34 +5234,50 @@ export function TransformationPage() {
         ...baseEffectTimeline,
       ]
     : baseEffectTimeline;
-  const generatedCaptionCues: EditableCaptionCue[] = projectCaptionCues(
+  const generatedCaptionCues: CaptionCueItem[] = projectCaptionCues(
     context.data.caption_cues || [],
     videoSequence,
-  );
+  ).map((c) => ({
+    ...c,
+    type: "main_caption",
+    style_id: null,
+    style_override: null,
+    locked: false,
+    visible: true,
+  }));
   const savedCaptionTimeline = Array.isArray(styleConfig.caption_timeline)
-    ? (styleConfig.caption_timeline as EditableCaptionCue[])
+    ? (styleConfig.caption_timeline as CaptionCueItem[])
         .map((cue, index) => ({
           id: String(cue.id || `caption-saved-${index}`),
           start: Math.max(0, Math.min(clipDuration, Number(cue.start) || 0)),
           end: Math.max(0, Math.min(clipDuration, Number(cue.end) || 0)),
           text: String(cue.text || "").trim(),
+          type: cue.type || "main_caption",
+          style_id: cue.style_id || null,
+          style_override: cue.style_override || null,
+          locked: Boolean(cue.locked),
+          visible: cue.visible !== false,
         }))
         .filter((cue) => cue.end > cue.start)
     : [];
   const captionTimelineInitialized = editorStateInitialized ||
     Boolean(styleConfig.caption_timeline_initialized) || savedCaptionTimeline.length > 0;
-  const captionSyncRequired = Boolean(styleConfig.caption_sync_required);
   const editableCaptionCues = captionTimelineInitialized
     ? savedCaptionTimeline
     : generatedCaptionCues;
-  const captionStyle = styleConfig.caption_style;
-  const captionUnifiedTextStyle = resolveTextOverlayStyle(captionStyle.textPreset);
   const currentCaptionCue = activeCaptionCue(editableCaptionCues, previewTime);
-  const subtitlePreview = currentCaptionCue
+  const resolvedCurrentCaptionStyle = resolveCaptionStyle(
+    currentCaptionCue,
+    mainCaptionStyle,
+    captionApplyToAll,
+  );
+  const rawSubtitlePreview = currentCaptionCue
     ? getCaptionPreviewText(currentCaptionCue.text)
     : null;
+  const subtitlePreview = rawSubtitlePreview
+    ? formatCaptionCase(rawSubtitlePreview, resolvedCurrentCaptionStyle.case_mode)
+    : null;
   const karaokeWords = subtitlePreview ? captionWords(subtitlePreview) : [];
-  const captionPreviewWordCount = karaokeWords.length;
   const karaokeCueDuration = currentCaptionCue
     ? Math.max(0, currentCaptionCue.end - currentCaptionCue.start)
     : 0;
@@ -3070,24 +5289,11 @@ export function TransformationPage() {
         Math.max(0, (previewTime - currentCaptionCue.start) / Math.max(0.001, karaokeCueDuration)),
       )
     : null;
-  // Estimasi karaoke proporsional dari durasi cue, bukan timing kata transcript asli.
+  // Estimasi karaoke proporsional dari durasi cue
   const karaokeActiveIndex =
-    karaokeCueProgress !== null && karaokeCueDuration >= 0.35 && karaokeWords.length > 1
+    karaokeCueProgress !== null && karaokeCueDuration >= 0.25 && karaokeWords.length > 1
       ? Math.min(karaokeWords.length - 1, Math.floor(karaokeCueProgress * karaokeWords.length))
       : -1;
-  const progressiveWordCount =
-    karaokeCueProgress !== null && karaokeCueDuration >= 0.35 && karaokeWords.length > 1
-      ? Math.min(
-          karaokeWords.length,
-          Math.max(1, Math.floor(karaokeCueProgress * karaokeWords.length) + 1),
-        )
-      : karaokeWords.length;
-  const wordByWordPreview =
-    karaokeCueProgress !== null
-      ? karaokeWords.slice(0, progressiveWordCount).join(" ") || subtitlePreview
-      : null;
-  const captionOverlayText =
-    captionStyle.displayMode === "word_by_word" ? wordByWordPreview : subtitlePreview;
   const editableEffectTimeline = configuredEffectTimeline.map((event, index) => ({
     ...event,
     id: editableEventId(event, index),
@@ -3096,6 +5302,241 @@ export function TransformationPage() {
     editableEffectTimeline.find((event) => event.id === selectedEventId) || null;
   const liveHookEvent = activeHookCue(editableEffectTimeline, previewTime);
   const liveHookText = hookCueText(liveHookEvent, hookFallbackText);
+  const liveStickerEvent = editableEffectTimeline.find(
+    (event) =>
+      (event.type === "keyword_popup" || event.type === "sticker") &&
+      Boolean(event.reason?.toLowerCase().includes("sticker") || event.type === "sticker") &&
+      Number.isFinite(event.start) &&
+      Number.isFinite(event.end) &&
+      previewTime >= event.start &&
+      previewTime <= event.end,
+  );
+  const liveKeywordEvent = editableEffectTimeline.find(
+    (event) =>
+      event.type === "keyword_popup" &&
+      !event.reason?.toLowerCase().includes("sticker") &&
+      Number.isFinite(event.start) &&
+      Number.isFinite(event.end) &&
+      previewTime >= event.start &&
+      previewTime <= event.end,
+  );
+  const hookResponsiveFontSize = (() => {
+    const len = (liveHookText || "").trim().length;
+    if (hookTextSize === "large") {
+      if (len > 50) return "clamp(11px, 2.7vh, 14px)";
+      if (len > 30) return "clamp(12px, 3.1vh, 16px)";
+      return "clamp(14px, 3.6vh, 18px)";
+    }
+    // normal size
+    if (len > 50) return "clamp(10px, 2.2vh, 12px)";
+    if (len > 30) return "clamp(11px, 2.5vh, 13.5px)";
+    return "clamp(12px, 2.9vh, 15px)";
+  })();
+  const liveTransitionEvent =
+    videoSegments.length >= 2
+      ? editableEffectTimeline.find(
+          (event) =>
+            event.type === "pattern_interrupt" &&
+            Boolean(event.reason?.startsWith("transition")) &&
+            Number.isFinite(event.start) &&
+            Number.isFinite(event.end) &&
+            previewTime >= event.start &&
+            previewTime <= event.end,
+        )
+      : undefined;
+
+  const liveEffectEvent = editableEffectTimeline.find(
+    (event) =>
+      (event.type === "pattern_interrupt" || event.type === "punch_zoom" || event.type === "effect") &&
+      !event.reason?.startsWith("transition") &&
+      Number.isFinite(event.start) &&
+      Number.isFinite(event.end) &&
+      previewTime >= event.start &&
+      previewTime <= event.end,
+  );
+
+  const isVisualModifierActive = Boolean(
+    liveTransitionEvent || previewDemoTransition || liveEffectEvent,
+  );
+
+  const visualModifierProgress = previewDemoTransition
+    ? demoTransitionProgress
+    : liveTransitionEvent
+    ? Math.min(
+        1,
+        Math.max(
+          0,
+          (previewTime - liveTransitionEvent.start) /
+            Math.max(0.01, liveTransitionEvent.end - liveTransitionEvent.start),
+        ),
+      )
+    : liveEffectEvent
+    ? Math.min(
+        1,
+        Math.max(
+          0,
+          (previewTime - liveEffectEvent.start) /
+            Math.max(0.01, liveEffectEvent.end - liveEffectEvent.start),
+        ),
+      )
+    : 0;
+
+  const activeVisualEffectType = (
+    previewDemoTransition?.effect ||
+    liveTransitionEvent?.effect ||
+    liveEffectEvent?.effect ||
+    (liveEffectEvent?.type === "punch_zoom" ? "punch_zoom" : "fade")
+  ).toLowerCase();
+
+  let transitionOverlayColor: string | null = null;
+  let transitionOverlayOpacity = 0;
+  let transitionTransformStyle: React.CSSProperties | undefined = undefined;
+  let transitionFilterStyle: string | undefined = undefined;
+
+  if (isVisualModifierActive) {
+    const p = Math.min(1, Math.max(0, visualModifierProgress));
+    if (activeVisualEffectType.includes("flash") || activeVisualEffectType.includes("white")) {
+      transitionOverlayColor = "#ffffff";
+      transitionOverlayOpacity = Math.sin(p * Math.PI) * 0.95;
+      transitionFilterStyle = `brightness(${1 + Math.sin(p * Math.PI) * 0.8})`;
+    } else if (
+      activeVisualEffectType.includes("fade_black") ||
+      activeVisualEffectType === "fade" ||
+      (activeVisualEffectType.includes("fade") &&
+        !activeVisualEffectType.includes("white") &&
+        !activeVisualEffectType.includes("blur"))
+    ) {
+      transitionOverlayColor = "#000000";
+      transitionOverlayOpacity = Math.sin(p * Math.PI) * 0.9;
+    } else if (activeVisualEffectType.includes("cross") || activeVisualEffectType.includes("dissolve")) {
+      transitionOverlayColor = "#0f172a";
+      transitionOverlayOpacity = Math.sin(p * Math.PI) * 0.6;
+      const blurDip = Math.sin(p * Math.PI) * 6;
+      const brightDip = 1 - Math.sin(p * Math.PI) * 0.25;
+      transitionFilterStyle = `blur(${blurDip}px) brightness(${brightDip})`;
+    } else if (
+      activeVisualEffectType.includes("slide_l") ||
+      activeVisualEffectType.includes("slide-l") ||
+      activeVisualEffectType.includes("slide_left")
+    ) {
+      const offsetPercent = -p * 100;
+      transitionTransformStyle = {
+        transform: `translateX(${offsetPercent}%)`,
+        transition: "none",
+      };
+      transitionOverlayColor = "#09090b";
+      transitionOverlayOpacity = Math.sin(p * Math.PI) * 0.3;
+    } else if (
+      activeVisualEffectType.includes("slide_r") ||
+      activeVisualEffectType.includes("slide-r") ||
+      activeVisualEffectType.includes("slide_right")
+    ) {
+      const offsetPercent = p * 100;
+      transitionTransformStyle = {
+        transform: `translateX(${offsetPercent}%)`,
+        transition: "none",
+      };
+      transitionOverlayColor = "#09090b";
+      transitionOverlayOpacity = Math.sin(p * Math.PI) * 0.3;
+    } else if (
+      activeVisualEffectType.includes("slide_u") ||
+      activeVisualEffectType.includes("slide-u") ||
+      activeVisualEffectType.includes("slide_up")
+    ) {
+      const offsetPercent = -p * 100;
+      transitionTransformStyle = {
+        transform: `translateY(${offsetPercent}%)`,
+        transition: "none",
+      };
+      transitionOverlayColor = "#09090b";
+      transitionOverlayOpacity = Math.sin(p * Math.PI) * 0.3;
+    } else if (
+      activeVisualEffectType.includes("slide_d") ||
+      activeVisualEffectType.includes("slide-d") ||
+      activeVisualEffectType.includes("slide_down")
+    ) {
+      const offsetPercent = p * 100;
+      transitionTransformStyle = {
+        transform: `translateY(${offsetPercent}%)`,
+        transition: "none",
+      };
+      transitionOverlayColor = "#09090b";
+      transitionOverlayOpacity = Math.sin(p * Math.PI) * 0.3;
+    } else if (activeVisualEffectType.includes("zoom_in") || activeVisualEffectType.includes("zoom-in")) {
+      const scale = 1 + Math.sin(p * Math.PI) * 0.4;
+      const blurPx = Math.sin(p * Math.PI) * 4;
+      transitionTransformStyle = {
+        transform: `scale(${scale})`,
+        transformOrigin: "center center",
+      };
+      transitionFilterStyle = blurPx > 0.5 ? `blur(${blurPx}px)` : undefined;
+    } else if (activeVisualEffectType.includes("zoom_out") || activeVisualEffectType.includes("zoom-out")) {
+      const scale = 1 - Math.sin(p * Math.PI) * 0.28;
+      transitionTransformStyle = {
+        transform: `scale(${scale})`,
+        transformOrigin: "center center",
+      };
+    } else if (activeVisualEffectType.includes("punch")) {
+      const scale = 1 + Math.sin(p * Math.PI) * 0.32;
+      transitionTransformStyle = {
+        transform: `scale(${scale})`,
+        transformOrigin: "center center",
+      };
+    } else if (activeVisualEffectType.includes("quick_zoom") || activeVisualEffectType.includes("zoom")) {
+      const scale = 1 + Math.sin(p * Math.PI) * 0.26;
+      transitionTransformStyle = {
+        transform: `scale(${scale})`,
+        transformOrigin: "center center",
+      };
+    } else if (activeVisualEffectType.includes("blur")) {
+      const blurPx = Math.sin(p * Math.PI) * 16;
+      transitionFilterStyle = `blur(${blurPx}px)`;
+      transitionOverlayColor = "#000000";
+      transitionOverlayOpacity = Math.sin(p * Math.PI) * 0.35;
+    } else if (activeVisualEffectType.includes("glitch")) {
+      const skew = Math.sin(p * Math.PI * 6) * 10;
+      const shiftX = Math.sin(p * Math.PI * 8) * 20;
+      const hue = Math.sin(p * Math.PI * 4) * 180;
+      transitionTransformStyle = {
+        transform: `skewX(${skew}deg) translateX(${shiftX}px)`,
+      };
+      transitionFilterStyle = `hue-rotate(${hue}deg) contrast(180%) saturate(220%)`;
+    } else if (activeVisualEffectType.includes("noise") || activeVisualEffectType.includes("scanline")) {
+      const shiftY = Math.sin(p * Math.PI * 10) * 8;
+      transitionTransformStyle = {
+        transform: `translateY(${shiftY}px)`,
+      };
+      transitionFilterStyle = `contrast(200%) saturate(150%) brightness(1.2) hue-rotate(90deg)`;
+    } else if (activeVisualEffectType.includes("shake") || activeVisualEffectType.includes("earthquake")) {
+      const isQuake = activeVisualEffectType.includes("earthquake");
+      const shakeAmp = (isQuake ? 32 : 16) * Math.sin(p * Math.PI);
+      const shakeX = Math.sin(p * Math.PI * (isQuake ? 14 : 12)) * shakeAmp;
+      const shakeY = Math.cos(p * Math.PI * (isQuake ? 16 : 14)) * (shakeAmp * 0.75);
+      const rot = Math.sin(p * Math.PI * (isQuake ? 12 : 10)) * (isQuake ? 4.5 : 2.5);
+      transitionTransformStyle = {
+        transform: `translate3d(${shakeX}px, ${shakeY}px, 0) rotate(${rot}deg)`,
+      };
+    } else if (
+      activeVisualEffectType.includes("light_leak") ||
+      activeVisualEffectType.includes("leak") ||
+      activeVisualEffectType.includes("light")
+    ) {
+      transitionOverlayColor = "#f59e0b";
+      transitionOverlayOpacity = Math.sin(p * Math.PI) * 0.5;
+      transitionFilterStyle = `brightness(${1 + Math.sin(p * Math.PI) * 0.4}) saturate(${1 + Math.sin(p * Math.PI) * 0.5})`;
+    } else if (activeVisualEffectType.includes("freeze")) {
+      transitionOverlayColor = "#0284c7";
+      transitionOverlayOpacity = Math.sin(p * Math.PI) * 0.4;
+      transitionFilterStyle = `contrast(${1 + Math.sin(p * Math.PI) * 0.5}) brightness(${1 + Math.sin(p * Math.PI) * 0.3}) saturate(0.6)`;
+    } else if (activeVisualEffectType.includes("wipe")) {
+      const offsetPercent = -p * 100;
+      transitionTransformStyle = {
+        transform: `translateX(${offsetPercent}%)`,
+      };
+      transitionOverlayColor = "#09090b";
+      transitionOverlayOpacity = Math.sin(p * Math.PI) * 0.35;
+    }
+  }
   const renderedPreviewIsCleanFallback = Boolean(
     renderedPreviewUrl &&
       activeRender?.error_message?.includes("Sebagian efek gaya tidak diterapkan"),
@@ -3147,34 +5588,229 @@ export function TransformationPage() {
     );
     updateEffectTimeline(next);
   };
+
+  const isItemIdLocked = (itemId: string | null | undefined): boolean => {
+    if (!itemId) return false;
+    const cue = editableCaptionCues.find((c) => c.id === itemId);
+    if (cue) return Boolean(cue.locked);
+    const event = editableEffectTimeline.find((e) => e.id === itemId);
+    if (event) return Boolean(event.locked);
+    const video = videoSegments.find((v) => v.id === itemId);
+    if (video) return Boolean(video.locked || styleConfig.video_locked);
+    const audio = audioSegments.find((a) => a.id === itemId);
+    if (audio) return Boolean(audio.locked || styleConfig.audio_locked);
+    const addAudio = additionalAudioTracks.find((t) => t.id === itemId);
+    if (addAudio) return Boolean(addAudio.locked);
+    return false;
+  };
+
+  const startCanvasDrag = (
+    event: ReactPointerEvent<HTMLDivElement>,
+    targetType: "hook" | "sticker" | "keyword" | "caption",
+    targetId: string,
+    currentPosX: number,
+    currentPosY: number,
+    currentScale = 1.0,
+    currentFontSize?: number,
+  ) => {
+    if (isItemIdLocked(targetId)) {
+      setMessage("Item sedang dikunci.");
+      return;
+    }
+    const canvas = previewCanvasContainerRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    event.stopPropagation();
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    recordEditorHistory(draft, `canvas-drag-${targetType}`, true);
+
+    if (targetType === "caption") {
+      setSelectedCaptionId(targetId);
+      setSelectedEventId(null);
+      setSelectedEditorContext("caption");
+      setCaptionInspectorTab("text");
+    } else {
+      setSelectedEventId(targetId);
+      setSelectedCaptionId(null);
+      setSelectedEditorContext(targetType === "sticker" ? "keyword" : targetType);
+      setTextInspectorTab("text");
+    }
+
+    canvasManipulationRef.current = {
+      pointerId: event.pointerId,
+      mode: "drag",
+      targetType,
+      targetId,
+      startX: event.clientX,
+      startY: event.clientY,
+      initialPosX: currentPosX,
+      initialPosY: currentPosY,
+      initialScale: currentScale,
+      initialFontSize: currentFontSize,
+      canvasWidth: rect.width || 1,
+      canvasHeight: rect.height || 1,
+    };
+  };
+
+  const startCanvasResize = (
+    event: ReactPointerEvent<HTMLDivElement>,
+    handle: "tl" | "tr" | "bl" | "br",
+    targetType: "hook" | "sticker" | "keyword" | "caption",
+    targetId: string,
+    currentPosX: number,
+    currentPosY: number,
+    currentScale = 1.0,
+    currentFontSize?: number,
+  ) => {
+    if (isItemIdLocked(targetId)) {
+      setMessage("Item sedang dikunci.");
+      return;
+    }
+    const canvas = previewCanvasContainerRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    event.stopPropagation();
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    recordEditorHistory(draft, `canvas-resize-${targetType}`, true);
+
+    canvasManipulationRef.current = {
+      pointerId: event.pointerId,
+      mode: "resize",
+      handle,
+      targetType,
+      targetId,
+      startX: event.clientX,
+      startY: event.clientY,
+      initialPosX: currentPosX,
+      initialPosY: currentPosY,
+      initialScale: currentScale,
+      initialFontSize: currentFontSize,
+      canvasWidth: rect.width || 1,
+      canvasHeight: rect.height || 1,
+    };
+  };
+
+  const handleCanvasManipulationMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const action = canvasManipulationRef.current;
+    if (!action || action.pointerId !== event.pointerId) return;
+
+    if (action.mode === "drag") {
+      const deltaXPercent = ((event.clientX - action.startX) / action.canvasWidth) * 100;
+      const deltaYPercent = ((event.clientY - action.startY) / action.canvasHeight) * 100;
+      const nextX = Math.max(5, Math.min(95, Number((action.initialPosX + deltaXPercent).toFixed(1))));
+      const nextY = Math.max(5, Math.min(95, Number((action.initialPosY + deltaYPercent).toFixed(1))));
+
+      if (action.targetType === "caption") {
+        updateMainCaptionStyle({
+          position_x_percent: nextX,
+          position_y_percent: nextY,
+        });
+      } else {
+        replaceEvent(action.targetId, {
+          position_x_percent: nextX,
+          position_y_percent: nextY,
+        });
+      }
+    } else if (action.mode === "resize") {
+      const deltaX = event.clientX - action.startX;
+      const deltaY = event.clientY - action.startY;
+      const signX = action.handle === "tr" || action.handle === "br" ? 1 : -1;
+      const signY = action.handle === "bl" || action.handle === "br" ? 1 : -1;
+      const avgDelta = (deltaX * signX + deltaY * signY) / 2;
+      const scaleDelta = avgDelta / (action.canvasWidth * 0.35);
+
+      if (action.targetType === "caption") {
+        const baseSize = action.initialFontSize || resolvedCurrentCaptionStyle.font_size || 28;
+        const fontDelta = Math.round(avgDelta * 0.25);
+        const nextFontSize = Math.max(10, Math.min(96, baseSize + fontDelta));
+        updateMainCaptionStyle({
+          font_size: nextFontSize,
+        });
+      } else {
+        const nextScale = Math.max(
+          action.targetType === "sticker" ? 0.2 : 0.4,
+          Math.min(4.0, Number((action.initialScale + scaleDelta).toFixed(2))),
+        );
+        replaceEvent(action.targetId, {
+          scale: nextScale,
+        });
+      }
+    }
+  };
+
+  const handleCanvasManipulationUp = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const action = canvasManipulationRef.current;
+    if (!action || action.pointerId !== event.pointerId) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    canvasManipulationRef.current = null;
+    setAutosaveWakeRevision((r) => r + 1);
+  };
   const deleteEvent = (eventId: string) => {
     if (!window.confirm("Hapus event ini?")) return;
     updateEffectTimeline(editableEffectTimeline.filter((event) => event.id !== eventId));
     setSelectedEventId(null);
     setSelectedEditorContext("timeline");
   };
-  const addEvent = (type: "hook_text" | "punch_zoom" | "keyword_popup" | "pattern_interrupt") => {
+  const addEvent = (
+    type: "hook_text" | "punch_zoom" | "keyword_popup" | "pattern_interrupt",
+    customReason?: string,
+    customText?: string,
+    customPreset?: TextStylePresetKey,
+    customEffectName?: string,
+  ) => {
     const start = Math.min(Math.max(0, previewTime), Math.max(0, clipDuration - 0.4));
     const intensity = String(styleConfig.style_intensity || "low");
-    const zoom = intensity === "high" ? 1.14 : intensity === "medium" ? 1.1 : 1.06;
-    const base = {
-      id: newEventId(),
+    const zoom = intensity === "high" ? 1.25 : intensity === "medium" ? 1.20 : 1.18;
+    const eventId = newEventId();
+    const defaultText =
+      customText ||
+      (customReason?.includes("lower_third")
+        ? "Nama / Jabatan"
+        : customReason?.includes("quote")
+        ? "“Kutipan menarik di sini”"
+        : customReason?.includes("big_title")
+        ? "JUDUL BESAR"
+        : customReason?.includes("hook")
+        ? (hookFallbackText || "WAJIB TAHU INI!")
+        : "Teks Baru");
+    const defaultDuration =
+      type === "keyword_popup" ? 1.2 : type === "hook_text" ? 3 : type === "punch_zoom" ? 0.8 : 0.7;
+    const base: EffectTimelineEvent = {
+      id: eventId,
       type,
       start,
-      end: Math.min(clipDuration, start + (type === "keyword_popup" ? 1.2 : type === "hook_text" ? 3 : 1)),
-      reason: "manual timeline",
-    } as EffectTimelineEvent;
-    const event =
+      end: Math.min(clipDuration, start + defaultDuration),
+      reason: customReason || (type === "hook_text" ? "text:basic_text" : "manual timeline"),
+    };
+    if (customPreset) {
+      base.preset = customPreset;
+    }
+    const resolvedEffect =
+      customEffectName ||
+      (customReason?.startsWith("effect:")
+        ? customReason.replace("effect:", "").replace(/^ef-/, "").replace(/-/g, "_")
+        : "quick_zoom");
+    const event: EffectTimelineEvent =
       type === "keyword_popup"
-        ? { ...base, text: "" }
+        ? { ...base, text: customText || "KEYWORD" }
         : type === "punch_zoom"
-          ? { ...base, zoom }
+          ? { ...base, zoom, effect: "punch_zoom" }
           : type === "hook_text"
-            ? { ...base, text: hookFallbackText || "Hook video" }
-            : { ...base, effect: "quick_zoom_shift" };
+            ? { ...base, text: defaultText }
+            : { ...base, effect: resolvedEffect };
     updateEffectTimeline([...editableEffectTimeline, event]);
     setSelectedEventId(event.id || null);
-    setSelectedEditorContext(contextFromEventType(event.type));
+    setSelectedCaptionId(null);
+    setSelectedEditorContext(type === "keyword_popup" ? "keyword" : type === "hook_text" ? "hook" : "effect");
+    if (type === "hook_text" || type === "keyword_popup") {
+      setTextInspectorTab("text");
+    } else {
+      setEffectInspectorTab("effect");
+    }
   };
   const timelineVideoItems: TimelineItem[] = videoSegments.map((segment) => ({
     ...segment,
@@ -3184,20 +5820,28 @@ export function TransformationPage() {
     title: `Video bagian ${segment.number}\n${formatTimePrecise(segment.start)}-${formatTimePrecise(segment.end)}\n${audioExtracted ? "Track video" : "Video dengan audio asli tertaut"}`,
     active: selectedMediaSegmentId === segment.id,
     colorClass: "bg-blue-600 text-white",
+    locked: Boolean(segment.locked || styleConfig.video_locked),
+    visible: (segment.visible !== false) && (styleConfig.video_visible !== false),
   }));
   const timelineAudioItems: TimelineItem[] = audioSegments.map((segment) => ({
-        ...segment,
-        selectable: true,
-        type: "audio",
-        label: audioSettings.muted
-          ? "Audio asli • Mute"
-          : `Audio asli • ${Math.round(audioSettings.volume * 100)}%`,
-        title: `Audio asli\nVolume ${Math.round(audioSettings.volume * 100)}%\nFade in ${audioSettings.fade_in.toFixed(1)}s • Fade out ${audioSettings.fade_out.toFixed(1)}s`,
-        active: selectedMediaSegmentId === segment.id,
-        colorClass: audioSettings.muted ? "bg-slate-400 text-white" : "bg-emerald-500 text-white",
-      }));
+    ...segment,
+    selectable: true,
+    type: "audio",
+    label: audioSettings.muted
+      ? "Audio asli • Mute"
+      : `Audio asli • ${Math.round(audioSettings.volume * 100)}%`,
+    title: `Audio asli\nVolume ${Math.round(audioSettings.volume * 100)}%\nFade in ${audioSettings.fade_in.toFixed(1)}s • Fade out ${audioSettings.fade_out.toFixed(1)}s`,
+    active: selectedMediaSegmentId === segment.id,
+    colorClass: audioSettings.muted ? "bg-slate-400 text-white" : "bg-emerald-500 text-white",
+    locked: Boolean(segment.locked || styleConfig.audio_locked),
+    muted: Boolean(segment.muted || audioSettings.muted),
+  }));
   const timelineAdditionalAudioTracks = additionalAudioTracks.map((track) => {
     const asset = additionalAudioAssets.find((item) => item.id === track.asset_id);
+    const trackSpeed = Math.max(0.5, Math.min(2.0, track.speed || 1.0));
+    const baseDuration = Number(track.base_duration) || (asset?.duration_seconds ? Number(asset.duration_seconds) : Math.max(0.1, track.end - track.start));
+    const effectiveDuration = baseDuration / trackSpeed;
+    const effectiveEnd = track.start + effectiveDuration;
     return {
       track,
       item: {
@@ -3205,111 +5849,282 @@ export function TransformationPage() {
         selectable: true,
         type: "additional_audio",
         start: Math.max(0, track.start),
-        end: Math.min(timelineScaleDuration, Math.max(track.start + 0.1, track.end)),
+        end: Math.min(timelineScaleDuration, Math.max(track.start + 0.1, effectiveEnd)),
         label: asset?.name || track.label,
-        title: `${track.label}\n${asset?.name || "Aset audio"}\nBelum ikut live preview/output export`,
+        title: `${track.label}\n${asset?.name || "Aset audio"}\nSpeed: ${trackSpeed.toFixed(2)}x`,
         active: selectedAdditionalAudioTrackId === track.id,
         colorClass: track.kind === "sfx"
           ? "bg-amber-500 text-slate-950"
           : "bg-fuchsia-600 text-white",
+        locked: Boolean(track.locked),
+        muted: Boolean(track.muted),
       } satisfies TimelineItem,
     };
   });
-  const timelineCaptionItems: TimelineItem[] = editableCaptionCues
-    .map((cue, index) => ({
+  const hookEvents = editableEffectTimeline.filter((event) => event.type === "hook_text");
+
+  const textTimelineItems: TimelineItem[] = [
+    // 1. Caption Cues
+    ...editableCaptionCues.map((cue, index) => ({
       id: cue.id || `caption-${index}`,
       eventId: cue.id,
-      editable: true,
+      editable: !cue.locked,
       selectable: true,
       type: "caption",
       start: cue.start,
       end: cue.end,
-      label: "",
+      label: cue.text ? `Caption: ${cue.text.length > 20 ? cue.text.slice(0, 20) + "..." : cue.text}` : "Caption",
       active: currentCaptionCue?.id === cue.id,
       title: `Caption\n${formatTimePrecise(cue.start)}-${formatTimePrecise(cue.end)}\n${cue.text}`,
-      colorClass: "bg-violet-500/90 text-white",
-    }));
-  const hookEvents = editableEffectTimeline.filter((event) => event.type === "hook_text");
-  const timelineHookItems: TimelineItem[] = (
-    hookEvents.length
-      ? hookEvents
-      : !effectTimelineInitialized && styleConfig.hook_text_enabled && hookFallbackText
-        ? [
-            {
-              id: "hook-preview",
-              type: "hook_text",
-              start: 0,
-              end: Math.min(3, Math.max(1, clipDuration)),
-              text: hookFallbackText,
-            },
-          ]
-        : []
-  ).map((event) => ({
-    id: event.id || "hook-preview",
-    eventId: event.id,
-    editable: Boolean(event.id),
-    selectable: true,
-    type: "hook_text",
-    start: event.start,
-    end: event.end,
-    label: "Hook",
-    active: previewTime >= event.start && previewTime <= event.end,
-    title: `Hook Text\n${formatTimePrecise(event.start)}-${formatTimePrecise(event.end)}\n${hookCueText(event, hookFallbackText)}`,
-    colorClass: "bg-cyan-500 text-white",
-  }));
-  const timelinePunchItems: TimelineItem[] = editableEffectTimeline
-    .filter((event) => event.type === "punch_zoom" && event.end > event.start)
-    .map((event, index) => ({
-      id: `punch-${index}`,
-      eventId: event.id,
-      editable: true,
-      type: event.type,
-      start: event.start,
-      end: event.end,
-      label: `${event.zoom?.toFixed(2) || "1.08"}x`,
-      active: previewTime >= event.start && previewTime <= event.end,
-      title: `Punch Zoom\n${formatTimePrecise(event.start)}-${formatTimePrecise(event.end)} - zoom ${
-        event.zoom?.toFixed(2) || "1.08"
-      }x${event.reason ? `\nReason: ${event.reason}` : ""}`,
-      colorClass: "bg-rose-500 text-white",
-    }));
-  const timelineKeywordItems: TimelineItem[] = editableEffectTimeline
-    .filter((event) => event.type === "keyword_popup" && event.end > event.start && event.text)
-    .map((event, index) => ({
-      id: `keyword-${index}`,
-      eventId: event.id,
-      editable: true,
-      type: event.type,
-      start: event.start,
-      end: event.end,
-      label: event.text || "Keyword",
-      active: previewTime >= event.start && previewTime <= event.end,
-      title: `Keyword Pop-up\n${formatTimePrecise(event.start)}-${formatTimePrecise(event.end)}\n"${
-        event.text || ""
-      }"${event.reason ? `\nReason: ${event.reason}` : ""}`,
-      colorClass: "bg-yellow-300 text-slate-950",
-    }));
-  const timelinePatternItems: TimelineItem[] = editableEffectTimeline
-    .filter((event) => event.type === "pattern_interrupt" && event.end > event.start)
-    .map((event, index) => ({
-      id: `pattern-${index}`,
-      eventId: event.id,
-      editable: true,
-      type: event.type,
-      start: event.start,
-      end: event.end,
-      label: "Pattern",
-      active: previewTime >= event.start && previewTime <= event.end,
-      title: `Pattern Interrupt\n${formatTimePrecise(event.start)}-${formatTimePrecise(event.end)}${
-        event.reason ? `\nReason: ${event.reason}` : ""
-      }`,
-      colorClass: "bg-teal-500 text-white",
-    }));
-  const effectSummary = {
-    punch: timelinePunchItems.length,
-    keyword: timelineKeywordItems.length,
-    pattern: timelinePatternItems.length,
-  };
+      colorClass: "bg-violet-600/90 text-white font-medium",
+      locked: Boolean(cue.locked),
+      visible: cue.visible !== false,
+    })),
+
+    // 2. Hook & Text items (hook_text, basic_text, lower_third, quote, big_title, title_overlay, property_of)
+    ...(
+      hookEvents.length
+        ? hookEvents
+        : !effectTimelineInitialized && styleConfig.hook_text_enabled && hookFallbackText
+          ? [
+              {
+                id: "hook-preview",
+                type: "hook_text",
+                start: 0,
+                end: Math.min(3, Math.max(1, clipDuration)),
+                text: hookFallbackText,
+                reason: "hook",
+              },
+            ]
+          : []
+    ).map((event) => {
+      const rawText = hookCueText(event, hookFallbackText);
+      const reasonLower = (event.reason || "").toLowerCase();
+      const badge = reasonLower.includes("lower_third")
+        ? "Lower Third"
+        : reasonLower.includes("quote")
+        ? "Quote"
+        : reasonLower.includes("big_title")
+        ? "Big Title"
+        : reasonLower.includes("property_of")
+        ? "Property Of"
+        : reasonLower.includes("title_overlay")
+        ? "Title"
+        : reasonLower.includes("basic_text") || reasonLower.includes("default_text")
+        ? "Text"
+        : "Hook";
+      const displayLabel = rawText
+        ? `${badge}: ${rawText.length > 20 ? rawText.slice(0, 20) + "..." : rawText}`
+        : badge;
+      return {
+        id: event.id || "hook-preview",
+        eventId: event.id,
+        editable: Boolean(event.id) && !event.locked,
+        selectable: true,
+        type: "hook_text",
+        start: event.start,
+        end: event.end,
+        label: displayLabel,
+        active: previewTime >= event.start && previewTime <= event.end,
+        title: `${badge}\n${formatTimePrecise(event.start)}-${formatTimePrecise(event.end)}\n${rawText}`,
+        colorClass: "bg-cyan-600 text-white font-semibold",
+        locked: Boolean(event.locked),
+        visible: event.visible !== false,
+      };
+    }),
+
+    // 3. Keyword text items (type: "keyword_popup" when NOT a sticker)
+    ...editableEffectTimeline
+      .filter(
+        (event) =>
+          event.type === "keyword_popup" &&
+          event.end > event.start &&
+          event.text &&
+          !event.reason?.toLowerCase().includes("sticker"),
+      )
+      .map((event, index) => {
+        const text = event.text || "";
+        const label = `Keyword: ${text || "KEYWORD"}`;
+        const displayLabel = text ? (label.length > 22 ? label.slice(0, 22) + "..." : label) : "Keyword";
+        return {
+          id: event.id || `keyword-${index}`,
+          eventId: event.id,
+          editable: !event.locked,
+          type: event.type,
+          start: event.start,
+          end: event.end,
+          label: displayLabel,
+          active: previewTime >= event.start && previewTime <= event.end,
+          title: `Keyword Pop-up\n${formatTimePrecise(event.start)}-${formatTimePrecise(event.end)}\n"${
+            event.text || ""
+          }"${event.reason ? `\nReason: ${event.reason}` : ""}`,
+          colorClass: "bg-yellow-300 text-slate-950 font-semibold",
+          locked: Boolean(event.locked),
+          visible: event.visible !== false,
+        };
+      }),
+  ];
+
+  const overlayTimelineItems: TimelineItem[] = [
+    // 1. Stickers (Sticker, Emoji, Shapes, Arrows, Badges)
+    ...editableEffectTimeline
+      .filter(
+        (event) =>
+          event.type === "keyword_popup" &&
+          Boolean(event.reason?.toLowerCase().includes("sticker")) &&
+          event.end > event.start &&
+          event.text,
+      )
+      .map((event, index) => {
+        const text = event.text || "";
+        const reasonLower = (event.reason || "").toLowerCase();
+        const badge = reasonLower.includes("arrow")
+          ? "Arrow"
+          : reasonLower.includes("shape")
+          ? "Shape"
+          : reasonLower.includes("badge")
+          ? "Badge"
+          : "Sticker";
+        const label = `${badge}: ${text}`;
+        return {
+          id: event.id || `sticker-${index}`,
+          eventId: event.id,
+          editable: !event.locked,
+          type: "keyword_popup",
+          start: event.start,
+          end: event.end,
+          label: label.length > 22 ? label.slice(0, 22) + "..." : label,
+          active: previewTime >= event.start && previewTime <= event.end,
+          title: `${badge}: ${event.text}\n${formatTimePrecise(event.start)}-${formatTimePrecise(event.end)}`,
+          colorClass: "bg-amber-400 text-slate-950 font-bold",
+          locked: Boolean(event.locked),
+          visible: event.visible !== false,
+        };
+      }),
+
+    // 2. Punch Zoom
+    ...editableEffectTimeline
+      .filter((event) => event.type === "punch_zoom" && event.end > event.start)
+      .map((event, index) => ({
+        id: event.id || `punch-${index}`,
+        eventId: event.id,
+        editable: !event.locked,
+        type: event.type,
+        start: event.start,
+        end: event.end,
+        label: `Punch: ${event.zoom?.toFixed(2) || "1.08"}x`,
+        active: previewTime >= event.start && previewTime <= event.end,
+        title: `Punch Zoom\n${formatTimePrecise(event.start)}-${formatTimePrecise(event.end)} - zoom ${
+          event.zoom?.toFixed(2) || "1.08"
+        }x${event.reason ? `\nReason: ${event.reason}` : ""}`,
+        colorClass: "bg-rose-500 text-white font-medium",
+        locked: Boolean(event.locked),
+        visible: event.visible !== false,
+      })),
+
+    // 3. Pattern Interrupt / Effects
+    ...editableEffectTimeline
+      .filter(
+        (event) =>
+          event.type === "pattern_interrupt" &&
+          event.end > event.start &&
+          !event.reason?.startsWith("transition"),
+      )
+      .map((event, index) => {
+        const effectLabel = event.effect?.replace(/_/g, " ") || "Pattern";
+        return {
+          id: event.id || `pattern-${index}`,
+          eventId: event.id,
+          editable: !event.locked,
+          type: event.type,
+          start: event.start,
+          end: event.end,
+          label: `Effect: ${effectLabel}`,
+          active: previewTime >= event.start && previewTime <= event.end,
+          title: `Pattern Interrupt\n${formatTimePrecise(event.start)}-${formatTimePrecise(event.end)}\nEffect: ${effectLabel}`,
+          colorClass: "bg-teal-500 text-white font-medium",
+          locked: Boolean(event.locked),
+          visible: event.visible !== false,
+        };
+      }),
+  ];
+
+  const timelineTransitionMarkers = (() => {
+    if (videoClipBoundaries.length === 0) return [];
+    const transitionEvents = editableEffectTimeline.filter(
+      (e) => e.type === "pattern_interrupt" && e.reason?.startsWith("transition"),
+    );
+
+    const markers: Array<{
+      id: string;
+      eventId: string;
+      time: number;
+      duration: number;
+      name: string;
+      effect: string;
+      active: boolean;
+      selected: boolean;
+      beforeNumber: number;
+      afterNumber: number;
+    }> = [];
+
+    videoClipBoundaries.forEach((boundary) => {
+      const matching = transitionEvents.find((e) => {
+        const mid = (e.start + e.end) / 2;
+        return (
+          Math.abs(mid - boundary.time) <= 0.4 ||
+          Math.abs(e.start - boundary.time) <= 0.4 ||
+          Math.abs(e.end - boundary.time) <= 0.4
+        );
+      });
+
+      if (matching) {
+        const name = matching.reason?.replace("transition:", "") || "Transisi";
+        markers.push({
+          id: `trans-marker-${boundary.boundaryId}`,
+          eventId: matching.id || `trans-${boundary.index}`,
+          time: boundary.time,
+          duration: matching.end - matching.start,
+          name,
+          effect: matching.effect || "fade",
+          active: previewTime >= matching.start && previewTime <= matching.end,
+          selected: selectedEventId === matching.id,
+          beforeNumber: boundary.beforeSegment.number,
+          afterNumber: boundary.afterSegment.number,
+        });
+      }
+    });
+
+    return markers;
+  })();
+  const selectedTransitionBoundary = (() => {
+    if (!selectedEvent || !selectedEvent.reason?.startsWith("transition")) return null;
+    const mid = (selectedEvent.start + selectedEvent.end) / 2;
+    return (
+      videoClipBoundaries.find(
+        (b) =>
+          Math.abs(b.time - mid) <= 0.4 ||
+          Math.abs(b.time - selectedEvent.start) <= 0.4 ||
+          Math.abs(b.time - selectedEvent.end) <= 0.4,
+      ) || null
+    );
+  })();
+  const audioTimelineItems: TimelineItem[] = [
+    ...(audioExtracted ? timelineAudioItems : []),
+    ...timelineAdditionalAudioTracks.map((t) => t.item),
+  ];
+
+  const textLanes = packTimelineItemsIntoLanes(textTimelineItems);
+  const overlayLanes = packTimelineItemsIntoLanes(overlayTimelineItems);
+  const videoLanes = packTimelineItemsIntoLanes(timelineVideoItems);
+  const audioLanes = packTimelineItemsIntoLanes(audioTimelineItems);
+
+  const hasAnyTimelineTracks = Boolean(
+    textLanes.length > 0 ||
+      overlayLanes.length > 0 ||
+      videoLanes.length > 0 ||
+      audioLanes.length > 0,
+  );
   const hookWords = hookWordCount(styleConfig.hook_text);
   const clampClipTime = (value: number) =>
     Math.min(Math.max(0, Number.isFinite(value) ? value : 0), Math.max(0, clipDuration));
@@ -3317,6 +6132,7 @@ export function TransformationPage() {
     if (renderedPreviewUrl) {
       return clampClipTime(videoTime);
     }
+    if (videoSegments.length === 0) return 0;
     const sourceTime = videoTime;
     const currentIndex = videoSegments.findIndex(
       (segment) =>
@@ -3331,12 +6147,12 @@ export function TransformationPage() {
       if (video) video.currentTime = next.sourceStart;
       return next.start;
     }
-    return clampClipTime(
-      segment.start + Math.min(
-        segment.sourceEnd - segment.sourceStart,
-        Math.max(0, sourceTime - segment.sourceStart),
-      ),
+    const relativeSourceTime = Math.min(
+      segment.sourceEnd - segment.sourceStart,
+      Math.max(0, sourceTime - segment.sourceStart),
     );
+    const relativeTimelineTime = relativeSourceTime / videoSpeed;
+    return clampClipTime(segment.start + relativeTimelineTime);
   };
   const updateCaptionTimeline = (
     cues: EditableCaptionCue[],
@@ -3388,49 +6204,343 @@ export function TransformationPage() {
         : "Sinkronisasi selesai, tetapi tidak ada segment caption yang overlap dengan video.",
     );
   };
+
+  const toggleLaneLock = (laneItems: TimelineItem[]) => {
+    if (!laneItems.length) return;
+    const allLocked = laneItems.every((item) => Boolean(item.locked));
+    const targetLocked = !allLocked;
+    const itemIds = new Set(laneItems.map((item) => item.id || item.eventId).filter(Boolean));
+
+    const matchingCues = editableCaptionCues.filter((c) => itemIds.has(c.id));
+    if (matchingCues.length > 0) {
+      updateCaptionTimeline(
+        editableCaptionCues.map((c) =>
+          itemIds.has(c.id) ? { ...c, locked: targetLocked } : c,
+        ),
+        true,
+      );
+    }
+
+    const matchingEffects = editableEffectTimeline.filter((e) => itemIds.has(e.id));
+    if (matchingEffects.length > 0) {
+      updateEffectTimeline(
+        editableEffectTimeline.map((e) =>
+          itemIds.has(e.id) ? { ...e, locked: targetLocked } : e,
+        ),
+        true,
+      );
+    }
+
+    const matchingVideos = videoSegments.filter((v) => itemIds.has(v.id));
+    if (matchingVideos.length > 0) {
+      if (videoSequence.length > 0) {
+        const nextVideoSeq = videoSequence.map((v) =>
+          itemIds.has(v.id) ? { ...v, locked: targetLocked } : v,
+        );
+        commitMediaSequence(nextVideoSeq, configuredEffectTimeline, "video");
+      } else {
+        setStyle("video_locked", targetLocked);
+      }
+    }
+
+    const matchingAudios = audioSegments.filter((a) => itemIds.has(a.id));
+    if (matchingAudios.length > 0) {
+      if (audioSequence.length > 0) {
+        const nextAudioSeq = audioSequence.map((a) =>
+          itemIds.has(a.id) ? { ...a, locked: targetLocked } : a,
+        );
+        commitMediaSequence(nextAudioSeq, configuredEffectTimeline, "audio");
+      } else {
+        setStyle("audio_locked", targetLocked);
+      }
+    }
+
+    const matchingAddTracks = additionalAudioTracks.filter((t) => itemIds.has(t.id));
+    if (matchingAddTracks.length > 0) {
+      const nextAddTracks = additionalAudioTracks.map((t) =>
+        itemIds.has(t.id) ? { ...t, locked: targetLocked } : t,
+      );
+      updateAdditionalAudioLibrary(additionalAudioAssets, nextAddTracks);
+    }
+
+    setMessage(targetLocked ? "Item pada lane dikunci." : "Kunci item pada lane dibuka.");
+  };
+
+  const toggleLaneVisibility = (laneItems: TimelineItem[]) => {
+    if (!laneItems.length) return;
+    const allVisible = laneItems.every((item) => item.visible !== false);
+    const targetVisible = !allVisible;
+    const itemIds = new Set(laneItems.map((item) => item.id || item.eventId).filter(Boolean));
+
+    const matchingCues = editableCaptionCues.filter((c) => itemIds.has(c.id));
+    if (matchingCues.length > 0) {
+      updateCaptionTimeline(
+        editableCaptionCues.map((c) =>
+          itemIds.has(c.id) ? { ...c, visible: targetVisible } : c,
+        ),
+        true,
+      );
+    }
+
+    const matchingEffects = editableEffectTimeline.filter((e) => itemIds.has(e.id));
+    if (matchingEffects.length > 0) {
+      updateEffectTimeline(
+        editableEffectTimeline.map((e) =>
+          itemIds.has(e.id) ? { ...e, visible: targetVisible } : e,
+        ),
+        true,
+      );
+    }
+
+    const matchingVideos = videoSegments.filter((v) => itemIds.has(v.id));
+    if (matchingVideos.length > 0) {
+      if (videoSequence.length > 0) {
+        const nextVideoSeq = videoSequence.map((v) =>
+          itemIds.has(v.id) ? { ...v, visible: targetVisible } : v,
+        );
+        commitMediaSequence(nextVideoSeq, configuredEffectTimeline, "video");
+      } else {
+        setStyle("video_visible", targetVisible);
+      }
+    }
+
+    setMessage(targetVisible ? "Item pada lane ditampilkan." : "Item pada lane disembunyikan dari preview.");
+  };
+
+  const toggleLaneMute = (laneItems: TimelineItem[]) => {
+    if (!laneItems.length) return;
+    const isExtractedAudioLane = laneItems.some((item) => item.type === "audio");
+    if (isExtractedAudioLane) {
+      const nextMuted = !audioSettings.muted;
+      setAudioSettings({ muted: nextMuted });
+      if (audioSequence.length > 0) {
+        const nextAudioSeq = audioSequence.map((a) => ({ ...a, muted: nextMuted }));
+        commitMediaSequence(nextAudioSeq, configuredEffectTimeline, "audio");
+      }
+      setMessage(nextMuted ? "Audio asli dibisukan (mute)." : "Audio asli diaktifkan kembali.");
+      return;
+    }
+
+    const itemIds = new Set(laneItems.map((item) => item.id));
+    const laneTracks = additionalAudioTracks.filter((t) => itemIds.has(t.id));
+    const allMuted = laneTracks.length > 0 && laneTracks.every((t) => t.muted);
+    const nextMuted = !allMuted;
+    const nextTracks = additionalAudioTracks.map((t) =>
+      itemIds.has(t.id) ? { ...t, muted: nextMuted } : t,
+    );
+    updateAdditionalAudioLibrary(additionalAudioAssets, nextTracks);
+    setMessage(nextMuted ? "Track audio dibisukan (mute)." : "Track audio diaktifkan kembali.");
+  };
+
+  const hasTimelineMedia = Boolean(
+    (videoSegments.length > 0 && !videoTrackDeleted) ||
+      (audioSegments.length > 0 && !audioTrackDeleted) ||
+      additionalAudioTracks.length > 0 ||
+      Boolean(context.data?.uploaded_filename) ||
+        Boolean(draft?.candidate_id),
+  );
   const videoTimeFromClipTime = (clipTime: number) => {
     const safeTime = clampClipTime(clipTime);
     if (renderedPreviewUrl) return safeTime;
+    if (videoSegments.length === 0) return 0;
     const segment = videoSegments.find(
       (item) => safeTime >= item.start && safeTime <= item.end,
     ) || videoSegments[videoSegments.length - 1];
     if (!segment) return 0;
-    return segment.sourceStart + safeTime - segment.start;
+    const relativeTime = Math.max(0, safeTime - segment.start);
+    const sourceOffset = relativeTime * videoSpeed;
+    return Math.min(segment.sourceEnd, segment.sourceStart + sourceOffset);
   };
   const audioTimeFromClipTime = (clipTime: number) => {
     const safeTime = clampClipTime(clipTime);
+    if (audioSegments.length === 0) return null;
+    const currentAudioSpeed = audioExtracted
+      ? Math.max(0.5, Math.min(2.0, audioSettings.speed || 1.0))
+      : videoSpeed;
     const segment = audioSegments.find(
       (item) => safeTime >= item.start && safeTime < item.end - 0.001,
     );
     if (!segment) return null;
-    return segment.sourceStart + safeTime - segment.start;
+    const relativeTime = Math.max(0, safeTime - segment.start);
+    const sourceOffset = relativeTime * currentAudioSpeed;
+    return Math.min(segment.sourceEnd, segment.sourceStart + sourceOffset);
   };
-  const syncExtractedPreviewAudio = (clipTime: number, shouldPlay: boolean) => {
-    if (!audioExtracted || renderedPreviewUrl) return;
+  const syncExtractedPreviewAudio = (
+    clipTime: number,
+    shouldPlay: boolean,
+    isSeeking = false,
+  ) => {
+    if (!audioExtracted || renderedPreviewUrl || audioTrackDeleted) {
+      if (previewAudioRef.current && !previewAudioRef.current.paused) {
+        previewAudioRef.current.pause();
+      }
+      return;
+    }
     const audio = previewAudioRef.current;
     if (!audio) return;
     const sourceTime = audioTimeFromClipTime(clipTime);
     audio.muted = audioSettings.muted;
-    audio.volume = Math.min(1, audioSettings.volume);
-    if (sourceTime === null) {
-      audio.pause();
+    const speed = Math.max(0.5, Math.min(2.0, audioSettings.speed || 1.0));
+    if (audio.playbackRate !== speed) {
+      audio.playbackRate = speed;
+    }
+    let fadeFactor = 1.0;
+    if (audioSettings.fade_in && audioSettings.fade_in > 0 && clipTime < audioSettings.fade_in) {
+      fadeFactor = Math.max(0, clipTime / audioSettings.fade_in);
+    }
+    const remainingTime = clipDuration - clipTime;
+    if (audioSettings.fade_out && audioSettings.fade_out > 0 && remainingTime < audioSettings.fade_out) {
+      fadeFactor = Math.min(fadeFactor, Math.max(0, remainingTime / audioSettings.fade_out));
+    }
+    const targetVolume = audioSettings.muted ? 0 : Math.min(1, Math.max(0, audioSettings.volume * fadeFactor));
+    if (audio.volume !== targetVolume) {
+      audio.volume = targetVolume;
+    }
+
+    if (sourceTime === null || clipTime >= audioLayout.duration) {
+      if (!audio.paused) audio.pause();
       return;
     }
-    if (Math.abs(audio.currentTime - sourceTime) > 0.18) {
+
+    if (isSeeking) {
       audio.currentTime = sourceTime;
+    } else {
+      const drift = Math.abs(audio.currentTime - sourceTime);
+      const DRIFT_TOLERANCE = 0.25;
+      if (drift > DRIFT_TOLERANCE) {
+        audio.currentTime = sourceTime;
+      }
     }
-    if (shouldPlay && !audioSettings.muted && audio.paused) {
-      void audio.play().catch(() => undefined);
-    } else if (!shouldPlay || audioSettings.muted) {
-      audio.pause();
+
+    if (shouldPlay && !audioSettings.muted && targetVolume > 0) {
+      if (audio.paused) {
+        void audio.play().catch(() => undefined);
+      }
+    } else if (!shouldPlay || audioSettings.muted || targetVolume === 0) {
+      if (!audio.paused) {
+        audio.pause();
+      }
     }
+  };
+  const syncAdditionalAudioTracks = (
+    clipTime: number,
+    shouldPlay: boolean,
+    isSeeking = false,
+  ) => {
+    if (renderedPreviewUrl) {
+      activeAudioElementsRef.current.forEach((el) => {
+        if (!el.paused) el.pause();
+      });
+      return;
+    }
+    const currentTrackIds = new Set(additionalAudioTracks.map((t) => t.id));
+    for (const [id, el] of activeAudioElementsRef.current.entries()) {
+      if (!currentTrackIds.has(id)) {
+        el.pause();
+        el.src = "";
+        activeAudioElementsRef.current.delete(id);
+      }
+    }
+
+    additionalAudioTracks.forEach((track) => {
+      const trackSpeed = Math.max(0.5, Math.min(2.0, track.speed || 1.0));
+      const baseDuration = track.base_duration || Math.max(0.1, track.end - track.start);
+      const effectiveDuration = baseDuration / trackSpeed;
+      const effectiveEnd = track.start + effectiveDuration;
+      const isWithinTrack = clipTime >= track.start && clipTime <= effectiveEnd;
+      const isSeedSfx = track.asset_id.startsWith("sfx-");
+      const isSeedMusic = track.asset_id.startsWith("mus-");
+      const isTrackMuted = Boolean(track.muted);
+      const baseVol = isTrackMuted ? 0 : Math.min(2, Math.max(0, track.volume ?? 1));
+
+      let fadeFactor = 1.0;
+      if (isWithinTrack && baseVol > 0) {
+        const offset = clipTime - track.start;
+        const remaining = effectiveEnd - clipTime;
+        if (track.fade_in && track.fade_in > 0 && offset < track.fade_in) {
+          fadeFactor = Math.max(0, offset / track.fade_in);
+        }
+        if (track.fade_out && track.fade_out > 0 && remaining < track.fade_out) {
+          fadeFactor = Math.min(fadeFactor, Math.max(0, remaining / track.fade_out));
+        }
+      }
+      const effectiveVol = Math.min(1, Math.max(0, baseVol * fadeFactor));
+
+      if (isSeedSfx) {
+        if (shouldPlay && isWithinTrack && effectiveVol > 0) {
+          if (!lastTriggeredSfxRef.current.has(track.id) && clipTime - track.start < 0.25) {
+            playSynthesizedSound(sfxIdToSoundType(track.asset_id), effectiveVol);
+            lastTriggeredSfxRef.current.add(track.id);
+          }
+        } else if (clipTime < track.start || clipTime > effectiveEnd) {
+          lastTriggeredSfxRef.current.delete(track.id);
+        }
+      } else if (isSeedMusic) {
+        if (shouldPlay && isWithinTrack && effectiveVol > 0) {
+          if (!lastTriggeredSfxRef.current.has(track.id) && clipTime - track.start < 0.25) {
+            playSynthesizedSound("music_preview", effectiveVol * 0.6);
+            lastTriggeredSfxRef.current.add(track.id);
+          }
+        } else if (clipTime < track.start || clipTime > effectiveEnd) {
+          lastTriggeredSfxRef.current.delete(track.id);
+        }
+      } else {
+        let audioEl = activeAudioElementsRef.current.get(track.id);
+        if (!audioEl) {
+          audioEl = new Audio(uploadedAudioUrl(transformationId, track.asset_id));
+          audioEl.preload = "auto";
+          activeAudioElementsRef.current.set(track.id, audioEl);
+        }
+        audioEl.muted = isTrackMuted || effectiveVol === 0;
+        if (audioEl.volume !== effectiveVol) {
+          audioEl.volume = effectiveVol;
+        }
+        audioEl.loop = Boolean(track.loop);
+        if (audioEl.playbackRate !== trackSpeed) {
+          audioEl.playbackRate = trackSpeed;
+        }
+
+        const trackOffset = Math.max(0, (clipTime - track.start) * trackSpeed);
+        if (isWithinTrack && shouldPlay && effectiveVol > 0) {
+          if (isSeeking) {
+            audioEl.currentTime = trackOffset;
+          } else {
+            const drift = Math.abs(audioEl.currentTime - trackOffset);
+            const DRIFT_TOLERANCE = 0.25;
+            if (drift > DRIFT_TOLERANCE) {
+              audioEl.currentTime = trackOffset;
+            }
+          }
+          if (audioEl.paused) {
+            void audioEl.play().catch(() => {});
+          }
+        } else {
+          if (!audioEl.paused) {
+            audioEl.pause();
+          }
+          if (isSeeking && isWithinTrack) {
+            audioEl.currentTime = trackOffset;
+          }
+        }
+      }
+    });
   };
   const setPreviewTimeFromVideo = (videoTime: number) => {
     if (timelineDraggingRef.current) return;
     const clipTime = clipTimeFromVideoTime(videoTime);
     previewTimeRef.current = clipTime;
     setPreviewTime(clipTime);
-    syncExtractedPreviewAudio(clipTime, !previewVideoRef.current?.paused);
+    const isPlaying = !previewVideoRef.current?.paused;
+    syncExtractedPreviewAudio(clipTime, isPlaying, false);
+    syncAdditionalAudioTracks(clipTime, isPlaying, false);
+  };
+  const handleVideoSeeked = (videoTime: number) => {
+    const clipTime = clipTimeFromVideoTime(videoTime);
+    previewTimeRef.current = clipTime;
+    setPreviewTime(clipTime);
+    const isPlaying = !previewVideoRef.current?.paused;
+    syncExtractedPreviewAudio(clipTime, isPlaying, true);
+    syncAdditionalAudioTracks(clipTime, isPlaying, true);
   };
   const seekPreviewTo = (clipTime: number) => {
     const safeTime = clampClipTime(clipTime);
@@ -3438,9 +6548,21 @@ export function TransformationPage() {
     previewTimeRef.current = safeTime;
     setPreviewTime(safeTime);
     if (video) {
-      video.currentTime = videoTimeFromClipTime(safeTime);
+      if (safeTime < videoLayout.duration) {
+        const targetVideoTime = videoTimeFromClipTime(safeTime);
+        if (Math.abs(video.currentTime - targetVideoTime) > 0.05) {
+          video.currentTime = targetVideoTime;
+        }
+      } else {
+        const lastSegment = videoSegments[videoSegments.length - 1];
+        if (lastSegment) {
+          video.currentTime = lastSegment.sourceEnd;
+        }
+      }
     }
-    syncExtractedPreviewAudio(safeTime, Boolean(video && !video.paused));
+    const isPlaying = Boolean(video && !video.paused);
+    syncExtractedPreviewAudio(safeTime, isPlaying, true);
+    syncAdditionalAudioTracks(safeTime, isPlaying, true);
   };
   const stopPreviewClock = () => {
     if (previewClockFrameRef.current !== null) {
@@ -3450,30 +6572,74 @@ export function TransformationPage() {
   };
   const startPreviewClock = () => {
     stopPreviewClock();
-    previewClockLastUpdateRef.current = 0;
+    previewClockLastUpdateRef.current = performance.now();
     const updateClock = (timestamp: number) => {
       const video = previewVideoRef.current;
-      if (!video || video.paused || video.ended) {
-        previewClockFrameRef.current = null;
+      const audio = previewAudioRef.current;
+
+      const isVideoPlaying = Boolean(video && !video.paused && !video.ended);
+      const isAudioPlaying = Boolean(audio && !audio.paused && !audio.ended);
+      const hasPlayingAdditional = Array.from(activeAudioElementsRef.current.values()).some(
+        (el) => !el.paused && !el.ended,
+      );
+
+      if ((!isVideoPlaying && !isAudioPlaying && !hasPlayingAdditional) || previewTimeRef.current >= clipDuration) {
+        handlePreviewPause();
         return;
       }
-      if (timestamp - previewClockLastUpdateRef.current >= 50) {
+
+      if (timestamp - previewClockLastUpdateRef.current >= 40) {
+        const delta = (timestamp - previewClockLastUpdateRef.current) / 1000;
         previewClockLastUpdateRef.current = timestamp;
-        setPreviewTimeFromVideo(video.currentTime);
+
+        let nextClipTime: number;
+        if (isVideoPlaying && video && previewTimeRef.current < videoLayout.duration) {
+          nextClipTime = clipTimeFromVideoTime(video.currentTime);
+        } else {
+          nextClipTime = clampClipTime(previewTimeRef.current + delta);
+        }
+
+        previewTimeRef.current = nextClipTime;
+        setPreviewTime(nextClipTime);
+
+        syncExtractedPreviewAudio(nextClipTime, true, false);
+        syncAdditionalAudioTracks(nextClipTime, true, false);
+
+        if (nextClipTime >= clipDuration) {
+          handlePreviewPause();
+          return;
+        }
       }
+
       previewClockFrameRef.current = window.requestAnimationFrame(updateClock);
     };
     previewClockFrameRef.current = window.requestAnimationFrame(updateClock);
   };
   const handlePreviewPlay = () => {
     setPreviewPlaying(true);
+    if (previewVideoRef.current) {
+      const clamped = Math.max(0.25, Math.min(4.0, videoSpeed || 1.0));
+      if (previewVideoRef.current.playbackRate !== clamped) {
+        previewVideoRef.current.playbackRate = clamped;
+      }
+      if (previewTime < videoLayout.duration && previewVideoRef.current.paused) {
+        void previewVideoRef.current.play().catch(() => undefined);
+      }
+    }
     startPreviewClock();
-    syncExtractedPreviewAudio(previewTime, true);
+    syncExtractedPreviewAudio(previewTime, true, false);
+    syncAdditionalAudioTracks(previewTime, true, false);
   };
   const handlePreviewPause = () => {
     setPreviewPlaying(false);
     stopPreviewClock();
-    previewAudioRef.current?.pause();
+    if (previewVideoRef.current && !previewVideoRef.current.paused) {
+      previewVideoRef.current.pause();
+    }
+    if (previewAudioRef.current && !previewAudioRef.current.paused) {
+      previewAudioRef.current.pause();
+    }
+    syncAdditionalAudioTracks(previewTime, false, false);
   };
   const mediaTrackSelected =
     (selectedEditorContext === "video" || selectedEditorContext === "audio") &&
@@ -3603,6 +6769,7 @@ export function TransformationPage() {
     item: TimelineItem,
     edge: "left" | "right",
   ) => {
+    if (item.locked || isItemIdLocked(item.id)) return;
     const segmentIndex = mediaSegments.findIndex((segment) => segment.id === item.id);
     const track = event.currentTarget.parentElement?.parentElement as HTMLDivElement | null;
     if (segmentIndex < 0 || !track) return;
@@ -3706,7 +6873,7 @@ export function TransformationPage() {
     item: TimelineItem,
     edge: "left" | "right",
   ) => {
-    if (!item.eventId) return;
+    if (!item.eventId || item.locked || isItemIdLocked(item.eventId)) return;
     const track = event.currentTarget.parentElement?.parentElement as HTMLDivElement | null;
     if (!track) return;
     const kind = item.type === "caption" ? "caption" : "effect";
@@ -3782,7 +6949,8 @@ export function TransformationPage() {
       setTimelineError("Playhead harus berada di dalam bagian track yang dipilih.");
       return;
     }
-    const sourcePoint = segment.sourceStart + previewTime - segment.start;
+    const activeSpeed = activeMediaTrack === "audio" ? (audioSettings.speed || 1.0) : videoSpeed;
+    const sourcePoint = segment.sourceStart + (previewTime - segment.start) * activeSpeed;
     const rightId = `media-${newEventId()}`;
     const nextSequence = mediaSequence.flatMap((item, index) =>
       index === segmentIndex
@@ -3804,6 +6972,7 @@ export function TransformationPage() {
       setTimelineError("Sisakan setidaknya 0,25 detik setelah titik potong.");
       return;
     }
+    const activeSpeed = activeMediaTrack === "audio" ? (audioSettings.speed || 1.0) : videoSpeed;
     const nextSequence = mediaSegments.flatMap((segment) => {
       if (segment.end <= previewTime) return [];
       if (segment.start >= previewTime) return [{
@@ -3813,7 +6982,7 @@ export function TransformationPage() {
       }];
       return [{
         id: segment.id,
-        sourceStart: segment.sourceStart + previewTime - segment.start,
+        sourceStart: segment.sourceStart + (previewTime - segment.start) * activeSpeed,
         sourceEnd: segment.sourceEnd,
       }];
     });
@@ -3843,6 +7012,7 @@ export function TransformationPage() {
       setTimelineError("Sisakan setidaknya 0,25 detik sebelum titik potong.");
       return;
     }
+    const activeSpeed = activeMediaTrack === "audio" ? (audioSettings.speed || 1.0) : videoSpeed;
     const nextSequence = mediaSegments.flatMap((segment) => {
       if (segment.start >= previewTime) return [];
       if (segment.end <= previewTime) return [{
@@ -3853,7 +7023,7 @@ export function TransformationPage() {
       return [{
         id: segment.id,
         sourceStart: segment.sourceStart,
-        sourceEnd: segment.sourceStart + previewTime - segment.start,
+        sourceEnd: segment.sourceStart + (previewTime - segment.start) * activeSpeed,
       }];
     });
     const nextEvents = configuredEffectTimeline
@@ -3863,7 +7033,7 @@ export function TransformationPage() {
     commitMediaSequence(nextSequence, nextEvents);
     setSelectedMediaSegmentId(null);
     setPreviewTime(Math.min(previewTime, nextSequence.reduce(
-      (total, segment) => total + segment.sourceEnd - segment.sourceStart,
+      (total, segment) => total + (segment.sourceEnd - segment.sourceStart) / activeSpeed,
       0,
     )));
   };
@@ -3960,7 +7130,7 @@ export function TransformationPage() {
     if (!selectedCaption) return;
     const sourceCue = selectedCaption;
     const usedIds = new Set(editableCaptionCues.map((cue) => cue.id));
-    const reflowed = reflowCaptionCue(sourceCue, usedIds, captionStyle.maxWords);
+    const reflowed = reflowCaptionCue(sourceCue, usedIds, MAX_CAPTION_WORDS);
     const nextCues = editableCaptionCues.flatMap((cue) =>
       cue.id === selectedCaption.id ? reflowed : [cue],
     );
@@ -3968,19 +7138,19 @@ export function TransformationPage() {
     setSelectedCaptionId(reflowed[0].id);
     setMessage(
       reflowed.length > 1
-        ? `Caption dipecah menjadi ${reflowed.length} cue (maksimal ${captionStyle.maxWords} kata).`
-        : `Caption sudah maksimal ${captionStyle.maxWords} kata.`,
+        ? `Caption dipecah menjadi ${reflowed.length} cue (maksimal ${MAX_CAPTION_WORDS} kata).`
+        : `Caption sudah maksimal ${MAX_CAPTION_WORDS} kata.`,
     );
   };
   const reflowAllCaptions = () => {
     const sourceCues = editableCaptionCues;
     const usedIds = new Set(sourceCues.map((cue) => cue.id));
     const nextCues = sourceCues.flatMap((cue) =>
-      reflowCaptionCue(cue, usedIds, captionStyle.maxWords),
+      reflowCaptionCue(cue, usedIds, MAX_CAPTION_WORDS),
     );
     updateCaptionTimeline(nextCues);
     setMessage(
-      `Semua caption dirapikan menjadi ${nextCues.length} cue (maksimal ${captionStyle.maxWords} kata).`,
+      `Semua caption dirapikan menjadi ${nextCues.length} cue (maksimal ${MAX_CAPTION_WORDS} kata).`,
     );
   };
   const timedTrackSelected = Boolean(selectedCaption || selectedEvent);
@@ -4034,7 +7204,20 @@ export function TransformationPage() {
   };
   const splitSelectedTrack = () => {
     if (mediaTrackSelected) {
+      const selectedSeg = mediaSegments.find((s) => s.id === selectedMediaSegmentId);
+      if (selectedSeg?.locked || (activeMediaTrack === "video" ? styleConfig.video_locked : styleConfig.audio_locked)) {
+        setTimelineError("Item media sedang dikunci.");
+        return;
+      }
       splitSelectedMedia();
+      return;
+    }
+    if (selectedCaption && selectedCaption.locked) {
+      setTimelineError("Caption sedang dikunci.");
+      return;
+    }
+    if (selectedEvent && selectedEvent.locked) {
+      setTimelineError("Event sedang dikunci.");
       return;
     }
     const item = selectedCaption || selectedEvent;
@@ -4046,7 +7229,7 @@ export function TransformationPage() {
       const rightId = `caption-${newEventId()}`;
       updateCaptionTimeline(editableCaptionCues.flatMap((cue) =>
         cue.id === selectedCaption.id
-          ? [{ ...cue, end: previewTime }, { ...cue, id: rightId, start: previewTime }]
+          ? [{ ...cue, end: previewTime }, { ...cue, id: rightId, start: previewTime, locked: false }]
           : [cue],
       ));
       setSelectedCaptionId(rightId);
@@ -4054,13 +7237,21 @@ export function TransformationPage() {
       const rightId = newEventId();
       updateEffectTimeline(editableEffectTimeline.flatMap((event) =>
         event.id === selectedEvent.id
-          ? [{ ...event, end: previewTime }, { ...event, id: rightId, start: previewTime }]
+          ? [{ ...event, end: previewTime }, { ...event, id: rightId, start: previewTime, locked: false }]
           : [event],
       ));
       setSelectedEventId(rightId);
     }
   };
   const trimSelectedTimedItem = (edge: "left" | "right") => {
+    if (selectedCaption && selectedCaption.locked) {
+      setTimelineError("Caption sedang dikunci.");
+      return;
+    }
+    if (selectedEvent && selectedEvent.locked) {
+      setTimelineError("Event sedang dikunci.");
+      return;
+    }
     const item = selectedCaption || selectedEvent;
     if (!item || previewTime <= item.start || previewTime >= item.end) {
       setTimelineError("Playhead harus berada di dalam item yang dipilih.");
@@ -4081,15 +7272,35 @@ export function TransformationPage() {
     }
   };
   const deleteLeftSelectedTrack = () => {
-    if (mediaTrackSelected) deleteMediaLeft();
-    else trimSelectedTimedItem("left");
+    if (mediaTrackSelected) {
+      const selectedSeg = mediaSegments.find((s) => s.id === selectedMediaSegmentId);
+      if (selectedSeg?.locked || (activeMediaTrack === "video" ? styleConfig.video_locked : styleConfig.audio_locked)) {
+        setTimelineError("Item media sedang dikunci.");
+        return;
+      }
+      deleteMediaLeft();
+    } else {
+      trimSelectedTimedItem("left");
+    }
   };
   const deleteRightSelectedTrack = () => {
-    if (mediaTrackSelected) deleteMediaRight();
-    else trimSelectedTimedItem("right");
+    if (mediaTrackSelected) {
+      const selectedSeg = mediaSegments.find((s) => s.id === selectedMediaSegmentId);
+      if (selectedSeg?.locked || (activeMediaTrack === "video" ? styleConfig.video_locked : styleConfig.audio_locked)) {
+        setTimelineError("Item media sedang dikunci.");
+        return;
+      }
+      deleteMediaRight();
+    } else {
+      trimSelectedTimedItem("right");
+    }
   };
   const deleteSelectedTrackItem = () => {
     if (selectedAdditionalAudioTrack) {
+      if (selectedAdditionalAudioTrack.locked) {
+        setTimelineError("Track audio sedang dikunci.");
+        return;
+      }
       updateAdditionalAudioLibrary(
         additionalAudioAssets,
         additionalAudioTracks.filter((track) => track.id !== selectedAdditionalAudioTrack.id),
@@ -4104,6 +7315,10 @@ export function TransformationPage() {
       );
       const selected = mediaSegments[selectedIndex];
       if (!selected) return;
+      if (selected.locked || (activeMediaTrack === "video" ? styleConfig.video_locked : styleConfig.audio_locked)) {
+        setTimelineError("Item media sedang dikunci.");
+        return;
+      }
       const removedDuration = selected.end - selected.start;
       const nextSequence = mediaSequence.filter((segment) => segment.id !== selected.id);
       const nextEvents = activeMediaTrack === "audio"
@@ -4114,14 +7329,13 @@ export function TransformationPage() {
               if (event.start >= selected.end) {
                 return {
                   ...event,
-                  start: event.start - removedDuration,
-                  end: event.end - removedDuration,
+                  start: Math.max(0, event.start - removedDuration),
+                  end: Math.max(0, event.end - removedDuration),
                 };
               }
               return {
                 ...event,
-                start: Math.min(event.start, selected.start),
-                end: Math.max(selected.start, event.end - removedDuration),
+                end: Math.max(event.start, event.end - removedDuration),
               };
             })
             .filter((event) => event.end > event.start);
@@ -4132,12 +7346,20 @@ export function TransformationPage() {
       return;
     }
     if (selectedCaption) {
+      if (selectedCaption.locked) {
+        setTimelineError("Caption terpilih sedang dikunci.");
+        return;
+      }
       updateCaptionTimeline(editableCaptionCues.filter((cue) => cue.id !== selectedCaption.id));
       setSelectedCaptionId(null);
       setMessage("Caption terpilih dihapus.");
       return;
     }
     if (selectedEvent) {
+      if (selectedEvent.locked) {
+        setTimelineError("Event terpilih sedang dikunci.");
+        return;
+      }
       updateEffectTimeline(editableEffectTimeline.filter((event) => event.id !== selectedEvent.id));
       setSelectedEventId(null);
       setMessage("Event terpilih dihapus.");
@@ -4149,7 +7371,7 @@ export function TransformationPage() {
     setSaveFailureMessage("");
   };
   const clampTimelineHeight = (value: number) =>
-    Math.max(220, Math.min(value, Math.max(320, window.innerHeight - 280)));
+    Math.max(180, Math.min(value, Math.max(230, window.innerHeight - 260)));
   const handleTimelineResizeStart = (event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -4217,7 +7439,7 @@ export function TransformationPage() {
     event: ReactPointerEvent<HTMLDivElement>,
     item: TimelineItem,
   ) => {
-    if (!item.eventId) return;
+    if (!item.eventId || item.locked || isItemIdLocked(item.eventId)) return;
     const track = event.currentTarget.parentElement as HTMLDivElement | null;
     if (!track) return;
     const rect = track.getBoundingClientRect();
@@ -4263,6 +7485,7 @@ export function TransformationPage() {
       setSelectedCaptionId(null);
       setSelectedMediaSegmentId(null);
       setSelectedEditorContext("audio");
+      setAudioInspectorTab("audio");
       return;
     }
     setSelectedAdditionalAudioTrackId(null);
@@ -4271,6 +7494,11 @@ export function TransformationPage() {
       setSelectedCaptionId(null);
       setSelectedMediaSegmentId(item.id);
       setSelectedEditorContext(item.type);
+      if (item.type === "video") {
+        setVideoInspectorTab("video");
+      } else {
+        setAudioInspectorTab("audio");
+      }
       return;
     }
     if (item.type === "caption") {
@@ -4284,17 +7512,30 @@ export function TransformationPage() {
       setSelectedEventId(null);
       setSelectedMediaSegmentId(null);
       setSelectedEditorContext("caption");
+      setCaptionInspectorTab("captions");
       return;
     }
     setSelectedCaptionId(null);
     setSelectedMediaSegmentId(null);
     if (item.eventId) {
       setSelectedEventId(item.eventId);
-      setSelectedEditorContext(contextFromEventType(item.type));
+      const nextContext = contextFromEventType(item.type);
+      setSelectedEditorContext(nextContext);
+      if (nextContext === "hook" || nextContext === "keyword") {
+        setTextInspectorTab("text");
+      } else if (nextContext === "effect") {
+        setEffectInspectorTab("effect");
+      }
       return;
     }
     setSelectedEventId(null);
-    setSelectedEditorContext(contextFromEventType(item.type));
+    const nextContext = contextFromEventType(item.type);
+    setSelectedEditorContext(nextContext);
+    if (nextContext === "hook" || nextContext === "keyword") {
+      setTextInspectorTab("text");
+    } else if (nextContext === "effect") {
+      setEffectInspectorTab("effect");
+    }
   };
   const handleEventClick = (item: TimelineItem) => selectTimelineItem(item);
   const handleTrackItemContextMenu = (
@@ -4331,13 +7572,20 @@ export function TransformationPage() {
     onItemPointerUp: handleEventPointerUp,
   };
   const timelineTrackOrderProps = (track: TimelineTrackKey) => {
-    const index = trackOrder.indexOf(track);
+    const effectiveKey =
+      track === "caption" || track === "hook" || track === "keyword"
+        ? "text"
+        : track === "punch" || track === "pattern"
+        ? "overlay"
+        : track;
+    const index = trackOrder.indexOf(effectiveKey);
+    const safeIndex = index >= 0 ? index : defaultTrackOrder.indexOf(effectiveKey);
     return {
-      order: index,
-      canMoveUp: index > 0,
-      canMoveDown: index >= 0 && index < trackOrder.length - 1,
-      onMoveUp: () => moveTimelineTrack(track, -1),
-      onMoveDown: () => moveTimelineTrack(track, 1),
+      order: safeIndex >= 0 ? safeIndex : 0,
+      canMoveUp: safeIndex > 0,
+      canMoveDown: safeIndex >= 0 && safeIndex < trackOrder.length - 1,
+      onMoveUp: () => moveTimelineTrack(effectiveKey, -1),
+      onMoveDown: () => moveTimelineTrack(effectiveKey, 1),
     };
   };
   const previewModeText = renderedPreviewAvailable
@@ -4435,7 +7683,13 @@ export function TransformationPage() {
     100,
     Math.max(0, (previewTime / Math.max(1, timelineScaleDuration)) * 100),
   );
-  const tickStep = timelineScaleDuration > 45 ? 10 : 5;
+  const tickStep = (() => {
+    if (timelineZoomPercent <= 25) return timelineScaleDuration > 30 ? 15 : 10;
+    if (timelineZoomPercent <= 50) return timelineScaleDuration > 45 ? 15 : 10;
+    if (timelineZoomPercent <= 100) return timelineScaleDuration > 45 ? 10 : 5;
+    if (timelineZoomPercent <= 200) return timelineScaleDuration > 45 ? 5 : 2;
+    return timelineScaleDuration > 45 ? 2 : 1;
+  })();
   const ticks = Array.from(
     new Set([
       ...Array.from(
@@ -4457,7 +7711,7 @@ export function TransformationPage() {
             ? "saturate-150 contrast-125"
             : "";
   const liveZoomStyle =
-    !renderedPreviewUrl && livePunchEvent
+    !renderedPreviewUrl && livePunchEvent && livePunchEvent.visible !== false
       ? {
           transform: `scale(${livePunchEvent.zoom || 1.08})`,
           transition: "transform 160ms ease-out",
@@ -4466,70 +7720,230 @@ export function TransformationPage() {
       : undefined;
   const toggleLeftSection = (id: string) =>
     setOpenLeftSection((current) => (current === id ? null : id));
-  const transcriptSummary = context.data.candidate_transcript
-    ? `${context.data.candidate_transcript.slice(0, 64).trim()}${
-        context.data.candidate_transcript.length > 64 ? "..." : ""
-      }`
-    : "Transkrip belum tersedia";
   const captionSummary = draft.social_caption
     ? `${draft.social_caption.slice(0, 64).trim()}${
         draft.social_caption.length > 64 ? "..." : ""
       }`
     : "Deskripsi belum tersedia";
   const availableNavTabs: Array<{ id: EditorNavTab; label: string; icon: string }> = [
-    ...(!manualEditorMode ? [{ id: "autoclip" as const, label: "AutoClip", icon: "✨" }] : []),
     { id: "media" as const, label: "Media", icon: "📁" },
     { id: "audio" as const, label: "Audio", icon: "🎵" },
     { id: "text" as const, label: "Text", icon: "T" },
+    { id: "stickers" as const, label: "Stickers", icon: "😀" },
+    { id: "transitions" as const, label: "Transitions", icon: "⇄" },
+    { id: "effects" as const, label: "Effects", icon: "✦" },
     { id: "caption" as const, label: "Captions", icon: "💬" },
-    { id: "effect" as const, label: "Effects", icon: "✦" },
     { id: "templates" as const, label: "Templates", icon: "📐" },
+    ...(!manualEditorMode ? [{ id: "autoclip" as const, label: "AutoClip", icon: "✨" }] : []),
   ];
-return (
-    <div className={`editor-workspace flex min-h-[calc(100vh-80px)] flex-col rounded-xl border border-zinc-800 bg-[#151719] shadow-2xl shadow-black/30 xl:h-[calc(100vh-80px)] xl:min-h-[720px] xl:overflow-hidden ${
+  const inspectorContext: "details" | "video" | "audio" | "caption" | "hook" | "keyword" | "effect" =
+    selectedEvent
+      ? selectedEvent.type === "keyword_popup"
+        ? "keyword"
+        : selectedEvent.type === "hook_text"
+        ? "hook"
+        : "effect"
+      : selectedCaption
+      ? "caption"
+      : anyTrackSelected && selectedEditorContext === "video"
+      ? "video"
+      : anyTrackSelected && selectedEditorContext === "audio"
+      ? "audio"
+      : selectedEditorContext === "hook"
+      ? "hook"
+      : selectedEditorContext === "keyword"
+      ? "keyword"
+      : selectedEditorContext === "caption"
+      ? "caption"
+      : selectedEditorContext === "effect"
+      ? "effect"
+      : "details";
+
+  return (
+    <div className={`editor-workspace flex min-h-[calc(100vh-50px)] flex-col rounded-xl border border-zinc-800 bg-[#151719] shadow-2xl shadow-black/30 xl:h-[calc(100vh-50px)] xl:min-h-[580px] xl:overflow-hidden ${
       editorTheme === "light" ? "editor-theme-light" : "editor-theme-dark"
     }`}>
-      {/* 1. TOP NAV TABS BAR (Kategori Sumber / Preset) */}
-      <div className="flex shrink-0 items-center justify-between border-b border-zinc-800 bg-[#16181b] px-3 py-1.5 z-20">
-        <div className="flex items-center gap-1 overflow-x-auto py-0.5">
-          {availableNavTabs.map((tab) => (
-            <button
-              key={tab.id}
-              type="button"
-              onClick={() => setActiveNavTab(tab.id)}
-              className={`flex items-center gap-2 rounded-lg px-3.5 py-1.5 text-xs font-black transition-all ${
-                activeNavTab === tab.id
-                  ? "bg-[#272a31] text-cyan-300 shadow-sm ring-1 ring-cyan-500/30"
-                  : "text-zinc-400 hover:bg-[#1f2227] hover:text-zinc-200"
-              }`}
-            >
-              <span className="text-sm font-normal">{tab.icon}</span>
-              <span>{tab.label}</span>
-            </button>
-          ))}
+      {/* 1. TOP ROW BAR (Left Source Tabs | Center Info | Right Inspector Tabs) */}
+      <div className="grid h-9 shrink-0 border-b border-zinc-800/90 bg-[#16181b] z-20 xl:grid-cols-[360px_minmax(400px,1fr)_330px] items-center">
+        {/* Left Cell: Source / Library Tabs with Arrow Navigation (CapCut style) */}
+        <SourceNavTabStrip
+          tabs={availableNavTabs}
+          activeTab={activeNavTab}
+          onSelectTab={setActiveNavTab}
+        />
+
+        {/* Center Cell: Preview Editor Title (Aligned with Top Tabs) */}
+        <div className="hidden items-center justify-center gap-2 px-3 xl:flex">
+          <span
+            className="text-xs font-bold uppercase tracking-wider text-zinc-400 cursor-default"
+            title={`${currentRenderLabel} • ${previewModeText}`}
+          >
+            Preview Editor
+          </span>
         </div>
-        <div className="hidden items-center gap-3 text-xs font-bold text-zinc-500 lg:flex pr-2">
-          {manualEditorMode ? (
-            <span className="flex items-center gap-1.5 text-emerald-400">
-              <span className="size-2 rounded-full bg-emerald-400" />
-              Editor Manual
-            </span>
-          ) : (
-            <span className="flex items-center gap-1.5 text-cyan-400">
-              <span className="size-2 rounded-full bg-cyan-400" />
-              AutoClip AI
-            </span>
-          )}
+
+        {/* Right Cell: Inspector Sub-Tabs (Aligned Horizontally with Source Tabs) */}
+        <div className="flex items-center justify-between gap-1 overflow-x-auto no-scrollbar px-3 py-0.5 border-l border-zinc-800/40 xl:border-l-0">
+          <div className="flex items-center gap-2 overflow-x-auto no-scrollbar">
+            {inspectorContext === "details" ? (
+              <span className="relative pb-1 text-xs font-bold text-cyan-400 after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-cyan-400 after:rounded-full whitespace-nowrap">
+                Details
+              </span>
+            ) : inspectorContext === "video" ? (
+              (
+                [
+                  { id: "video", label: "Video" },
+                  { id: "adjust", label: "Adjust" },
+                  { id: "speed", label: "Speed" },
+                  { id: "audio", label: "Audio" },
+                ] as const
+              ).map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => setVideoInspectorTab(tab.id)}
+                  className={`relative pb-1 text-xs font-bold transition whitespace-nowrap px-1 ${
+                    videoInspectorTab === tab.id
+                      ? "text-cyan-400 after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-cyan-400 after:rounded-full"
+                      : "text-zinc-400 hover:text-zinc-200"
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))
+            ) : inspectorContext === "audio" ? (
+              (
+                [
+                  { id: "audio", label: "Audio", title: "Pengaturan audio dasar" },
+                  { id: "fade", label: "Fade", title: "Fade In & Fade Out" },
+                  { id: "speed", label: "Speed", title: "Kecepatan Audio" },
+                  { id: "timing", label: "Timing", title: "Durasi & Posisi Audio" },
+                ] as const
+              ).map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  title={tab.title}
+                  onClick={() => setAudioInspectorTab(tab.id)}
+                  className={`relative pb-1 text-xs font-bold transition whitespace-nowrap px-1 ${
+                    audioInspectorTab === tab.id
+                      ? "text-cyan-400 after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-cyan-400 after:rounded-full"
+                      : "text-zinc-400 hover:text-zinc-200"
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))
+            ) : inspectorContext === "hook" || inspectorContext === "keyword" ? (
+              (
+                selectedEvent?.reason?.toLowerCase().includes("sticker")
+                  ? ([
+                      { id: "text", label: "Sticker", title: "Sticker" },
+                      { id: "animation", label: "Animation", title: "Animation" },
+                    ] as const)
+                  : ([
+                      { id: "text", label: "Text", title: "Text" },
+                      { id: "animation", label: "Animation", title: "Animation" },
+                      { id: "tracking", label: "Tracking", title: "Tracking" },
+                      { id: "tts", label: "TTS", title: "Text to speech" },
+                    ] as const)
+              ).map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  title={tab.title}
+                  onClick={() => setTextInspectorTab(tab.id)}
+                  className={`relative pb-1 text-xs font-bold transition whitespace-nowrap px-1 ${
+                    textInspectorTab === tab.id
+                      ? "text-cyan-400 after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-cyan-400 after:rounded-full"
+                      : "text-zinc-400 hover:text-zinc-200"
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))
+            ) : inspectorContext === "caption" ? (
+              (
+                [
+                  { id: "captions", label: "Captions", title: "Captions" },
+                  { id: "text", label: "Text", title: "Text Style & Templates" },
+                  { id: "animation", label: "Animation", title: "Animation" },
+                  { id: "tracking", label: "Tracking", title: "Tracking" },
+                  { id: "tts", label: "TTS", title: "Text to speech" },
+                ] as const
+              ).map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  title={tab.title}
+                  onClick={() => setCaptionInspectorTab(tab.id)}
+                  className={`relative pb-1 text-xs font-bold transition whitespace-nowrap px-1 ${
+                    captionInspectorTab === tab.id
+                      ? "text-cyan-400 after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-cyan-400 after:rounded-full"
+                      : "text-zinc-400 hover:text-zinc-200"
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))
+            ) : inspectorContext === "effect" ? (
+              (
+                [
+                  {
+                    id: "effect",
+                    label: selectedEvent?.reason?.startsWith("transition")
+                      ? "Transition"
+                      : "Effect",
+                  },
+                  { id: "timing", label: "Timing" },
+                ] as const
+              ).map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => setEffectInspectorTab(tab.id)}
+                  className={`relative pb-1 text-xs font-bold transition whitespace-nowrap px-1 ${
+                    effectInspectorTab === tab.id
+                      ? "text-cyan-400 after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-cyan-400 after:rounded-full"
+                      : "text-zinc-400 hover:text-zinc-200"
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))
+            ) : (
+              <span className="relative pb-1 text-xs font-bold text-cyan-400 after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-cyan-400 after:rounded-full whitespace-nowrap">
+                Details
+              </span>
+            )}
+          </div>
+
+          {/* Subtle Mini Autosave Indicator Dot */}
+          <div
+            className="flex shrink-0 items-center gap-1 text-[10px] font-medium text-zinc-400 pl-1"
+            title={editorSaveStatusTitle}
+          >
+            <span
+              className={`size-1.5 rounded-full ${
+                editorSaveStatusClass.includes("emerald")
+                  ? "bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]"
+                  : editorSaveStatusClass.includes("amber")
+                  ? "bg-amber-400 animate-pulse"
+                  : "bg-zinc-500"
+              }`}
+            />
+          </div>
         </div>
       </div>
 
       {/* 2. MIDDLE 3-PANEL GRID */}
-      <div className="grid min-h-0 flex-1 gap-px bg-zinc-800 xl:grid-cols-[330px_minmax(400px,1fr)_330px] xl:items-stretch overflow-hidden">
+      {/* 2. MIDDLE 3-PANEL GRID */}
+      <div className="grid min-h-0 flex-1 gap-px bg-zinc-800 xl:grid-cols-[360px_minmax(400px,1fr)_330px] xl:items-stretch overflow-hidden">
         {/* LEFT SOURCE PANEL (Input / Library / Preset / Add Asset) */}
-        <aside className="editor-sidepanel min-h-0 bg-[#17191c] xl:h-full xl:overflow-y-auto p-3.5 space-y-4">
+        <aside className="editor-sidepanel min-h-0 bg-[#17191c] xl:h-full xl:overflow-hidden flex flex-col">
           {/* TAB A: AUTOCLIP (Hanya AutoClip Mode) */}
           {activeNavTab === "autoclip" && !manualEditorMode && (
-            <section className="space-y-3">
+            <div className="p-3.5 space-y-3 overflow-y-auto custom-scrollbar flex-1">
               <div>
                 <h2 className="text-sm font-black text-slate-950 uppercase tracking-wide text-cyan-400">
                   Ringkasan Klip (AutoClip AI)
@@ -4720,168 +8134,343 @@ return (
                   </div>
                 </AccordionSection>
               </div>
-            </section>
+            </div>
           )}
 
           {/* TAB B: MEDIA (Input & Project Media Library) */}
           {activeNavTab === "media" && (
-            <section className="space-y-4">
-              <div>
-                <h2 className="text-sm font-black text-slate-950 uppercase tracking-wide text-cyan-400">
-                  Project Media
-                </h2>
-                <p className="mt-0.5 text-xs text-zinc-400">
-                  Impor video, audio, atau gambar untuk ditambahkan ke timeline.
-                </p>
-              </div>
-
-              <EditorMediaImportControls
-                className="grid grid-cols-1 gap-2"
-                disabled={editorMediaUploading}
-                onImport={importEditorMedia}
-                uploadingKind={editorMediaUploadKind}
-              />
-
-              <div className="border-t border-zinc-800 pt-3">
-                <p className="text-xs font-black uppercase tracking-wide text-zinc-400">
-                  Daftar Asset ({editorMediaQuery.data?.length || 0})
-                </p>
-
-                {editorMediaQuery.isLoading ? (
-                  <p className="mt-3 text-xs font-semibold text-zinc-400">Memuat media...</p>
-                ) : editorMediaQuery.data?.length ? (
-                  <div className="mt-3 space-y-2.5">
-                    {editorMediaQuery.data.map((asset) => (
-                      <div
-                        className="rounded-xl border border-zinc-700/80 bg-[#22252a] p-3 transition hover:border-zinc-500"
-                        key={asset.asset_id}
-                      >
-                        <div className="flex items-start justify-between gap-2">
-                          <div className="min-w-0">
-                            <span className="block truncate text-xs font-black text-zinc-100">
-                              {asset.name}
-                            </span>
-                            <span className="mt-0.5 block text-[10px] text-zinc-400">
-                              {(asset.size_bytes / 1024 / 1024).toFixed(1)} MB
-                            </span>
-                          </div>
-                          <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-black uppercase ${
-                            asset.kind === "video"
-                              ? "bg-blue-500/20 text-blue-300"
-                              : asset.kind === "audio"
-                              ? "bg-emerald-500/20 text-emerald-300"
-                              : "bg-purple-500/20 text-purple-300"
-                          }`}>
-                            {asset.kind}
-                          </span>
-                        </div>
-                        <div className="mt-3 flex gap-2">
-                          {asset.kind === "image" ? (
-                            <span className="px-1 py-1 text-[10px] font-bold text-emerald-400">
-                              Tersimpan di project
-                            </span>
-                          ) : (
-                            <button
-                              className="btn-secondary flex-1 py-1.5 text-xs font-bold bg-cyan-400/10 text-cyan-300 border-cyan-500/30 hover:bg-cyan-400/20"
-                              onClick={() => addEditorMediaToTimeline(asset)}
-                              type="button"
-                            >
-                              + Tambahkan ke Timeline
-                            </button>
-                          )}
-                          {asset.kind !== "image" && (
-                            <a
-                              className="btn-secondary px-2.5 py-1.5 text-xs font-semibold"
-                              href={mediaUrl(transformationId, asset.asset_id)}
-                              target="_blank"
-                              rel="noreferrer"
-                            >
-                              Putar
-                            </a>
-                          )}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="mt-3 rounded-2xl border-2 border-dashed border-zinc-700 bg-zinc-900/40 p-6 text-center">
-                    <span className="text-3xl">📁</span>
-                    <p className="mt-2 text-xs font-bold text-zinc-300">Import media untuk memulai</p>
-                    <p className="mt-1 text-[11px] text-zinc-500">
-                      Video, audio, atau gambar Anda akan muncul di sini.
+            <LeftPanelDirectoryLayout
+              directories={mediaDirectories}
+              activeDirectory={mediaDirectory}
+              onSelectDirectory={setMediaDirectory}
+            >
+              {mediaDirectory === "import" && (
+                <div className="space-y-3">
+                  <p className="text-[11px] font-black uppercase tracking-wide text-zinc-400">
+                    Import Media Sumber
+                  </p>
+                  <EditorMediaImportControls
+                    className="flex flex-col gap-2"
+                    disabled={editorMediaUploading}
+                    onImport={importEditorMedia}
+                    uploadingKind={editorMediaUploadKind}
+                  />
+                  <div className="rounded-xl border border-zinc-800 bg-[#202226] p-2.5 text-[11px] text-zinc-400">
+                    <p className="font-bold text-zinc-300">💡 Tips Media:</p>
+                    <p className="mt-0.5">
+                      Video, audio, atau gambar yang diunggah akan otomatis disimpan di daftar asset project Anda.
                     </p>
                   </div>
-                )}
-              </div>
-            </section>
+                </div>
+              )}
+
+              {mediaDirectory !== "import" && (
+                <div className="space-y-2.5">
+                  <p className="text-[11px] font-black uppercase tracking-wide text-zinc-400">
+                    {mediaDirectory === "project_media"
+                      ? "Semua Asset Project"
+                      : mediaDirectory === "video"
+                      ? "Asset Video"
+                      : mediaDirectory === "audio"
+                      ? "Asset Audio"
+                      : "Asset Gambar"}{" "}
+                    (
+                    {(editorMediaQuery.data || []).filter((a) =>
+                      mediaDirectory === "video"
+                        ? a.kind === "video"
+                        : mediaDirectory === "audio"
+                        ? a.kind === "audio"
+                        : mediaDirectory === "images"
+                        ? a.kind === "image"
+                        : true,
+                    ).length}
+                    )
+                  </p>
+
+                  {(() => {
+                    const assets = (editorMediaQuery.data || []).filter((a) =>
+                      mediaDirectory === "video"
+                        ? a.kind === "video"
+                        : mediaDirectory === "audio"
+                        ? a.kind === "audio"
+                        : mediaDirectory === "images"
+                        ? a.kind === "image"
+                        : true,
+                    );
+
+                    if (editorMediaQuery.isLoading) {
+                      return <p className="text-xs font-semibold text-zinc-400">Memuat media...</p>;
+                    }
+
+                    if (assets.length === 0) {
+                      return (
+                        <div className="rounded-xl border border-dashed border-zinc-700 bg-zinc-900/40 p-4 text-center text-xs font-semibold text-zinc-400">
+                          Belum ada file {mediaDirectory === "video" ? "video" : mediaDirectory === "audio" ? "audio" : mediaDirectory === "images" ? "gambar" : "media"}. Gunakan menu Import untuk mengunggah.
+                        </div>
+                      );
+                    }
+
+                    return (
+                      <div className="space-y-2">
+                        {assets.map((asset) => (
+                          <div
+                            className="rounded-xl border border-zinc-700/80 bg-[#22252a] p-2.5 transition hover:border-zinc-500"
+                            key={asset.asset_id}
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="min-w-0">
+                                <span className="block truncate text-xs font-black text-zinc-100">
+                                  {asset.name}
+                                </span>
+                                <span className="mt-0.5 block text-[10px] text-zinc-400">
+                                  {(asset.size_bytes / 1024 / 1024).toFixed(1)} MB
+                                </span>
+                              </div>
+                              <span
+                                className={`shrink-0 rounded px-1.5 py-0.5 text-[9px] font-black uppercase ${
+                                  asset.kind === "video"
+                                    ? "bg-blue-500/20 text-blue-300"
+                                    : asset.kind === "audio"
+                                    ? "bg-emerald-500/20 text-emerald-300"
+                                    : "bg-purple-500/20 text-purple-300"
+                                }`}
+                              >
+                                {asset.kind}
+                              </span>
+                            </div>
+                            <div className="mt-2.5 flex gap-1.5">
+                              {asset.kind === "image" ? (
+                                <span className="px-1 py-1 text-[10px] font-bold text-emerald-400">
+                                  Tersimpan di project
+                                </span>
+                              ) : (
+                                <button
+                                  className="btn-secondary flex-1 py-1 text-[10px] font-bold bg-cyan-400/10 text-cyan-300 border-cyan-500/30 hover:bg-cyan-400/20"
+                                  onClick={() => addEditorMediaToTimeline(asset)}
+                                  type="button"
+                                >
+                                  + Ke Timeline
+                                </button>
+                              )}
+                              {asset.kind !== "image" && (
+                                <a
+                                  className="btn-secondary px-2 py-1 text-[10px] font-semibold"
+                                  href={mediaUrl(transformationId, asset.asset_id)}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                >
+                                  Putar
+                                </a>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
+            </LeftPanelDirectoryLayout>
           )}
 
           {/* TAB C: AUDIO (Audio Library / Add Audio Only) */}
           {activeNavTab === "audio" && (
-            <section className="space-y-4">
-              <div>
-                <h2 className="text-sm font-black text-slate-950 uppercase tracking-wide text-cyan-400">
-                  Audio Library
-                </h2>
-                <p className="mt-0.5 text-xs text-zinc-400">Pilih musik latar, efek suara, atau upload file audio.</p>
-              </div>
-
-              {/* Submenu Library: Musik, SFX, Uploads */}
-              <div className="grid grid-cols-3 gap-1 rounded-lg bg-zinc-900 p-1">
-                {(["music", "sfx", "uploads"] as const).map((tab) => (
-                  <button
-                    key={tab}
-                    type="button"
-                    onClick={() => setAudioLibraryTab(tab)}
-                    className={`rounded-md py-1.5 text-[10px] font-black uppercase transition ${
-                      audioLibraryTab === tab
-                        ? "bg-[#25282d] text-cyan-300 shadow-sm"
-                        : "text-zinc-400 hover:text-zinc-200"
-                    }`}
-                  >
-                    {tab === "music" ? "Musik" : tab === "sfx" ? "SFX" : "Uploads"}
-                  </button>
-                ))}
-              </div>
-
-              <label className="btn-secondary block cursor-pointer px-3 py-2 text-center text-xs font-black">
-                {audioUploading ? `Mengupload ${audioUploadProgress}%` : "+ Upload File Audio"}
-                <input
-                  accept=".mp3,.wav,.m4a,audio/mpeg,audio/wav,audio/mp4"
-                  className="hidden"
-                  disabled={audioUploading}
-                  onChange={(event) => {
-                    void handleAdditionalAudioUpload(event.target.files?.[0]);
-                    event.currentTarget.value = "";
-                  }}
-                  type="file"
-                />
-              </label>
-
-              {audioLibraryTab !== "uploads" ? (
-                <div className="rounded-xl border border-dashed border-zinc-700 bg-zinc-900/40 p-4 text-center text-xs font-semibold text-zinc-400">
-                  <p>Pilih tab Uploads untuk menambahkan audio kustom ke timeline.</p>
-                </div>
-              ) : (
+            <LeftPanelDirectoryLayout
+              directories={audioDirectories}
+              activeDirectory={audioDirectory}
+              onSelectDirectory={setAudioDirectory}
+            >
+              {audioDirectory === "music" && (
                 <div className="space-y-2.5">
+                  <div>
+                    <input
+                      type="text"
+                      placeholder="Cari musik latar..."
+                      value={audioSearch}
+                      onChange={(e) => setAudioSearch(e.target.value)}
+                      className="w-full text-xs"
+                    />
+                  </div>
+
+                  {(() => {
+                    const filtered = defaultMusicTracks.filter((track) =>
+                      audioSearch
+                        ? track.name.toLowerCase().includes(audioSearch.toLowerCase()) ||
+                          track.desc.toLowerCase().includes(audioSearch.toLowerCase())
+                        : true,
+                    );
+
+                    return (
+                      <div className="space-y-2">
+                        <p className="text-[11px] font-black uppercase tracking-wide text-zinc-400">
+                          Musik Bawaan ({filtered.length})
+                        </p>
+                        {filtered.map((track) => (
+                          <div
+                            key={track.id}
+                            className="rounded-xl border border-zinc-700/80 bg-[#22252a] p-2.5 transition hover:border-zinc-500"
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="min-w-0">
+                                <p className="truncate text-xs font-black text-zinc-100">{track.name}</p>
+                                <p className="mt-0.5 text-[10px] text-zinc-400 line-clamp-1">{track.desc}</p>
+                              </div>
+                              <span className="shrink-0 rounded bg-cyan-500/20 px-1.5 py-0.5 text-[10px] font-bold text-cyan-300">
+                                {formatTimeLabel(track.duration)}
+                              </span>
+                            </div>
+                            <div className="mt-2 flex items-center justify-end gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (libraryPreviewAudioId === track.id) {
+                                    setLibraryPreviewAudioId(null);
+                                  } else {
+                                    setLibraryPreviewAudioId(track.id);
+                                    playSynthesizedSound("music_preview", 0.75);
+                                    setTimeout(() => {
+                                      setLibraryPreviewAudioId((cur) => (cur === track.id ? null : cur));
+                                    }, 3500);
+                                  }
+                                }}
+                                className={`btn-secondary py-1 px-2 text-[10px] font-bold transition ${
+                                  libraryPreviewAudioId === track.id
+                                    ? "bg-cyan-500/20 text-cyan-300 border-cyan-400"
+                                    : "text-zinc-300 hover:text-cyan-300"
+                                }`}
+                              >
+                                {libraryPreviewAudioId === track.id ? "⏹ Stop" : "▶ Sample"}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  addAdditionalAudioTrack(
+                                    {
+                                      id: track.id,
+                                      name: track.name,
+                                      duration_seconds: track.duration,
+                                      size_bytes: 1024 * 1024,
+                                      mime_type: "audio/mp3",
+                                    },
+                                    "backsound",
+                                  );
+                                  setMessage(`Musik "${track.name}" ditambahkan ke timeline.`);
+                                }}
+                                className="btn-secondary py-1 px-2 text-[10px] font-bold text-cyan-300 border-cyan-500/30 hover:bg-cyan-500/10"
+                              >
+                                + Tambah
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
+
+              {audioDirectory === "sfx" && (
+                <div className="space-y-2.5">
+                  <div>
+                    <input
+                      type="text"
+                      placeholder="Cari efek suara SFX..."
+                      value={audioSearch}
+                      onChange={(e) => setAudioSearch(e.target.value)}
+                      className="w-full text-xs"
+                    />
+                  </div>
+
+                  {(() => {
+                    const filtered = sfxList.filter((sfx) =>
+                      audioSearch
+                        ? sfx.label.toLowerCase().includes(audioSearch.toLowerCase()) ||
+                          sfx.desc.toLowerCase().includes(audioSearch.toLowerCase()) ||
+                          sfx.category.toLowerCase().includes(audioSearch.toLowerCase())
+                        : true,
+                    );
+
+                    return (
+                      <div className="space-y-2">
+                        <p className="text-[11px] font-black uppercase tracking-wide text-zinc-400">
+                          Sound Effects ({filtered.length})
+                        </p>
+                        {filtered.map((sfx) => (
+                          <div
+                            key={sfx.id}
+                            className="rounded-xl border border-zinc-700/80 bg-[#22252a] p-2.5 transition hover:border-zinc-500"
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="flex items-center gap-1.5 min-w-0">
+                                <span className="text-sm shrink-0">{sfx.icon}</span>
+                                <div className="min-w-0">
+                                  <p className="truncate text-xs font-black text-zinc-100">{sfx.label}</p>
+                                  <p className="mt-0.5 text-[10px] text-zinc-400 line-clamp-1">{sfx.desc}</p>
+                                </div>
+                              </div>
+                              <span className="shrink-0 rounded bg-purple-500/20 px-1.5 py-0.5 text-[9px] font-bold text-purple-300">
+                                {sfx.category}
+                              </span>
+                            </div>
+                            <div className="mt-2 flex items-center justify-end gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => playSynthesizedSound(sfx.sound, 0.9)}
+                                className="btn-secondary py-1 px-2 text-[10px] font-bold text-zinc-300 hover:text-purple-300"
+                              >
+                                ▶ Tes
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  addAdditionalAudioTrack(
+                                    {
+                                      id: sfx.id,
+                                      name: sfx.label,
+                                      duration_seconds: 0.5,
+                                      size_bytes: 1024 * 256,
+                                      mime_type: "audio/mp3",
+                                    },
+                                    "sfx",
+                                  );
+                                  setMessage(`SFX "${sfx.label}" ditambahkan ke timeline.`);
+                                }}
+                                className="btn-secondary py-1 px-2 text-[10px] font-bold text-purple-300 border-purple-500/30 hover:bg-purple-500/10"
+                              >
+                                + Tambah
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
+
+              {audioDirectory === "yours" && (
+                <div className="space-y-2.5">
+                  <p className="text-[11px] font-black uppercase tracking-wide text-zinc-400">
+                    Audio Upload Anda ({additionalAudioAssets.length})
+                  </p>
                   {additionalAudioAssets.length === 0 ? (
                     <div className="rounded-xl border border-dashed border-zinc-700 bg-zinc-900/40 p-4 text-center text-xs font-semibold text-zinc-400">
-                      Belum ada file audio yang diunggah.
+                      Belum ada audio kustom. Buka direktori Import untuk mengunggah file mp3/wav.
                     </div>
                   ) : (
                     additionalAudioAssets.map((asset) => (
-                      <div className="rounded-xl border border-zinc-700/80 bg-[#22252a] p-3" key={asset.id}>
+                      <div className="rounded-xl border border-zinc-700/80 bg-[#22252a] p-2.5" key={asset.id}>
                         <div className="flex items-center justify-between">
                           <p className="truncate text-xs font-black text-zinc-200">{asset.name}</p>
                           <span className="text-[10px] text-zinc-400">{formatTimeLabel(asset.duration_seconds)}</span>
                         </div>
                         <audio
-                          className="mt-2 h-7 w-full"
+                          className="mt-2 h-6 w-full"
                           controls
                           preload="metadata"
                           src={uploadedAudioUrl(transformationId, asset.id)}
                         />
-                        <div className="mt-2 grid grid-cols-2 gap-2">
+                        <div className="mt-2 grid grid-cols-2 gap-1.5">
                           <button
                             className="btn-secondary px-2 py-1 text-[10px] font-bold text-cyan-300"
                             onClick={() => addAdditionalAudioTrack(asset, "backsound")}
@@ -4903,439 +8492,1060 @@ return (
                 </div>
               )}
 
-              <div className="rounded-xl border border-zinc-800 bg-[#202226] p-3 text-xs text-zinc-400">
-                <p className="font-bold text-zinc-300">💡 Tips Audio:</p>
-                <p className="mt-1 text-[11px]">
-                  Pilih track audio di timeline untuk mengatur volume, mute, fade in/out, atau ekstraksi audio di panel kanan (Inspector).
-                </p>
-              </div>
-            </section>
-          )}
-
-          {/* TAB D: TEXT (Text Presets & Add Actions Only) */}
-          {activeNavTab === "text" && (
-            <section className="space-y-4">
-              <div>
-                <h2 className="text-sm font-black text-slate-950 uppercase tracking-wide text-cyan-400">
-                  Text & Titles
-                </h2>
-                <p className="mt-0.5 text-xs text-zinc-400">Preset tipografi dan penambahan teks ke timeline.</p>
-              </div>
-
-              <button
-                type="button"
-                onClick={() => addEvent("hook_text")}
-                className="btn-secondary w-full py-2 text-xs font-bold text-cyan-300"
-              >
-                + Tambah Teks ke Timeline
-              </button>
-
-              {!manualEditorMode && (
-                <div className="grid grid-cols-3 gap-1 rounded-lg bg-zinc-900 p-1">
-                  <button
-                    type="button"
-                    onClick={() => setActiveTextSubTab("presets")}
-                    className={`rounded-md py-1.5 text-[10px] font-black transition ${
-                      activeTextSubTab === "presets" ? "bg-[#25282d] text-cyan-300" : "text-zinc-400"
-                    }`}
-                  >
-                    Gaya Teks
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setActiveTextSubTab("hook")}
-                    className={`rounded-md py-1.5 text-[10px] font-black transition ${
-                      activeTextSubTab === "hook" ? "bg-[#25282d] text-cyan-300" : "text-zinc-400"
-                    }`}
-                  >
-                    Hook
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setActiveTextSubTab("keyword")}
-                    className={`rounded-md py-1.5 text-[10px] font-black transition ${
-                      activeTextSubTab === "keyword" ? "bg-[#25282d] text-cyan-300" : "text-zinc-400"
-                    }`}
-                  >
-                    Keyword
-                  </button>
+              {audioDirectory === "import" && (
+                <div className="space-y-3">
+                  <p className="text-[11px] font-black uppercase tracking-wide text-zinc-400">
+                    Import File Audio
+                  </p>
+                  <label className="btn-secondary block cursor-pointer px-3 py-2.5 text-center text-xs font-black">
+                    {audioUploading ? `Mengupload ${audioUploadProgress}%` : "+ Upload File Audio (.mp3, .wav, .m4a)"}
+                    <input
+                      accept=".mp3,.wav,.m4a,audio/mpeg,audio/wav,audio/mp4"
+                      className="hidden"
+                      disabled={audioUploading}
+                      onChange={(event) => {
+                        void handleAdditionalAudioUpload(event.target.files?.[0]);
+                        event.currentTarget.value = "";
+                      }}
+                      type="file"
+                    />
+                  </label>
                 </div>
               )}
 
-              {(manualEditorMode || activeTextSubTab === "presets") && (
+              {audioDirectory === "copyright" && (
                 <div className="space-y-3">
-                  <TextStylePresetSelector
-                    label="Pilih Preset Gaya Teks"
-                    onChange={(value) => setStyle("hook_text_style_preset", value)}
-                    value={styleConfig.hook_text_style_preset || "clean_white"}
-                  />
-                  <div className="rounded-xl border border-zinc-800 bg-[#202226] p-3 text-xs text-zinc-400">
-                    <p className="font-bold text-zinc-300">💡 Tips Tipografi:</p>
-                    <p className="mt-1 text-[11px]">
-                      Klik teks atau caption di timeline/canvas untuk mengubah font, warna, ukuran, dan perataan di panel kanan (Inspector).
+                  <div className="rounded-xl border border-emerald-800/60 bg-emerald-950/30 p-3 text-xs text-emerald-200">
+                    <p className="font-bold text-emerald-300 flex items-center gap-1.5">
+                      <span>🛡️</span>
+                      <span>Audio Bebas Royalti</span>
+                    </p>
+                    <p className="mt-1 text-[11px] text-emerald-300/90 leading-relaxed">
+                      Seluruh musik latar dan sound effects bawaan XA AutoClip 100% aman dan bebas royalti untuk video komersial dan media sosial (TikTok, Reels, Shorts).
                     </p>
                   </div>
                 </div>
               )}
+            </LeftPanelDirectoryLayout>
+          )}
 
-              {!manualEditorMode && activeTextSubTab === "hook" && (
-                <div className="space-y-3">
-                  <label className="flex items-center justify-between rounded-xl bg-zinc-800/80 p-3 text-xs font-bold">
-                    <span>Aktifkan Hook Text</span>
-                    <input
-                      checked={Boolean(styleConfig.hook_text_enabled)}
-                      className="size-4 accent-cyan-400"
-                      onChange={(event) => setStyle("hook_text_enabled", event.target.checked)}
-                      type="checkbox"
-                    />
-                  </label>
-
-                  <div>
-                    <label htmlFor="left_hook_template_select">Template Hook</label>
-                    <select
-                      id="left_hook_template_select"
-                      value={hookTextTemplate}
-                      onChange={(event) => setStyle("hook_text_template", event.target.value as HookTextTemplate)}
+          {/* TAB D: TEXT (Text Templates & Library Only - No Presets Grid) */}
+          {activeNavTab === "text" && (
+            <LeftPanelDirectoryLayout
+              directories={textDirectories}
+              activeDirectory={textDirectory}
+              onSelectDirectory={setTextDirectory}
+            >
+              {textDirectory === "add_text" && (
+                <div className="space-y-2.5">
+                  <p className="text-[11px] font-black uppercase tracking-wide text-zinc-400">
+                    Quick Add Text
+                  </p>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setStyle("hook_text_style_preset", "clean_white");
+                        addEvent("hook_text", "text:basic_text", "Teks Baru", "clean_white");
+                        setMessage("Teks default ditambahkan ke timeline.");
+                      }}
+                      className="flex flex-col items-start rounded-xl border border-zinc-700/80 bg-[#22252a] p-2.5 text-left transition hover:border-cyan-400 hover:bg-[#282c34]"
                     >
-                      {hookTextTemplates.map((t) => (
-                        <option key={t.value} value={t.value}>{t.label}</option>
-                      ))}
+                      <span className="text-sm">🔤</span>
+                      <span className="mt-1 block text-xs font-black text-zinc-100">Default text</span>
+                      <span className="text-[10px] text-zinc-400">Teks judul standar</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setStyle("hook_text_style_preset", "yellow_viral");
+                        addEvent("hook_text", "hook", styleConfig.hook_text || draft.original_hook || "WAJIB TAHU INI!", "yellow_viral");
+                        setMessage("Hook title ditambahkan ke timeline.");
+                      }}
+                      className="flex flex-col items-start rounded-xl border border-zinc-700/80 bg-[#22252a] p-2.5 text-left transition hover:border-cyan-400 hover:bg-[#282c34]"
+                    >
+                      <span className="text-sm">⚡</span>
+                      <span className="mt-1 block text-xs font-black text-amber-300">Hook title</span>
+                      <span className="text-[10px] text-zinc-400">Teks pembuka viral</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setStyle("hook_text_style_preset", "authority_blue");
+                        addEvent("hook_text", "text:lower_third", "Nama / Jabatan", "authority_blue");
+                        setMessage("Lower third ditambahkan ke timeline.");
+                      }}
+                      className="flex flex-col items-start rounded-xl border border-zinc-700/80 bg-[#22252a] p-2.5 text-left transition hover:border-cyan-400 hover:bg-[#282c34]"
+                    >
+                      <span className="text-sm">🏷️</span>
+                      <span className="mt-1 block text-xs font-black text-cyan-300">Lower third</span>
+                      <span className="text-[10px] text-zinc-400">Nama / info bawah</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setStyle("hook_text_style_preset", "podcast_quote");
+                        addEvent("hook_text", "text:quote", "“Kutipan menarik di sini”", "podcast_quote");
+                        setMessage("Quote text ditambahkan ke timeline.");
+                      }}
+                      className="flex flex-col items-start rounded-xl border border-zinc-700/80 bg-[#22252a] p-2.5 text-left transition hover:border-cyan-400 hover:bg-[#282c34]"
+                    >
+                      <span className="text-sm">💬</span>
+                      <span className="mt-1 block text-xs font-black text-rose-300">Quote</span>
+                      <span className="text-[10px] text-zinc-400">Format kutipan</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setStyle("hook_text_style_preset", "white_bold_shadow");
+                        addEvent("hook_text", "text:big_title", "JUDUL BESAR", "white_bold_shadow");
+                        setMessage("Big title ditambahkan ke timeline.");
+                      }}
+                      className="flex flex-col items-start rounded-xl border border-zinc-700/80 bg-[#22252a] p-2.5 text-left transition hover:border-cyan-400 hover:bg-[#282c34]"
+                    >
+                      <span className="text-sm">📢</span>
+                      <span className="mt-1 block text-xs font-black text-zinc-100">Big title</span>
+                      <span className="text-[10px] text-zinc-400">Judul tebal besar</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        addEvent("keyword_popup", "keyword", "KEYWORD", "yellow_viral");
+                        setMessage("Keyword popup ditambahkan ke timeline.");
+                      }}
+                      className="flex flex-col items-start rounded-xl border border-zinc-700/80 bg-[#22252a] p-2.5 text-left transition hover:border-cyan-400 hover:bg-[#282c34]"
+                    >
+                      <span className="text-sm">🎯</span>
+                      <span className="mt-1 block text-xs font-black text-yellow-300">Keyword popup</span>
+                      <span className="text-[10px] text-zinc-400">Highlight singkat</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {textDirectory === "text_template" && (
+                <div className="space-y-2.5">
+                  <div>
+                    <input
+                      type="text"
+                      placeholder="Search for text templates..."
+                      value={textSearch}
+                      onChange={(e) => setTextSearch(e.target.value)}
+                      className="w-full text-xs"
+                    />
+                  </div>
+
+                  {(() => {
+                    const filtered = textTemplates.filter((tpl) =>
+                      textSearch
+                        ? tpl.label.toLowerCase().includes(textSearch.toLowerCase()) ||
+                          tpl.sample.toLowerCase().includes(textSearch.toLowerCase()) ||
+                          tpl.category.toLowerCase().includes(textSearch.toLowerCase())
+                        : true,
+                    );
+
+                    return (
+                      <div className="space-y-2">
+                        <p className="text-[11px] font-black uppercase tracking-wide text-zinc-400">
+                          Trending ({filtered.length})
+                        </p>
+                        <div className="grid grid-cols-2 gap-2">
+                          {filtered.map((tpl) => (
+                            <button
+                              key={tpl.id}
+                              type="button"
+                              onClick={() => {
+                                setStyle("hook_text_style_preset", tpl.preset);
+                                addEvent("hook_text", `template:${tpl.id}`, tpl.sample, tpl.preset);
+                                setMessage(`Template "${tpl.label}" ditambahkan ke timeline.`);
+                              }}
+                              className="flex flex-col items-start rounded-xl border border-zinc-700/80 bg-[#22252a] p-2 text-left transition hover:border-cyan-400 hover:bg-[#282c34] group"
+                            >
+                              <span className="rounded bg-cyan-400/10 px-1.5 py-0.5 text-[8px] font-bold uppercase text-cyan-300">
+                                {tpl.category}
+                              </span>
+                              <span className="mt-1 block text-xs font-black text-zinc-100 group-hover:text-cyan-200">
+                                {tpl.label}
+                              </span>
+                              <span className="mt-0.5 block text-[10px] text-zinc-400 truncate w-full italic">
+                                {tpl.sample}
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
+
+              {textDirectory === "text_effects" && (
+                <div className="space-y-2.5">
+                  <p className="text-[11px] font-black uppercase tracking-wide text-zinc-400">
+                    Text Effects ({textEffectsList.length})
+                  </p>
+                  <div className="grid grid-cols-2 gap-2">
+                    {textEffectsList.map((fx) => (
+                      <button
+                        key={fx.id}
+                        type="button"
+                        onClick={() => {
+                          setStyle("hook_text_style_preset", fx.preset);
+                          addEvent("hook_text", `effect:${fx.id}`, fx.sample, fx.preset);
+                          setMessage(`Efek teks "${fx.label}" ditambahkan ke timeline.`);
+                        }}
+                        className="flex flex-col items-start rounded-xl border border-zinc-700/80 bg-[#22252a] p-2.5 text-left transition hover:border-cyan-400 hover:bg-[#282c34] group"
+                      >
+                        <div className="flex items-center gap-1.5">
+                          <span>{fx.icon}</span>
+                          <span className="text-xs font-black text-zinc-100 group-hover:text-cyan-200">
+                            {fx.label}
+                          </span>
+                        </div>
+                        <span className="mt-1 block text-[10px] text-zinc-400 line-clamp-1">
+                          {fx.desc}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {textDirectory === "yours" && (
+                <div className="space-y-2.5">
+                  <p className="text-[11px] font-black uppercase tracking-wide text-zinc-400">
+                    Teks Tersimpan & Project
+                  </p>
+                  {styleConfig.hook_text || draft.original_hook || context.data?.candidate_title ? (
+                    <div className="space-y-2">
+                      {styleConfig.hook_text && (
+                        <button
+                          type="button"
+                          onClick={() => addEvent("hook_text", "hook", styleConfig.hook_text, (styleConfig.hook_text_style_preset as TextStylePresetKey) || "clean_white")}
+                          className="w-full rounded-xl border border-zinc-700/80 bg-[#22252a] p-2.5 text-left transition hover:border-cyan-400"
+                        >
+                          <span className="text-[9px] font-bold text-cyan-400 uppercase">Hook Aktif</span>
+                          <p className="text-xs font-bold text-zinc-100 mt-0.5">{styleConfig.hook_text}</p>
+                        </button>
+                      )}
+                      {context.data?.candidate_title && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setStyle("hook_text", context.data.candidate_title || "");
+                            addEvent("hook_text");
+                          }}
+                          className="w-full rounded-xl border border-zinc-700/80 bg-[#22252a] p-2.5 text-left transition hover:border-cyan-400"
+                        >
+                          <span className="text-[9px] font-bold text-zinc-400 uppercase">Judul AI</span>
+                          <p className="text-xs font-bold text-zinc-100 mt-0.5">{context.data.candidate_title}</p>
+                        </button>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="rounded-xl border border-dashed border-zinc-700 bg-zinc-900/40 p-4 text-center text-xs font-semibold text-zinc-400">
+                      Belum ada teks tersimpan.
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {(textDirectory === "auto_captions" || textDirectory === "local_captions") && (
+                <div className="space-y-3">
+                  <div className="rounded-xl border border-cyan-800/60 bg-cyan-950/30 p-3 text-xs text-cyan-200">
+                    <p className="font-bold text-cyan-300">💬 Navigasi ke Captions</p>
+                    <p className="mt-1 text-[11px] text-cyan-300/85">
+                      Gunakan tab Captions di atas untuk sinkronisasi caption otomatis atau import file subtitle lokal.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => setActiveNavTab("caption")}
+                      className="btn-secondary mt-2.5 w-full py-1.5 text-xs font-bold text-cyan-300"
+                    >
+                      Buka Tab Captions →
+                    </button>
+                  </div>
+                </div>
+              )}
+            </LeftPanelDirectoryLayout>
+          )}
+
+          {/* TAB E: STICKERS (Stickers, Emojis & Badges Library) */}
+          {activeNavTab === "stickers" && (
+            <LeftPanelDirectoryLayout
+              directories={stickerDirectories}
+              activeDirectory={stickerDirectory}
+              onSelectDirectory={setStickerDirectory}
+            >
+              <div className="space-y-2.5">
+                <div>
+                  <input
+                    type="text"
+                    placeholder="Cari sticker (misal: panah, api, hot)..."
+                    value={stickerSearch}
+                    onChange={(e) => setStickerSearch(e.target.value)}
+                    className="w-full text-xs"
+                  />
+                </div>
+
+                {(() => {
+                  const filtered = stickerItems.filter((item) => {
+                    const matchDir = stickerDirectory === "trending" ? true : item.category === stickerDirectory;
+                    const matchSearch = stickerSearch
+                      ? item.label.toLowerCase().includes(stickerSearch.toLowerCase()) ||
+                        item.icon.toLowerCase().includes(stickerSearch.toLowerCase()) ||
+                        item.category.toLowerCase().includes(stickerSearch.toLowerCase())
+                      : true;
+                    return matchDir && matchSearch;
+                  });
+
+                  if (stickerDirectory === "yours" && !stickerSearch) {
+                    return (
+                      <div className="rounded-xl border border-dashed border-zinc-700 bg-zinc-900/40 p-4 text-center text-xs font-semibold text-zinc-400">
+                        Belum ada sticker kustom di library Anda.
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div className="space-y-2">
+                      <p className="text-[11px] font-black uppercase tracking-wide text-zinc-400">
+                        Koleksi ({filtered.length})
+                      </p>
+                      {filtered.length === 0 ? (
+                        <div className="rounded-xl border border-dashed border-zinc-700 bg-zinc-900/40 p-4 text-center text-xs font-semibold text-zinc-400">
+                          Tidak ada sticker yang cocok dengan "{stickerSearch}".
+                        </div>
+                      ) : (
+                        <div className="grid grid-cols-2 gap-2">
+                          {filtered.map((item) => (
+                            <button
+                              key={item.id}
+                              type="button"
+                              onClick={() => {
+                                const start = Math.min(Math.max(0, previewTime), Math.max(0, clipDuration - 0.4));
+                                const newStickerEvent: EffectTimelineEvent = {
+                                  id: newEventId(),
+                                  type: "keyword_popup",
+                                  start: Number(start.toFixed(2)),
+                                  end: Number(Math.min(clipDuration, start + 1.5).toFixed(2)),
+                                  text: item.icon,
+                                  reason: "sticker",
+                                  position: "center",
+                                  size: "medium",
+                                };
+                                updateEffectTimeline([...editableEffectTimeline, newStickerEvent]);
+                                setSelectedEventId(newStickerEvent.id || null);
+                                setSelectedEditorContext("keyword");
+                                setTextInspectorTab("text");
+                                setMessage(`Sticker "${item.label}" ditambahkan ke timeline.`);
+                              }}
+                              className="flex flex-col items-center justify-center rounded-xl border border-zinc-700/80 bg-[#22252a] p-2 text-center transition hover:border-cyan-400 hover:bg-[#282c34] group"
+                              title={`Tambah ${item.label} ke timeline`}
+                            >
+                              <span className={`block text-xl group-hover:scale-110 transition-transform ${item.badge ? "text-xs font-black text-amber-300" : ""}`}>
+                                {item.icon}
+                              </span>
+                              <span className="mt-1 block text-[10px] font-bold text-zinc-400 group-hover:text-zinc-200 truncate w-full">
+                                {item.label}
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
+            </LeftPanelDirectoryLayout>
+          )}
+
+          {/* TAB F: EFFECTS (Visual Effects Library) */}
+          {(activeNavTab === "effects" || activeNavTab === "effect") && (
+            <LeftPanelDirectoryLayout
+              directories={effectDirectories}
+              activeDirectory={effectDirectory}
+              onSelectDirectory={setEffectDirectory}
+            >
+              <div className="space-y-2.5">
+                <div>
+                  <input
+                    type="text"
+                    placeholder="Cari effect video (misal: zoom, flash, shake)..."
+                    value={effectSearch}
+                    onChange={(e) => setEffectSearch(e.target.value)}
+                    className="w-full text-xs"
+                  />
+                </div>
+
+                {(() => {
+                  const filtered = visualEffectsList.filter((ef) => {
+                    const matchDir = effectDirectory === "video_effects" ? true : ef.category === effectDirectory;
+                    const matchSearch = effectSearch
+                      ? ef.label.toLowerCase().includes(effectSearch.toLowerCase()) ||
+                        ef.desc.toLowerCase().includes(effectSearch.toLowerCase()) ||
+                        ef.category.toLowerCase().includes(effectSearch.toLowerCase())
+                      : true;
+                    return matchDir && matchSearch;
+                  });
+
+                  const currentDirObj = effectDirectories.find((d) => d.id === effectDirectory);
+                  const titleLabel = currentDirObj ? currentDirObj.label : "Pilihan Efek";
+
+                  return (
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <p className="text-[11px] font-black uppercase tracking-wide text-zinc-400">
+                          {titleLabel} ({filtered.length})
+                        </p>
+                      </div>
+                      {filtered.length === 0 ? (
+                        <div className="rounded-xl border border-dashed border-zinc-700 bg-zinc-900/40 p-4 text-center text-xs font-semibold text-zinc-400">
+                          {effectSearch
+                            ? `Tidak ada efek yang cocok dengan "${effectSearch}".`
+                            : "Preset akan ditambahkan bertahap."}
+                        </div>
+                      ) : (
+                        <div className="grid grid-cols-2 gap-2">
+                          {filtered.map((item) => {
+                            const isDemoing = previewingEffectId === item.id;
+                            const isApplied = editableEffectTimeline.some(
+                              (e) =>
+                                e.id === selectedEventId &&
+                                (e.effect === item.effectName ||
+                                  (e.type === item.type && e.type === "punch_zoom" && item.type === "punch_zoom") ||
+                                  (e.reason && e.reason.includes(item.id))),
+                            );
+
+                            return (
+                              <div
+                                key={item.id}
+                                className={`group relative flex flex-col justify-between rounded-xl border p-2 text-left transition-all ${
+                                  isApplied
+                                    ? "border-cyan-400 bg-cyan-500/10 shadow-[0_0_0_1px_rgba(34,211,238,0.3)] ring-1 ring-cyan-400/40"
+                                    : "border-zinc-700/80 bg-[#1e2024] hover:border-zinc-500 hover:bg-[#25282e]"
+                                }`}
+                              >
+                                {/* 1. Thumbnail Preview with Play/Demo Overlay */}
+                                <div className="relative w-full overflow-hidden rounded-lg">
+                                  <EffectThumbnailPreview
+                                    effectId={item.id}
+                                    isDemoing={isDemoing}
+                                  />
+                                  {/* Play/Demo button overlay */}
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      triggerEffectDemo(item);
+                                    }}
+                                    title={`Demo efek ${item.label}`}
+                                    className={`absolute top-1 right-1 flex size-6 items-center justify-center rounded-full backdrop-blur-md transition shadow ${
+                                      isDemoing
+                                        ? "bg-cyan-500 text-black shadow-cyan-500/50 scale-110"
+                                        : "bg-black/60 text-zinc-200 hover:bg-cyan-500 hover:text-black opacity-80 group-hover:opacity-100"
+                                    }`}
+                                  >
+                                    <span className="text-[10px] font-black">{isDemoing ? "⏳" : "▶"}</span>
+                                  </button>
+                                </div>
+
+                                {/* 2. Text Info */}
+                                <div className="w-full min-w-0 mt-1">
+                                  <p className="truncate text-xs font-black text-zinc-100 group-hover:text-cyan-200">
+                                    {item.label}
+                                  </p>
+                                  <p className="truncate text-[10px] text-zinc-400">
+                                    {item.desc}
+                                  </p>
+                                </div>
+
+                                {/* 3. Tambah Action Button */}
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    addEvent(item.type, `effect:${item.id}`, undefined, undefined, item.effectName);
+                                    setMessage(`Efek "${item.label}" ditambahkan ke timeline.`);
+                                  }}
+                                  className="btn-secondary w-full py-1 mt-1 text-[10px] font-bold text-cyan-300 border-cyan-500/30 hover:bg-cyan-500/20"
+                                >
+                                  + Tambah
+                                </button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
+            </LeftPanelDirectoryLayout>
+          )}
+
+          {/* TAB G: TRANSITIONS (Transitions Library) */}
+          {activeNavTab === "transitions" && (
+            <LeftPanelDirectoryLayout
+              directories={transitionDirectories}
+              activeDirectory={transitionDirectory}
+              onSelectDirectory={setTransitionDirectory}
+            >
+              <div className="space-y-2.5">
+                {videoSegments.length < 2 && (
+                  <div className="rounded-xl border border-amber-800/60 bg-amber-950/30 p-2 text-xs text-amber-200">
+                    <p className="font-bold flex items-center gap-1 text-amber-300 text-[11px]">
+                      <span>⚠️</span>
+                      <span>Info Sambungan Klip</span>
+                    </p>
+                    <p className="mt-0.5 text-[10px] text-amber-300/85">
+                      Transisi butuh minimal 2 klip video. Potong klip (✂) atau tambahkan klip kedua.
+                    </p>
+                  </div>
+                )}
+
+                <div>
+                  <input
+                    type="text"
+                    placeholder="Cari transisi (misal: fade, slide, zoom)..."
+                    value={transitionSearch}
+                    onChange={(e) => setTransitionSearch(e.target.value)}
+                    className="w-full text-xs"
+                  />
+                </div>
+
+                {(() => {
+                  const filtered = transitionItems.filter((item) => {
+                    const matchDir = transitionDirectory === "trending" ? true : item.category === transitionDirectory;
+                    const matchSearch = transitionSearch
+                      ? item.name.toLowerCase().includes(transitionSearch.toLowerCase()) ||
+                        item.desc.toLowerCase().includes(transitionSearch.toLowerCase()) ||
+                        item.category.toLowerCase().includes(transitionSearch.toLowerCase())
+                      : true;
+                    return matchDir && matchSearch;
+                  });
+
+                  const currentDirObj = transitionDirectories.find((d) => d.id === transitionDirectory);
+                  const titleLabel = currentDirObj ? currentDirObj.label : "Pilihan Transisi";
+
+                  return (
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <p className="text-[11px] font-black uppercase tracking-wide text-zinc-400">
+                          {titleLabel} ({filtered.length})
+                        </p>
+                      </div>
+                      {filtered.length === 0 ? (
+                        <div className="rounded-xl border border-dashed border-zinc-700 bg-zinc-900/40 p-4 text-center text-xs font-semibold text-zinc-400">
+                          {transitionSearch
+                            ? `Tidak ada transisi yang cocok dengan "${transitionSearch}".`
+                            : "Preset akan ditambahkan bertahap."}
+                        </div>
+                      ) : (
+                        <div className="grid grid-cols-2 gap-2">
+                          {filtered.map((item) => {
+                            const isDemoing = previewingTransitionId === item.id;
+                            const isApplied = editableEffectTimeline.some(
+                              (e) =>
+                                e.type === "pattern_interrupt" &&
+                                e.reason?.startsWith("transition") &&
+                                (e.effect === item.name.toLowerCase().replace(/\s+/g, "_") ||
+                                  e.reason?.toLowerCase().includes(item.name.toLowerCase())),
+                            );
+
+                            return (
+                              <div
+                                key={item.id}
+                                className={`group relative flex flex-col justify-between rounded-xl border p-2 text-left transition-all ${
+                                  isApplied
+                                    ? "border-cyan-400 bg-cyan-500/10 shadow-[0_0_0_1px_rgba(34,211,238,0.3)] ring-1 ring-cyan-400/40"
+                                    : "border-zinc-700/80 bg-[#1e2024] hover:border-zinc-500 hover:bg-[#25282e]"
+                                }`}
+                              >
+                                {/* 1. Thumbnail Preview with Play/Demo Overlay */}
+                                <div className="relative w-full overflow-hidden rounded-lg">
+                                  <TransitionThumbnailPreview
+                                    transitionId={item.id}
+                                    isDemoing={isDemoing}
+                                  />
+                                  {/* Play/Demo button overlay */}
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      triggerTransitionDemo(item);
+                                    }}
+                                    title={`Demo transisi ${item.name}`}
+                                    className={`absolute top-1 right-1 flex size-6 items-center justify-center rounded-full backdrop-blur-md transition shadow ${
+                                      isDemoing
+                                        ? "bg-cyan-500 text-black shadow-cyan-500/50 scale-110"
+                                        : "bg-black/60 text-zinc-200 hover:bg-cyan-500 hover:text-black opacity-80 group-hover:opacity-100"
+                                    }`}
+                                  >
+                                    <span className="text-[10px] font-black">{isDemoing ? "⏳" : "▶"}</span>
+                                  </button>
+                                  {isApplied && (
+                                    <span className="absolute bottom-1 left-1 rounded bg-cyan-500/90 px-1 py-0.2 text-[8px] font-black text-black">
+                                      ✓ AKTIF
+                                    </span>
+                                  )}
+                                </div>
+
+                                {/* 2. Text Info */}
+                                <div className="w-full min-w-0 mt-1">
+                                  <p className="truncate text-xs font-black text-zinc-100 group-hover:text-cyan-200">
+                                    {item.name}
+                                  </p>
+                                  <p className="truncate text-[10px] text-zinc-400">
+                                    {item.desc}
+                                  </p>
+                                </div>
+
+                                {/* 3. Terapkan Action Button */}
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    if (videoClipBoundaries.length === 0) {
+                                      setMessage(
+                                        "Transisi membutuhkan minimal dua klip video. Silakan potong (split ✂) video terlebih dahulu.",
+                                      );
+                                      return;
+                                    }
+                                    const nearestBoundary = videoClipBoundaries.reduce((prev, curr) =>
+                                      Math.abs(curr.time - previewTime) < Math.abs(prev.time - previewTime)
+                                        ? curr
+                                        : prev,
+                                    );
+                                    const dur = 0.5;
+                                    const start = Number(
+                                      Math.max(0, nearestBoundary.time - dur / 2).toFixed(2),
+                                    );
+                                    const end = Number(
+                                      Math.min(clipDuration, nearestBoundary.time + dur / 2).toFixed(2),
+                                    );
+                                    const effectType = item.name.toLowerCase().replace(/\s+/g, "_");
+
+                                    const existingTransition = editableEffectTimeline.find(
+                                      (e) =>
+                                        e.type === "pattern_interrupt" &&
+                                        e.reason?.startsWith("transition") &&
+                                        Math.abs((e.start + e.end) / 2 - nearestBoundary.time) <= 0.4,
+                                    );
+
+                                    let nextTimeline: EffectTimelineEvent[];
+                                    const transId = existingTransition?.id || newEventId();
+                                    const transEvent: EffectTimelineEvent = {
+                                      id: transId,
+                                      type: "pattern_interrupt",
+                                      start,
+                                      end,
+                                      effect: effectType,
+                                      reason: `transition:${item.name}`,
+                                    };
+
+                                    if (existingTransition) {
+                                      nextTimeline = editableEffectTimeline.map((e) =>
+                                        e.id === existingTransition.id ? transEvent : e,
+                                      );
+                                      setMessage(
+                                        `Transisi antara Klip ${nearestBoundary.beforeSegment.number} & ${nearestBoundary.afterSegment.number} diganti menjadi "${item.name}".`,
+                                      );
+                                    } else {
+                                      nextTimeline = [...editableEffectTimeline, transEvent];
+                                      setMessage(
+                                        `Transisi "${item.name}" diterapkan antara Klip ${nearestBoundary.beforeSegment.number} & ${nearestBoundary.afterSegment.number}.`,
+                                      );
+                                    }
+
+                                    updateEffectTimeline(nextTimeline);
+                                    setSelectedEventId(transId);
+                                    setSelectedEditorContext("effect");
+                                    setEffectInspectorTab("effect");
+                                  }}
+                                  className="btn-secondary w-full py-1 mt-1 text-[10px] font-bold text-cyan-300 border-cyan-500/30 hover:bg-cyan-500/20"
+                                >
+                                  Terapkan
+                                </button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
+            </LeftPanelDirectoryLayout>
+          )}
+
+          {/* TAB H: CAPTIONS (Caption Workflow & Presets) */}
+          {activeNavTab === "caption" && (
+            <LeftPanelDirectoryLayout
+              directories={captionDirectories}
+              activeDirectory={captionDirectory}
+              onSelectDirectory={setCaptionDirectory}
+            >
+              {captionDirectory === "auto_captions" && (
+                <div className="space-y-3">
+                  <div>
+                    <p className="text-[11px] font-black uppercase tracking-wide text-cyan-400">
+                      Auto Captions
+                    </p>
+                    <p className="mt-0.5 text-[11px] text-zinc-400">
+                      Buat subtitle otomatis dari audio video di timeline secara instan.
+                    </p>
+                  </div>
+
+                  {/* 1. Spoken Language */}
+                  <div className="space-y-1">
+                    <label className="text-xs font-semibold text-zinc-300 block">
+                      Spoken language
+                    </label>
+                    <select
+                      value={spokenLanguage}
+                      onChange={(e) => setSpokenLanguage(e.target.value)}
+                      disabled={autoCaptionGenerating}
+                      className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-xs text-zinc-200 focus:border-cyan-500 focus:outline-none"
+                    >
+                      <option value="id">Bahasa Indonesia</option>
+                      <option value="en">English</option>
+                      <option value="auto">Auto detect</option>
                     </select>
                   </div>
 
-                  <button
-                    type="button"
-                    className="btn-secondary w-full py-2 text-xs font-bold"
-                    disabled={regenerateHook.isPending}
-                    onClick={() => regenerateHook.mutate()}
-                  >
-                    {regenerateHook.isPending ? "Membuat..." : "Buat Ulang Hook AI"}
-                  </button>
-                </div>
-              )}
-
-              {!manualEditorMode && activeTextSubTab === "keyword" && (
-                <div className="space-y-3">
-                  <label className="flex items-center justify-between rounded-xl bg-zinc-800/80 p-3 text-xs font-bold">
-                    <span>Aktifkan Keyword Pop-up</span>
-                    <input
-                      checked={Boolean(styleConfig.keyword_popup_enabled)}
-                      className="size-4 accent-cyan-400"
-                      onChange={(event) => setStyle("keyword_popup_enabled", event.target.checked)}
-                      type="checkbox"
-                    />
-                  </label>
-
-                  <button
-                    type="button"
-                    onClick={() => addEvent("keyword_popup")}
-                    className="btn-secondary w-full py-2 text-xs font-bold text-yellow-300"
-                  >
-                    + Tambah Keyword ke Timeline
-                  </button>
-
-                  <div className="rounded-xl border border-zinc-700/80 bg-[#22252a] p-3 text-xs text-zinc-300">
-                    <p className="font-bold">Keyword Events ({timelineKeywordItems.length})</p>
-                    <p className="mt-1 text-[11px] text-zinc-400">
-                      Klik keyword di timeline untuk mengubah kata dan gaya di Inspector kanan.
-                    </p>
+                  {/* 2. Bilingual Captions */}
+                  <div className="space-y-1">
+                    <label className="text-xs font-semibold text-zinc-300 block">
+                      Bilingual captions
+                    </label>
+                    <select
+                      value={bilingualMode}
+                      onChange={(e) => setBilingualMode(e.target.value)}
+                      disabled={autoCaptionGenerating}
+                      className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-xs text-zinc-200 focus:border-cyan-500 focus:outline-none"
+                    >
+                      <option value="none">None</option>
+                      <option value="id_en">Indonesia → English (placeholder)</option>
+                      <option value="en_id">English → Indonesia (placeholder)</option>
+                    </select>
+                    {bilingualMode !== "none" && (
+                      <p className="text-[10px] text-amber-400">
+                        Bilingual captions akan tersedia pada update berikutnya.
+                      </p>
+                    )}
                   </div>
-                </div>
-              )}
-            </section>
-          )}
 
-          {/* TAB E: CAPTIONS (Caption Workflow, Sync & Cues List) */}
-          {activeNavTab === "caption" && (
-            <section className="space-y-4">
-              <div>
-                <h2 className="text-sm font-black text-slate-950 uppercase tracking-wide text-cyan-400">
-                  Captions & Subtitles
-                </h2>
-                <p className="mt-0.5 text-xs text-zinc-400">Sinkronisasi, preset gaya, dan daftar cue subtitle.</p>
-              </div>
-
-              <div className="grid grid-cols-2 gap-2">
-                <button
-                  className="btn-secondary px-2 py-1.5 text-xs font-bold"
-                  onClick={syncCaptionWithVideo}
-                  type="button"
-                >
-                  Sinkronkan Video
-                </button>
-                <button
-                  className="btn-secondary px-2 py-1.5 text-xs font-bold"
-                  disabled={!editableCaptionCues.length}
-                  onClick={reflowAllCaptions}
-                  type="button"
-                >
-                  Rapikan Cues
-                </button>
-              </div>
-
-              <div>
-                <label htmlFor="left_caption_preset">Preset Gaya Caption</label>
-                <select
-                  id="left_caption_preset"
-                  onChange={(event) => {
-                    const selected = captionStylePresets.find((p) => p.value === event.target.value);
-                    if (selected) {
-                      setCaptionStyle({
-                        ...selected.config,
-                        displayMode: captionStyle.displayMode,
-                        maxWords: captionStyle.maxWords,
-                        karaokeEnabled: captionStyle.displayMode === "karaoke",
-                      });
-                    }
-                  }}
-                  value={captionStyle.preset}
-                >
-                  {captionStylePresets.map((p) => (
-                    <option key={p.value} value={p.value}>{p.label}</option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="rounded-xl border border-zinc-700/80 bg-[#22252a] p-3 space-y-2">
-                <p className="text-xs font-black uppercase text-zinc-400">Mode Tampilan</p>
-                <div className="grid grid-cols-3 gap-1 rounded-lg bg-zinc-900 p-1">
-                  {(["segment", "karaoke", "word_by_word"] as const).map((mode) => (
-                    <button
-                      key={mode}
-                      type="button"
-                      onClick={() => setCaptionStyle({ displayMode: mode, karaokeEnabled: mode === "karaoke" })}
-                      className={`rounded-md py-1 text-[10px] font-black capitalize transition ${
-                        captionStyle.displayMode === mode ? "bg-[#25282d] text-cyan-300" : "text-zinc-400"
-                      }`}
-                    >
-                      {mode === "word_by_word" ? "Word" : mode}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <div className="border-t border-zinc-800 pt-3">
-                <p className="text-xs font-black uppercase tracking-wide text-zinc-400">
-                  Daftar Cue Caption ({editableCaptionCues.length})
-                </p>
-                <p className="mt-0.5 text-[11px] text-zinc-500">Klik cue untuk mengedit teks & styling di panel kanan.</p>
-                <div className="mt-2 max-h-64 overflow-y-auto space-y-2 pr-1">
-                  {editableCaptionCues.map((cue) => (
-                    <div
-                      key={cue.id}
-                      onClick={() => {
-                        setSelectedCaptionId(cue.id);
-                        setSelectedEditorContext("caption");
-                      }}
-                      className={`cursor-pointer rounded-lg border p-2 text-xs transition ${
-                        selectedCaptionId === cue.id
-                          ? "border-cyan-400 bg-cyan-500/10 text-cyan-200"
-                          : "border-zinc-800 bg-[#22252a] text-zinc-300 hover:border-zinc-600"
-                      }`}
-                    >
-                      <div className="flex justify-between text-[10px] text-zinc-500 font-bold">
-                        <span>{formatTimePrecise(cue.start)} - {formatTimePrecise(cue.end)}</span>
-                        <span>{(cue.end - cue.start).toFixed(1)}s</span>
-                      </div>
-                      <p className="mt-1 font-semibold line-clamp-2">{cue.text}</p>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </section>
-          )}
-
-          {/* TAB F: EFFECTS (Effects Presets & Add Actions Only) */}
-          {activeNavTab === "effect" && (
-            <section className="space-y-4">
-              <div>
-                <h2 className="text-sm font-black text-slate-950 uppercase tracking-wide text-cyan-400">
-                  Effects & Presets
-                </h2>
-                <p className="mt-0.5 text-xs text-zinc-400">Pilih gaya editing visual atau tambahkan efek baru.</p>
-              </div>
-
-              <div className="space-y-3">
-                <div>
-                  <label htmlFor="left_clipper_style">Gaya Clipper</label>
-                  <select
-                    id="left_clipper_style"
-                    value={styleConfig.clipper_style_preset}
-                    onChange={(event) => {
-                      const nextStyle = event.target.value as keyof typeof styleDefaults;
-                      setRenderDirty(true);
-                      setRender(undefined);
-                      set("clipper_style_config", {
-                        ...styleDefaults[nextStyle],
-                        hook_text: styleConfig.hook_text,
-                        hook_text_template: styleConfig.hook_text_template,
-                        hook_text_font: styleConfig.hook_text_font,
-                        hook_text_position: styleConfig.hook_text_position,
-                        hook_text_size: styleConfig.hook_text_size,
-                        hook_text_style_preset: styleConfig.hook_text_style_preset,
-                        keyword_text_style_preset: styleConfig.keyword_text_style_preset,
-                        caption_style: styleConfig.caption_style,
-                        effect_timeline: styleConfig.effect_timeline || [],
-                        audio_settings: audioSettings,
-                        media_trim: styleConfig.media_trim,
-                        media_split_points: styleConfig.media_split_points || [],
-                        media_sequence: styleConfig.media_sequence || [],
-                        video_sequence: styleConfig.video_sequence || [],
-                        audio_sequence: styleConfig.audio_sequence || [],
-                        audio_extracted: audioExtracted,
-                        video_track_deleted: videoTrackDeleted,
-                        audio_track_deleted: audioTrackDeleted,
-                        video_framing: videoFraming,
-                        editor_state_version: styleConfig.editor_state_version || 0,
-                        video_sequence_initialized: styleConfig.video_sequence_initialized || false,
-                        audio_sequence_initialized: styleConfig.audio_sequence_initialized || false,
-                        caption_timeline_initialized: styleConfig.caption_timeline_initialized || false,
-                        effect_timeline_initialized: styleConfig.effect_timeline_initialized || false,
-                        layer_order: visualLayerOrder,
-                        track_order: trackOrder,
-                        additional_audio_assets: additionalAudioAssets,
-                        additional_audio_tracks: additionalAudioTracks,
-                        caption_timeline: styleConfig.caption_timeline || [],
-                        render_preset: preset,
-                      });
-                    }}
-                  >
-                    {stylePresets.map((item) => (
-                      <option key={item.value} value={item.value}>{item.label}</option>
-                    ))}
-                  </select>
-                </div>
-
-                <div>
-                  <label htmlFor="left_style_intensity">Intensitas Gaya</label>
-                  <select
-                    id="left_style_intensity"
-                    value={styleConfig.style_intensity}
-                    onChange={(event) => setStyle("style_intensity", event.target.value)}
-                  >
-                    <option value="low">Low</option>
-                    <option value="medium">Medium</option>
-                    <option value="high">High</option>
-                  </select>
-                </div>
-              </div>
-
-              <div className="border-t border-zinc-800 pt-3 space-y-2">
-                <p className="text-xs font-black uppercase tracking-wide text-zinc-400">Tambah Momen Efek</p>
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => addEvent("punch_zoom")}
-                    className="btn-secondary py-2 text-xs font-bold text-rose-300"
-                  >
-                    + Punch Zoom
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => addEvent("pattern_interrupt")}
-                    className="btn-secondary py-2 text-xs font-bold text-purple-300"
-                  >
-                    + Pattern
-                  </button>
-                </div>
-              </div>
-
-              <div className="rounded-xl border border-zinc-800 bg-[#202226] p-3 text-xs text-zinc-400">
-                <p className="font-bold text-zinc-300">💡 Tips Efek:</p>
-                <p className="mt-1 text-[11px]">
-                  Klik momen efek di timeline untuk mengatur zoom level, durasi, dan tipe transisi di panel kanan (Inspector).
-                </p>
-              </div>
-            </section>
-          )}
-
-          {/* TAB G: TEMPLATES (Templates & Layout Presets Only) */}
-          {activeNavTab === "templates" && (
-            <section className="space-y-4">
-              <div>
-                <h2 className="text-sm font-black text-slate-950 uppercase tracking-wide text-cyan-400">
-                  Templates & Layout
-                </h2>
-                <p className="mt-0.5 text-xs text-zinc-400">Pilih template layout 9:16 untuk framing video.</p>
-              </div>
-
-              <div className="space-y-2.5">
-                {presetOptions.map((opt) => (
-                  <div
-                    key={opt.value}
-                    onClick={() => selectPreset(opt.value as RenderPreset)}
-                    className={`cursor-pointer rounded-xl border p-3 transition ${
-                      preset === opt.value
-                        ? "border-cyan-400 bg-cyan-500/10 shadow-sm"
-                        : "border-zinc-700/80 bg-[#22252a] hover:border-zinc-500"
-                    }`}
-                  >
+                  {/* 3. Identify Filler Words */}
+                  <div className="rounded-lg border border-zinc-800 bg-[#202226] p-2 space-y-1">
                     <div className="flex items-center justify-between">
-                      <p className="text-xs font-black text-zinc-100">{opt.label}</p>
-                      {preset === opt.value && (
-                        <span className="rounded bg-cyan-400/20 px-1.5 py-0.5 text-[10px] font-black text-cyan-300">
-                          Aktif
-                        </span>
-                      )}
+                      <span className="text-xs text-zinc-300 font-medium">Identify filler words</span>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={identifyFillerWords}
+                        disabled={autoCaptionGenerating}
+                        onClick={() => setIdentifyFillerWords((v) => !v)}
+                        className={`relative inline-flex h-4 w-8 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                          identifyFillerWords ? "bg-cyan-500" : "bg-zinc-700"
+                        }`}
+                      >
+                        <span
+                          className={`pointer-events-none inline-block h-3 w-3 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                            identifyFillerWords ? "translate-x-4" : "translate-x-0"
+                          }`}
+                        />
+                      </button>
                     </div>
-                    <p className="mt-1 text-[11px] text-zinc-400">{opt.description}</p>
+                    {identifyFillerWords && (
+                      <p className="text-[10px] text-zinc-400">
+                        Deteksi filler words akan dikembangkan pada tahap berikutnya.
+                      </p>
+                    )}
                   </div>
-                ))}
-              </div>
 
-              <div className="rounded-xl border border-zinc-800 bg-[#202226] p-3 text-xs text-zinc-400">
-                <p className="font-bold text-zinc-300">💡 Tips Framing:</p>
-                <p className="mt-1 text-[11px]">
-                  Klik video di timeline atau canvas untuk mengatur posisi X, Y, dan zoom secara presisi di panel kanan (Inspector).
-                </p>
+                  {/* 4. Delete Current Captions */}
+                  <div className="space-y-1">
+                    <label className="flex items-center gap-2 cursor-pointer text-xs text-zinc-300">
+                      <input
+                        type="checkbox"
+                        checked={deleteCurrentCaptions}
+                        disabled={autoCaptionGenerating}
+                        onChange={(e) => setDeleteCurrentCaptions(e.target.checked)}
+                        className="rounded border-zinc-700 bg-zinc-900 text-cyan-500 focus:ring-0"
+                      />
+                      <span>Delete current captions</span>
+                    </label>
+                    {!deleteCurrentCaptions && (
+                      <p className="text-[10px] text-amber-400/90 pl-5">
+                        Caption baru akan digabungkan dengan caption yang sudah ada.
+                      </p>
+                    )}
+                  </div>
+
+                  {/* 5. Button Generate */}
+                  <div className="pt-1 space-y-2">
+                    <button
+                      type="button"
+                      disabled={!hasTimelineMedia || autoCaptionGenerating}
+                      onClick={() => generateAutoCaptionsMutation.mutate()}
+                      className={`w-full py-2 px-3 rounded-lg text-xs font-bold transition flex items-center justify-center gap-2 ${
+                        !hasTimelineMedia
+                          ? "bg-zinc-800 text-zinc-500 cursor-not-allowed border border-zinc-700/50"
+                          : autoCaptionGenerating
+                          ? "bg-cyan-600/50 text-cyan-200 cursor-wait animate-pulse"
+                          : "bg-cyan-500 hover:bg-cyan-400 text-slate-950 shadow-md shadow-cyan-500/20 active:scale-[0.98]"
+                      }`}
+                    >
+                      {autoCaptionGenerating ? (
+                        <>
+                          <svg className="animate-spin h-3.5 w-3.5 text-cyan-200" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                          </svg>
+                          <span>Membuat caption...</span>
+                        </>
+                      ) : (
+                        <span>Buat Caption</span>
+                      )}
+                    </button>
+
+                    {!hasTimelineMedia && (
+                      <p className="text-[10px] text-amber-400 text-center">
+                        Tambahkan video atau audio ke timeline terlebih dahulu.
+                      </p>
+                    )}
+
+                    {autoCaptionError && (
+                      <div className="rounded-lg border border-red-500/40 bg-red-950/30 p-2 text-[11px] text-red-300">
+                        {autoCaptionError}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Secondary helpers */}
+                  <div className="border-t border-zinc-800/80 pt-2 space-y-2">
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        className="btn-secondary px-2 py-1.5 text-[11px] font-bold text-zinc-300 hover:text-cyan-300"
+                        onClick={syncCaptionWithVideo}
+                        type="button"
+                      >
+                        ⚡ Sinkronkan
+                      </button>
+                      <button
+                        className="btn-secondary px-2 py-1.5 text-[11px] font-bold text-zinc-300"
+                        disabled={!editableCaptionCues.length}
+                        onClick={reflowAllCaptions}
+                        type="button"
+                      >
+                        ✨ Rapikan
+                      </button>
+                    </div>
+
+                    <div className="rounded-xl border border-zinc-800 bg-[#202226] p-2.5 text-xs text-zinc-400">
+                      <p className="font-bold text-zinc-300">Status Caption:</p>
+                      <p className="mt-0.5 text-[11px]">
+                        {editableCaptionCues.length} cue aktif di timeline. Klik cue untuk mengedit di inspector kanan.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {captionDirectory === "templates" && (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <p className="text-[11px] font-black uppercase tracking-wide text-zinc-400">
+                      Template Gaya Caption ({CAPTION_TEMPLATES.length})
+                    </p>
+                    <span className="text-[10px] text-cyan-400 font-bold">CapCut Style</span>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2 max-h-96 overflow-y-auto pr-1">
+                    {CAPTION_TEMPLATES.map((tpl) => {
+                      const isActive = mainCaptionStyle.preset_id === tpl.id;
+                      return (
+                        <div
+                          key={tpl.id}
+                          onClick={() => {
+                            updateMainCaptionStyle(tpl.stylePatch);
+                            setMessage(`Template "${tpl.name}" diterapkan ke caption.`);
+                          }}
+                          className={`group cursor-pointer rounded-xl border p-2 text-left transition flex flex-col justify-between ${
+                            isActive
+                              ? "border-cyan-400 bg-cyan-500/10 text-cyan-200 shadow-sm ring-1 ring-cyan-400"
+                              : "border-zinc-700/80 bg-[#22252a] text-zinc-300 hover:border-zinc-500 hover:bg-[#282b30]"
+                          }`}
+                        >
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-[11px] font-black truncate">{tpl.name}</span>
+                            {tpl.badge && (
+                              <span className="rounded bg-cyan-400/20 px-1 py-0.2 text-[8px] font-black uppercase text-cyan-300">
+                                {tpl.badge}
+                              </span>
+                            )}
+                          </div>
+                          <div className="h-9 rounded-md bg-zinc-950/80 flex items-center justify-center p-1 text-center overflow-hidden">
+                            <span
+                              style={{
+                                color: tpl.stylePatch.color || "#FFFFFF",
+                                fontFamily: tpl.stylePatch.font_family,
+                                fontWeight: tpl.stylePatch.font_weight || "800",
+                                fontStyle: tpl.stylePatch.italic ? "italic" : "normal",
+                                textTransform: tpl.stylePatch.case_mode === "uppercase" ? "uppercase" : "none",
+                                WebkitTextStroke: tpl.stylePatch.stroke_enabled
+                                  ? `${tpl.stylePatch.stroke_width || 1}px ${tpl.stylePatch.stroke_color || "#000"}`
+                                  : undefined,
+                                textShadow: tpl.stylePatch.shadow_enabled
+                                  ? `0 1px 3px ${tpl.stylePatch.shadow_color || "rgba(0,0,0,0.8)"}`
+                                  : undefined,
+                                fontSize: 10,
+                                lineHeight: 1.1,
+                              }}
+                              className="line-clamp-1"
+                            >
+                              {tpl.previewText}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {captionDirectory === "local_captions" && (
+                <div className="space-y-2.5">
+                  <p className="text-[11px] font-black uppercase tracking-wide text-zinc-400">
+                    Daftar Cue Subtitle ({editableCaptionCues.length})
+                  </p>
+                  {editableCaptionCues.length === 0 ? (
+                    <div className="rounded-xl border border-dashed border-zinc-700 bg-zinc-900/40 p-4 text-center text-xs font-semibold text-zinc-400">
+                      Belum ada subtitle cue.
+                    </div>
+                  ) : (
+                    <div className="max-h-72 overflow-y-auto space-y-1.5 pr-1">
+                      {editableCaptionCues.map((cue) => (
+                        <div
+                          key={cue.id}
+                          onClick={() => {
+                            setSelectedCaptionId(cue.id);
+                            setSelectedEditorContext("caption");
+                          }}
+                          className={`cursor-pointer rounded-lg border p-2 text-xs transition ${
+                            selectedCaptionId === cue.id
+                              ? "border-cyan-400 bg-cyan-500/10 text-cyan-200"
+                              : "border-zinc-800 bg-[#22252a] text-zinc-300 hover:border-zinc-600"
+                          }`}
+                        >
+                          <div className="flex justify-between text-[10px] text-zinc-500 font-bold">
+                            <span>{formatTimePrecise(cue.start)} - {formatTimePrecise(cue.end)}</span>
+                            <span>{(cue.end - cue.start).toFixed(1)}s</span>
+                          </div>
+                          <p className="mt-0.5 font-semibold line-clamp-2">{cue.text}</p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {(captionDirectory === "add_captions" || captionDirectory === "auto_lyrics") && (
+                <div className="space-y-3">
+                  <p className="text-[11px] font-black uppercase tracking-wide text-zinc-400">
+                    Tambah Caption Manual
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const start = Math.min(Math.max(0, previewTime), Math.max(0, clipDuration - 0.5));
+                      const newCue: EditableCaptionCue = {
+                        id: newEventId(),
+                        start: Number(start.toFixed(2)),
+                        end: Number(Math.min(clipDuration, start + 2).toFixed(2)),
+                        text: "Teks Caption Baru",
+                      };
+                      const next = [...editableCaptionCues, newCue].sort((a, b) => a.start - b.start);
+                      updateCaptionTimeline(next);
+                      setSelectedCaptionId(newCue.id);
+                      setSelectedEditorContext("caption");
+                      setMessage("Caption baru ditambahkan.");
+                    }}
+                    className="btn-secondary w-full py-2 text-xs font-bold text-cyan-300"
+                  >
+                    + Tambah Cue pada Playhead ({formatTimePrecise(previewTime)})
+                  </button>
+                </div>
+              )}
+            </LeftPanelDirectoryLayout>
+          )}
+
+          {/* TAB I: TEMPLATES (Templates & Project Scene Library) */}
+          {activeNavTab === "templates" && (
+            <div className="flex flex-1 min-h-0 w-full h-full flex-col items-center justify-center p-6 text-center bg-[#17191c]">
+              <div className="flex size-14 items-center justify-center rounded-2xl border border-zinc-700/60 bg-[#22252a] text-2xl shadow-inner mb-3 text-cyan-400">
+                🎨
               </div>
-            </section>
+              <h3 className="text-sm font-bold text-zinc-100 mb-1">
+                Template belum tersedia
+              </h3>
+              <p className="max-w-xs text-xs leading-relaxed text-zinc-400 mb-4">
+                Template scene akan ditambahkan setelah struktur template final siap. Untuk pengaturan framing video, pilih track <span className="font-semibold text-cyan-400">VIDEO</span> lalu gunakan <span className="font-semibold text-zinc-200">Framing & Canvas</span> di panel kanan.
+              </p>
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedEditorContext("video");
+                  setVideoInspectorTab("video");
+                  setSelectedEventId(null);
+                  setSelectedCaptionId(null);
+                  if (videoSegments.length > 0) {
+                    setSelectedMediaSegmentId(videoSegments[0].id);
+                  }
+                  setMessage("Navigasi ke Video Inspector → Framing & Canvas.");
+                }}
+                className="btn-primary flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold shadow-lg shadow-cyan-500/10"
+              >
+                <span>🎬</span>
+                <span>Pilih video untuk atur framing</span>
+              </button>
+            </div>
           )}
         </aside>
 
         {/* CENTER PREVIEW PLAYER */}
         <main className="flex min-h-0 w-full flex-col overflow-hidden bg-[#101214] xl:h-full">
-          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-4 py-2">
-            <div className="min-w-0">
-              <p className="text-xs font-black uppercase tracking-wide text-cyan-300">
-                {currentRenderLabel}
-              </p>
-              <p className="mt-0.5 text-xs text-slate-300">{previewModeText}</p>
-            </div>
-            <div className="flex flex-wrap gap-2 text-xs font-bold text-slate-300">
-              <span className="rounded-lg bg-white/10 px-2 py-1">9:16</span>
-              <span className="rounded-lg bg-white/10 px-2 py-1">
-                {presetOptions.find((item) => item.value === preset)?.label}
-              </span>
-              <span className="rounded-lg bg-white/10 px-2 py-1">
-                {stylePresets.find((item) => item.value === styleConfig.clipper_style_preset)?.label}
-              </span>
-            </div>
-          </div>
           <div
             className="flex min-h-0 flex-1 items-center justify-center px-3 py-2"
             onClick={() => {
               setSelectedEventId(null);
               setSelectedCaptionId(null);
               setSelectedMediaSegmentId(null);
-              setSelectedEditorContext(
-                manualEditorMode && videoSequence.length === 0 ? "media" : "video",
-              );
+              setSelectedAdditionalAudioTrackId(null);
+              setSelectedEditorContext("details");
             }}
           >
-            <div className="relative aspect-[9/16] h-[clamp(300px,42vh,500px)] max-h-full max-w-full overflow-hidden rounded-lg bg-black shadow-2xl shadow-black/50 ring-1 ring-white/10">
+            <div
+              ref={previewCanvasContainerRef}
+              className="relative aspect-[9/16] h-[clamp(300px,42vh,500px)] max-h-full max-w-full overflow-hidden rounded-lg bg-black shadow-2xl shadow-black/50 ring-1 ring-white/10 select-none"
+            >
               {renderedPreviewUrl ? (
                 <video
                   className="h-full w-full object-cover"
+                  style={{
+                    ...transitionTransformStyle,
+                    filter: transitionFilterStyle ? transitionFilterStyle : undefined,
+                  }}
                   controls
                   muted={audioSettings.muted}
                   onLoadedMetadata={(event) => {
                     event.currentTarget.volume = Math.min(1, audioSettings.volume);
+                    const clampedSpeed = Math.max(0.25, Math.min(4.0, videoSpeed || 1.0));
+                    event.currentTarget.playbackRate = clampedSpeed;
                     setPreviewTimeFromVideo(event.currentTarget.currentTime);
                   }}
                   onPause={handlePreviewPause}
                   onPlay={handlePreviewPlay}
-                  onSeeked={(event) => setPreviewTimeFromVideo(event.currentTarget.currentTime)}
+                  onSeeked={(event) => handleVideoSeeked(event.currentTarget.currentTime)}
                   onTimeUpdate={(event) => setPreviewTimeFromVideo(event.currentTarget.currentTime)}
                   preload="metadata"
                   ref={previewVideoRef}
@@ -5343,48 +9553,65 @@ return (
                 />
               ) : (
                 <div
-                  className={`absolute inset-0 h-full w-full ${livePreviewFilterClass}`}
-                  style={{ ...liveZoomStyle, zIndex: visualLayerZIndex("video") }}
+                  className={`absolute inset-0 h-full w-full ${livePreviewFilterClass} ${
+                    (videoSegments.length > 0
+                      ? ((videoSegments.find((s) => previewTime >= s.start - 0.05 && previewTime < s.end - 0.05) || videoSegments[0])?.visible === false)
+                      : (styleConfig.video_visible === false))
+                      ? "opacity-0 pointer-events-none"
+                      : ""
+                  }`}
+                  style={{
+                    ...liveZoomStyle,
+                    ...transitionTransformStyle,
+                    filter: transitionFilterStyle ? transitionFilterStyle : undefined,
+                    zIndex: visualLayerZIndex("video"),
+                  }}
                 >
                   <PresetVideo
-                    audioMuted={videoTrackDeleted || audioExtracted || audioSettings.muted}
+                    audioMuted={videoTrackDeleted || audioExtracted || videoMuted || audioSettings.muted}
                     audioVolume={audioSettings.volume}
                     src={sourceClipUrl}
-                    preset={preset}
+                    preset={effectiveFramingPreset}
                     framing={videoFraming}
+                    adjustments={videoAdjustments}
+                    speed={videoSpeed}
                     controls
                     onLoadedMetadata={setPreviewTimeFromVideo}
                     onPause={handlePreviewPause}
                     onPlay={handlePreviewPlay}
-                    onSeeked={setPreviewTimeFromVideo}
+                    onSeeked={handleVideoSeeked}
                     onTimeUpdate={setPreviewTimeFromVideo}
                     videoRef={previewVideoRef}
                   />
                 </div>
               )}
 
+              {isVisualModifierActive && transitionOverlayColor && (
+                <div
+                  className="pointer-events-none absolute inset-0"
+                  style={{
+                    backgroundColor: transitionOverlayColor,
+                    opacity: transitionOverlayOpacity,
+                    zIndex: 28,
+                  }}
+                />
+              )}
+
               {manualEditorMode && videoSequence.length === 0 && (
                 <div
-                  className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 bg-zinc-950/95 p-6 text-center"
-                  onClick={(event) => event.stopPropagation()}
+                  className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-2 bg-zinc-950/85 p-4 text-center pointer-events-none"
                 >
-                  <div className="flex size-14 items-center justify-center rounded-full bg-zinc-900 border border-zinc-700 text-2xl text-cyan-400">
-                    ▶
+                  <div className="flex size-10 items-center justify-center rounded-full bg-zinc-900 border border-zinc-800 text-base text-cyan-400">
+                    🎬
                   </div>
                   <div>
-                    <p className="text-base font-black text-zinc-100">
-                      Import media untuk mulai mengedit
+                    <p className="text-xs font-bold text-zinc-200">
+                      Editor Siap
                     </p>
-                    <p className="mt-1 max-w-xs text-xs font-semibold text-zinc-400">
-                      Gunakan tombol import di panel kiri atau tombol di bawah ini.
+                    <p className="mt-0.5 text-[11px] text-zinc-500">
+                      Pilih media dari panel kiri untuk mulai mengedit
                     </p>
                   </div>
-                  <EditorMediaImportControls
-                    className="grid w-full max-w-xs grid-cols-1 gap-2 mt-1"
-                    disabled={editorMediaUploading}
-                    onImport={importEditorMedia}
-                    uploadingKind={editorMediaUploadKind}
-                  />
                 </div>
               )}
 
@@ -5393,6 +9620,10 @@ return (
                   aria-label="Preview track audio terpisah"
                   className="hidden"
                   preload="metadata"
+                  onLoadedMetadata={(e) => {
+                    const speed = Math.max(0.5, Math.min(2.0, audioSettings.speed || 1.0));
+                    e.currentTarget.playbackRate = speed;
+                  }}
                   ref={previewAudioRef}
                   src={sourceMediaUrl}
                 />
@@ -5407,131 +9638,757 @@ return (
                 </div>
               )}
 
-              {hookPreviewState.shouldRenderHookOverlay && liveHookEvent && liveHookText && (
-                <div
-                  data-hook-duplicate-suppressed={
-                    hookPreviewState.hookPreviewDuplicateSuppressed
-                  }
-                  data-hook-render-source={hookPreviewState.hookPreviewRenderSource}
-                  className={`pointer-events-auto absolute max-h-20 cursor-pointer overflow-hidden rounded-lg text-center leading-tight ${
-                    ""
-                  } ${activeHookTemplate.widthClass} ${activeHookTemplate.paddingClass} ${
-                    activeHookTemplate.containerClass
-                  } ${hookOverlayTextSizeClass(liveHookText, hookTextSize, hookTextTemplate)}`}
-                  style={{
-                    ...hookUnifiedTextStyle,
-                    top: `${hookSafeArea.topPercent}%`,
-                    fontSize: `${hookSafeArea.fontSizePx}px`,
-                    zIndex: visualLayerZIndex("hook"),
-                    textShadow: hookUnifiedTextStyle.textShadow || activeHookTemplate.textShadow,
-                    fontFamily: activeHookFont.fontFamily,
-                  }}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    setSelectedEventId(liveHookEvent.id || null);
-                    setSelectedEditorContext("hook");
-                  }}
-                >
-                  {activeHookTemplate.badge && (
-                    <span
-                      className={`block font-black ${
-                        activeHookTemplate.badgeClass || "mb-1 text-[8px] tracking-wide opacity-90"
-                      }`}
-                    >
-                      {activeHookTemplate.badge}
-                    </span>
-                  )}
-                  <span className={`block line-clamp-2 ${activeHookTemplate.textClass}`}>
-                    {hookSafeArea.lines.map((line, index) => (
-                      <span key={`${line}-${index}`} className="block whitespace-normal">
-                        {line}
-                      </span>
-                    ))}
-                  </span>
-                </div>
-              )}
+              {hookPreviewState.shouldRenderHookOverlay && liveHookEvent && liveHookEvent.visible !== false && (() => {
+                const eventPreset = normalizeTextStylePreset(
+                  (liveHookEvent.preset as TextStylePresetKey) || styleConfig.hook_text_style_preset || "clean_white"
+                );
+                const eventStyle = resolveTextOverlayStyle(eventPreset);
+                const eventFont = liveHookEvent.font_family
+                  ? hookTextFonts.find((f) => f.value === liveHookEvent.font_family || f.fontFamily === liveHookEvent.font_family)?.fontFamily || liveHookEvent.font_family
+                  : activeHookFont.fontFamily;
+                const defaultHookPosY =
+                  liveHookEvent.position === "bottom"
+                    ? 84
+                    : liveHookEvent.position === "center"
+                    ? 50
+                    : liveHookEvent.position === "top"
+                    ? 10
+                    : liveHookEvent.position === "upper_center"
+                    ? 18
+                    : (hookSafeArea.topPercent || 18);
+                const posX = liveHookEvent.position_x_percent ?? 50;
+                const posY = liveHookEvent.position_y_percent ?? defaultHookPosY;
+                const scale = liveHookEvent.scale ?? 1.0;
+                const isSelected = selectedEventId === liveHookEvent.id || selectedEditorContext === "hook";
+                const currentText = liveHookEvent.text ?? (styleConfig.hook_text || hookFallbackText || "");
 
-              {!renderedPreviewAvailable &&
-                styleConfig.keyword_popup_enabled &&
-                liveKeywordEvent?.text && (
-                    <div
-                      className="pointer-events-auto absolute bottom-32 left-[16%] right-[16%] max-h-14 cursor-pointer overflow-hidden rounded-md px-2 py-1.5 text-center text-sm leading-tight md:text-base"
-                      style={{
-                        ...keywordUnifiedTextStyle,
-                        zIndex: visualLayerZIndex("keyword"),
-                      }}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        setSelectedEventId(liveKeywordEvent.id || null);
-                        setSelectedEditorContext("keyword");
-                      }}
-                    >
-                      {liveKeywordEvent.text}
-                    </div>
-              )}
+                const resolvedColor = liveHookEvent.color || eventStyle.color || "#ffffff";
+                const resolvedWeight = liveHookEvent.font_weight || eventStyle.fontWeight || 700;
+                const resolvedStyle = liveHookEvent.font_style || "normal";
+                const resolvedDecoration = liveHookEvent.text_decoration || "none";
+                const resolvedTransform =
+                  liveHookEvent.text_case === "uppercase"
+                    ? "uppercase"
+                    : liveHookEvent.text_case === "lowercase"
+                    ? "lowercase"
+                    : liveHookEvent.text_case === "titlecase"
+                    ? "capitalize"
+                    : eventStyle.textTransform || "none";
+                const resolvedLetterSpacing =
+                  liveHookEvent.letter_spacing !== undefined ? `${liveHookEvent.letter_spacing}px` : undefined;
+                const resolvedLineHeight =
+                  liveHookEvent.line_height !== undefined ? liveHookEvent.line_height : 1.15;
+                const resolvedAlign = (liveHookEvent.text_align || "center") as CSSProperties["textAlign"];
+                const resolvedOpacity = liveHookEvent.opacity !== undefined ? liveHookEvent.opacity : 1;
+                const resolvedFontSize = liveHookEvent.font_size
+                  ? `${liveHookEvent.font_size}px`
+                  : hookResponsiveFontSize;
+                const resolvedStroke =
+                  liveHookEvent.stroke_enabled !== undefined
+                    ? liveHookEvent.stroke_enabled
+                      ? `${liveHookEvent.stroke_width || 2}px ${liveHookEvent.stroke_color || "#000000"}`
+                      : undefined
+                    : eventStyle.WebkitTextStroke;
+                const resolvedBackground =
+                  liveHookEvent.background_enabled !== undefined
+                    ? liveHookEvent.background_enabled
+                      ? `${liveHookEvent.background_color || "#000000"}${Math.round(
+                          (liveHookEvent.background_opacity ?? 0.8) * 255,
+                        )
+                          .toString(16)
+                          .padStart(2, "0")}`
+                      : "transparent"
+                    : eventStyle.backgroundColor;
+                const resolvedRadius =
+                  liveHookEvent.background_radius !== undefined
+                    ? `${liveHookEvent.background_radius}px`
+                    : undefined;
+                const resolvedShadow =
+                  liveHookEvent.shadow_enabled !== undefined
+                    ? liveHookEvent.shadow_enabled
+                      ? `0 2px ${liveHookEvent.shadow_blur || 4}px ${
+                          liveHookEvent.shadow_color || "rgba(0,0,0,0.85)"
+                        }`
+                      : undefined
+                    : eventStyle.textShadow ||
+                      activeHookTemplate.textShadow ||
+                      "0 2px 4px rgba(0,0,0,0.85)";
 
-              {captionOverlayText && (
-                <div
-                  className={`pointer-events-auto absolute left-[8%] right-[8%] cursor-pointer text-center leading-tight ${captionPositionClass(
-                    captionStyle.position,
-                  )} ${captionSizeClass(
-                    captionStyle.fontSize,
-                    captionStyle.preset,
-                    captionPreviewWordCount,
-                  )} ${captionWeightClass(
-                    captionStyle.fontWeight,
-                  )}`}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    setSelectedCaptionId(currentCaptionCue?.id || null);
-                    setSelectedEditorContext("caption");
-                  }}
-                  style={{
-                    zIndex: visualLayerZIndex("caption"),
-                    color: captionUnifiedTextStyle.color || captionStyle.textColor,
-                    fontFamily: captionUnifiedTextStyle.fontFamily,
-                    fontWeight: captionUnifiedTextStyle.fontWeight,
-                    textTransform: captionUnifiedTextStyle.textTransform,
-                    textShadow:
-                      captionUnifiedTextStyle.textShadow || captionTextShadow(captionStyle),
-                    WebkitTextStroke: captionUnifiedTextStyle.WebkitTextStroke,
-                    paintOrder: captionUnifiedTextStyle.paintOrder,
-                  }}
-                >
-                  <span
-                    className={`inline-block max-w-full rounded-md px-3 py-1.5 ${
-                      captionStyle.backgroundEnabled ? "" : "bg-transparent"
-                    }`}
+                return (
+                  <div
+                    data-hook-duplicate-suppressed={
+                      hookPreviewState.hookPreviewDuplicateSuppressed
+                    }
+                    data-hook-render-source={hookPreviewState.hookPreviewRenderSource}
+                    className={`pointer-events-auto absolute select-none rounded-lg text-center ${
+                      activeHookTemplate.paddingClass || "px-2 py-1"
+                    } ${activeHookTemplate.containerClass || "text-white"}`}
                     style={{
-                      backgroundColor: captionStyle.backgroundEnabled
-                        ? captionUnifiedTextStyle.backgroundColor ||
-                          `rgba(0,0,0,${captionStyle.backgroundOpacity})`
-                        : captionUnifiedTextStyle.backgroundColor || "transparent",
+                      ...eventStyle,
+                      left: `${posX}%`,
+                      top: `${posY}%`,
+                      transform: `translate(-50%, -50%) scale(${scale})`,
+                      width: "86%",
+                      maxWidth: "88%",
+                      fontSize: resolvedFontSize,
+                      zIndex: visualLayerZIndex("hook"),
+                      color: resolvedColor,
+                      fontWeight: resolvedWeight,
+                      fontStyle: resolvedStyle,
+                      textDecoration: resolvedDecoration,
+                      textTransform: resolvedTransform,
+                      letterSpacing: resolvedLetterSpacing,
+                      lineHeight: resolvedLineHeight,
+                      textAlign: resolvedAlign,
+                      opacity: resolvedOpacity,
+                      WebkitTextStroke: resolvedStroke,
+                      paintOrder: resolvedStroke ? "stroke fill" : undefined,
+                      backgroundColor: resolvedBackground,
+                      borderRadius: resolvedRadius,
+                      textShadow: resolvedShadow,
+                      fontFamily: eventFont,
+                      whiteSpace: "normal",
+                      overflowWrap: "break-word",
+                      wordBreak: "break-word",
                     }}
                   >
-                    <span className="block break-words">
-                      {captionStyle.displayMode === "karaoke" ? (
-                        karaokeWords.map((word, index) => (
-                          <span
-                            key={`${word}-${index}`}
+                    {/* Bounding Box Frame (Drag Borders + Resize Handles) */}
+                    {isSelected && (
+                      <div className="pointer-events-none absolute -inset-2 rounded border-2 border-cyan-400 shadow-[0_0_0_1px_rgba(0,0,0,0.5)]">
+                        {/* 4 Border Drag Strips */}
+                        <div
+                          className="pointer-events-auto absolute -top-2 inset-x-2 h-3.5 cursor-move"
+                          title="Geser posisi teks"
+                          onPointerDown={(e) =>
+                            startCanvasDrag(e, "hook", liveHookEvent.id || "hook-event", posX, posY, scale)
+                          }
+                          onPointerMove={handleCanvasManipulationMove}
+                          onPointerUp={handleCanvasManipulationUp}
+                        />
+                        <div
+                          className="pointer-events-auto absolute -bottom-2 inset-x-2 h-3.5 cursor-move"
+                          title="Geser posisi teks"
+                          onPointerDown={(e) =>
+                            startCanvasDrag(e, "hook", liveHookEvent.id || "hook-event", posX, posY, scale)
+                          }
+                          onPointerMove={handleCanvasManipulationMove}
+                          onPointerUp={handleCanvasManipulationUp}
+                        />
+                        <div
+                          className="pointer-events-auto absolute -left-2 inset-y-2 w-3.5 cursor-move"
+                          title="Geser posisi teks"
+                          onPointerDown={(e) =>
+                            startCanvasDrag(e, "hook", liveHookEvent.id || "hook-event", posX, posY, scale)
+                          }
+                          onPointerMove={handleCanvasManipulationMove}
+                          onPointerUp={handleCanvasManipulationUp}
+                        />
+                        <div
+                          className="pointer-events-auto absolute -right-2 inset-y-2 w-3.5 cursor-move"
+                          title="Geser posisi teks"
+                          onPointerDown={(e) =>
+                            startCanvasDrag(e, "hook", liveHookEvent.id || "hook-event", posX, posY, scale)
+                          }
+                          onPointerMove={handleCanvasManipulationMove}
+                          onPointerUp={handleCanvasManipulationUp}
+                        />
+
+                        {/* 4 Corner Resize Handles */}
+                        <div
+                          aria-label="Resize Top Left"
+                          className="pointer-events-auto absolute -left-1.5 -top-1.5 size-3.5 rounded-full border-2 border-cyan-400 bg-white shadow-md cursor-nwse-resize hover:scale-125 transition-transform"
+                          onPointerDown={(e) =>
+                            startCanvasResize(e, "tl", "hook", liveHookEvent.id || "hook-event", posX, posY, scale)
+                          }
+                        />
+                        <div
+                          aria-label="Resize Top Right"
+                          className="pointer-events-auto absolute -right-1.5 -top-1.5 size-3.5 rounded-full border-2 border-cyan-400 bg-white shadow-md cursor-nesw-resize hover:scale-125 transition-transform"
+                          onPointerDown={(e) =>
+                            startCanvasResize(e, "tr", "hook", liveHookEvent.id || "hook-event", posX, posY, scale)
+                          }
+                        />
+                        <div
+                          aria-label="Resize Bottom Left"
+                          className="pointer-events-auto absolute -left-1.5 -bottom-1.5 size-3.5 rounded-full border-2 border-cyan-400 bg-white shadow-md cursor-nesw-resize hover:scale-125 transition-transform"
+                          onPointerDown={(e) =>
+                            startCanvasResize(e, "bl", "hook", liveHookEvent.id || "hook-event", posX, posY, scale)
+                          }
+                        />
+                        <div
+                          aria-label="Resize Bottom Right"
+                          className="pointer-events-auto absolute -right-1.5 -bottom-1.5 size-3.5 rounded-full border-2 border-cyan-400 bg-white shadow-md cursor-nwse-resize hover:scale-125 transition-transform"
+                          onPointerDown={(e) =>
+                            startCanvasResize(e, "br", "hook", liveHookEvent.id || "hook-event", posX, posY, scale)
+                          }
+                        />
+                      </div>
+                    )}
+
+                    {activeHookTemplate.badge && (
+                      <span
+                        className={`block font-black uppercase ${
+                          activeHookTemplate.badgeClass || "mb-0.5 text-[8px] tracking-wider opacity-90"
+                        }`}
+                      >
+                        {activeHookTemplate.badge}
+                      </span>
+                    )}
+
+                    {isSelected ? (
+                      <WysiwygInlineTextEditor
+                        value={currentText}
+                        placeholder="Ketik teks di sini..."
+                        className={`block ${activeHookTemplate.textClass || "font-bold"}`}
+                        style={{
+                          whiteSpace: "normal",
+                          overflowWrap: "break-word",
+                          wordBreak: "break-word",
+                          lineHeight: 1.15,
+                        }}
+                        onChange={(nextText) => {
+                          if (liveHookEvent.id) {
+                            replaceEvent(liveHookEvent.id, { text: nextText });
+                          }
+                          setStyle("hook_text", nextText);
+                        }}
+                      />
+                    ) : (
+                      <span
+                        className={`block line-clamp-2 cursor-text ${activeHookTemplate.textClass || "font-bold"}`}
+                        style={{
+                          whiteSpace: "normal",
+                          overflowWrap: "break-word",
+                          wordBreak: "break-word",
+                          lineHeight: 1.15,
+                        }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSelectedEventId(liveHookEvent.id || null);
+                          setSelectedEditorContext("hook");
+                          setTextInspectorTab("text");
+                        }}
+                      >
+                        {currentText}
+                      </span>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {liveStickerEvent?.text && liveStickerEvent.visible !== false && (() => {
+                const defaultStickerPosY =
+                  liveStickerEvent.position === "top_left" || liveStickerEvent.position === "top_right"
+                    ? 16
+                    : liveStickerEvent.position === "bottom_left" || liveStickerEvent.position === "bottom_right"
+                    ? 76
+                    : 45;
+                const defaultStickerPosX =
+                  liveStickerEvent.position === "top_left" || liveStickerEvent.position === "bottom_left"
+                    ? 20
+                    : liveStickerEvent.position === "top_right" || liveStickerEvent.position === "bottom_right"
+                    ? 80
+                    : 50;
+                const posX = liveStickerEvent.position_x_percent ?? defaultStickerPosX;
+                const posY = liveStickerEvent.position_y_percent ?? defaultStickerPosY;
+                const scale = liveStickerEvent.scale ?? 1.0;
+                const isSelected = selectedEventId === liveStickerEvent.id;
+
+                return (
+                  <div
+                    className="pointer-events-auto absolute flex items-center justify-center cursor-move select-none"
+                    style={{
+                      left: `${posX}%`,
+                      top: `${posY}%`,
+                      transform: `translate(-50%, -50%) scale(${scale})`,
+                      fontSize:
+                        liveStickerEvent.size === "large"
+                          ? "clamp(42px, 8vh, 60px)"
+                          : liveStickerEvent.size === "small"
+                          ? "clamp(22px, 4vh, 28px)"
+                          : "clamp(32px, 6vh, 42px)",
+                      zIndex: 35,
+                      filter: "drop-shadow(0 4px 12px rgba(0,0,0,0.75))",
+                    }}
+                    onPointerDown={(event) =>
+                      startCanvasDrag(
+                        event,
+                        "sticker",
+                        liveStickerEvent.id || "sticker-event",
+                        posX,
+                        posY,
+                        scale,
+                      )
+                    }
+                    onPointerMove={handleCanvasManipulationMove}
+                    onPointerUp={handleCanvasManipulationUp}
+                    title="Geser posisi atau tarik sudut untuk memperbesar"
+                  >
+                    {isSelected && (
+                      <div className="pointer-events-none absolute -inset-2 rounded border-2 border-cyan-400 shadow-[0_0_0_1px_rgba(0,0,0,0.5)]">
+                        <div
+                          aria-label="Resize Top Left"
+                          className="pointer-events-auto absolute -left-1.5 -top-1.5 size-3.5 rounded-full border-2 border-cyan-400 bg-white shadow-md cursor-nwse-resize hover:scale-125 transition-transform"
+                          onPointerDown={(e) =>
+                            startCanvasResize(e, "tl", "sticker", liveStickerEvent.id || "sticker-event", posX, posY, scale)
+                          }
+                        />
+                        <div
+                          aria-label="Resize Top Right"
+                          className="pointer-events-auto absolute -right-1.5 -top-1.5 size-3.5 rounded-full border-2 border-cyan-400 bg-white shadow-md cursor-nesw-resize hover:scale-125 transition-transform"
+                          onPointerDown={(e) =>
+                            startCanvasResize(e, "tr", "sticker", liveStickerEvent.id || "sticker-event", posX, posY, scale)
+                          }
+                        />
+                        <div
+                          aria-label="Resize Bottom Left"
+                          className="pointer-events-auto absolute -left-1.5 -bottom-1.5 size-3.5 rounded-full border-2 border-cyan-400 bg-white shadow-md cursor-nesw-resize hover:scale-125 transition-transform"
+                          onPointerDown={(e) =>
+                            startCanvasResize(e, "bl", "sticker", liveStickerEvent.id || "sticker-event", posX, posY, scale)
+                          }
+                        />
+                        <div
+                          aria-label="Resize Bottom Right"
+                          className="pointer-events-auto absolute -right-1.5 -bottom-1.5 size-3.5 rounded-full border-2 border-cyan-400 bg-white shadow-md cursor-nwse-resize hover:scale-125 transition-transform"
+                          onPointerDown={(e) =>
+                            startCanvasResize(e, "br", "sticker", liveStickerEvent.id || "sticker-event", posX, posY, scale)
+                          }
+                        />
+                      </div>
+                    )}
+                    {liveStickerEvent.text.startsWith("🔥 HOT") ||
+                    liveStickerEvent.text.startsWith("✨ NEW") ||
+                    liveStickerEvent.text.startsWith("⚡ VIRAL") ||
+                    liveStickerEvent.text.startsWith("👑 TOP") ||
+                    liveStickerEvent.text.startsWith("💎 PRO") ? (
+                      <span className="rounded-xl bg-gradient-to-r from-amber-500 via-rose-500 to-pink-500 px-3.5 py-1.5 text-xs font-black text-white shadow-xl shadow-amber-950/60 uppercase tracking-wider border border-white/20">
+                        {liveStickerEvent.text}
+                      </span>
+                    ) : (
+                      <span className="leading-none select-none">{liveStickerEvent.text}</span>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {styleConfig.keyword_popup_enabled &&
+                liveKeywordEvent &&
+                !liveKeywordEvent.reason?.toLowerCase().includes("sticker") &&
+                liveKeywordEvent.visible !== false && (() => {
+                  const posX = liveKeywordEvent.position_x_percent ?? 50;
+                  const posY = liveKeywordEvent.position_y_percent ?? 74;
+                  const scale = liveKeywordEvent.scale ?? 1.0;
+                  const isSelected = selectedEventId === liveKeywordEvent.id;
+                  const currentText = liveKeywordEvent.text || "";
+
+                  return (
+                    <div
+                      className="pointer-events-auto absolute select-none rounded-lg px-3 py-1 text-center shadow-lg"
+                      style={{
+                        ...resolveTextOverlayStyle(
+                          normalizeTextStylePreset(
+                            liveKeywordEvent.preset || styleConfig.keyword_text_style_preset || "yellow_viral",
+                          ),
+                        ),
+                        left: `${posX}%`,
+                        top: `${posY}%`,
+                        transform: `translate(-50%, -50%) scale(${scale})`,
+                        width: "auto",
+                        maxWidth: "75%",
+                        fontSize: "clamp(10px, 2.4vh, 13px)",
+                        lineHeight: 1.2,
+                        whiteSpace: "normal",
+                        overflowWrap: "break-word",
+                        wordBreak: "break-word",
+                        zIndex: visualLayerZIndex("keyword"),
+                      }}
+                    >
+                      {isSelected && (
+                        <div className="pointer-events-none absolute -inset-2 rounded border-2 border-cyan-400 shadow-[0_0_0_1px_rgba(0,0,0,0.5)]">
+                          {/* 4 Border Drag Strips */}
+                          <div
+                            className="pointer-events-auto absolute -top-2 inset-x-2 h-3.5 cursor-move"
+                            title="Geser posisi keyword"
+                            onPointerDown={(e) =>
+                              startCanvasDrag(e, "keyword", liveKeywordEvent.id || "keyword-event", posX, posY, scale)
+                            }
+                            onPointerMove={handleCanvasManipulationMove}
+                            onPointerUp={handleCanvasManipulationUp}
+                          />
+                          <div
+                            className="pointer-events-auto absolute -bottom-2 inset-x-2 h-3.5 cursor-move"
+                            title="Geser posisi keyword"
+                            onPointerDown={(e) =>
+                              startCanvasDrag(e, "keyword", liveKeywordEvent.id || "keyword-event", posX, posY, scale)
+                            }
+                            onPointerMove={handleCanvasManipulationMove}
+                            onPointerUp={handleCanvasManipulationUp}
+                          />
+                          <div
+                            className="pointer-events-auto absolute -left-2 inset-y-2 w-3.5 cursor-move"
+                            title="Geser posisi keyword"
+                            onPointerDown={(e) =>
+                              startCanvasDrag(e, "keyword", liveKeywordEvent.id || "keyword-event", posX, posY, scale)
+                            }
+                            onPointerMove={handleCanvasManipulationMove}
+                            onPointerUp={handleCanvasManipulationUp}
+                          />
+                          <div
+                            className="pointer-events-auto absolute -right-2 inset-y-2 w-3.5 cursor-move"
+                            title="Geser posisi keyword"
+                            onPointerDown={(e) =>
+                              startCanvasDrag(e, "keyword", liveKeywordEvent.id || "keyword-event", posX, posY, scale)
+                            }
+                            onPointerMove={handleCanvasManipulationMove}
+                            onPointerUp={handleCanvasManipulationUp}
+                          />
+
+                          {/* 4 Corner Resize Handles */}
+                          <div
+                            aria-label="Resize Top Left"
+                            className="pointer-events-auto absolute -left-1.5 -top-1.5 size-3.5 rounded-full border-2 border-cyan-400 bg-white shadow-md cursor-nwse-resize hover:scale-125 transition-transform"
+                            onPointerDown={(e) =>
+                              startCanvasResize(e, "tl", "keyword", liveKeywordEvent.id || "keyword-event", posX, posY, scale)
+                            }
+                          />
+                          <div
+                            aria-label="Resize Top Right"
+                            className="pointer-events-auto absolute -right-1.5 -top-1.5 size-3.5 rounded-full border-2 border-cyan-400 bg-white shadow-md cursor-nesw-resize hover:scale-125 transition-transform"
+                            onPointerDown={(e) =>
+                              startCanvasResize(e, "tr", "keyword", liveKeywordEvent.id || "keyword-event", posX, posY, scale)
+                            }
+                          />
+                          <div
+                            aria-label="Resize Bottom Left"
+                            className="pointer-events-auto absolute -left-1.5 -bottom-1.5 size-3.5 rounded-full border-2 border-cyan-400 bg-white shadow-md cursor-nesw-resize hover:scale-125 transition-transform"
+                            onPointerDown={(e) =>
+                              startCanvasResize(e, "bl", "keyword", liveKeywordEvent.id || "keyword-event", posX, posY, scale)
+                            }
+                          />
+                          <div
+                            aria-label="Resize Bottom Right"
+                            className="pointer-events-auto absolute -right-1.5 -bottom-1.5 size-3.5 rounded-full border-2 border-cyan-400 bg-white shadow-md cursor-nwse-resize hover:scale-125 transition-transform"
+                            onPointerDown={(e) =>
+                              startCanvasResize(e, "br", "keyword", liveKeywordEvent.id || "keyword-event", posX, posY, scale)
+                            }
+                          />
+                        </div>
+                      )}
+
+                      {isSelected ? (
+                        <WysiwygInlineTextEditor
+                          value={currentText}
+                          placeholder="KEYWORD"
+                          className="font-black block"
+                          style={{
+                            lineHeight: 1.2,
+                            whiteSpace: "normal",
+                            overflowWrap: "break-word",
+                            wordBreak: "break-word",
+                          }}
+                          onChange={(nextText) => {
+                            const text = sanitizeKeywordInput(nextText);
+                            if (liveKeywordEvent.id) {
+                              replaceEvent(liveKeywordEvent.id, { text });
+                            }
+                          }}
+                        />
+                      ) : (
+                        <span
+                          className="font-black cursor-text"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setSelectedEventId(liveKeywordEvent.id || null);
+                            setSelectedEditorContext("keyword");
+                            setTextInspectorTab("text");
+                          }}
+                        >
+                          {currentText}
+                        </span>
+                      )}
+                    </div>
+                  );
+                })()}
+
+              {subtitlePreview && currentCaptionCue && currentCaptionCue.visible !== false && (() => {
+                const defaultCaptionPosY =
+                  resolvedCurrentCaptionStyle.position === "top"
+                    ? 12
+                    : resolvedCurrentCaptionStyle.position === "middle"
+                    ? 50
+                    : 84;
+                const posX = resolvedCurrentCaptionStyle.position_x_percent ?? 50;
+                const posY = resolvedCurrentCaptionStyle.position_y_percent ?? defaultCaptionPosY;
+                const isSelected =
+                  Boolean(currentCaptionCue?.id && selectedCaptionId === currentCaptionCue.id) ||
+                  selectedEditorContext === "caption";
+                const currentText = currentCaptionCue?.text || subtitlePreview || "";
+
+                return (
+                  <div
+                    className="pointer-events-auto absolute select-none leading-tight"
+                    style={{
+                      zIndex: visualLayerZIndex("caption"),
+                      left: `${posX}%`,
+                      top: `${posY}%`,
+                      transform: "translate(-50%, -50%)",
+                      width: `${resolvedCurrentCaptionStyle.max_width_percent}%`,
+                      maxWidth: "92%",
+                      textAlign: resolvedCurrentCaptionStyle.align,
+                      fontFamily: resolvedCurrentCaptionStyle.font_family,
+                      fontSize: `clamp(${Math.round(resolvedCurrentCaptionStyle.font_size * 0.7)}px, ${resolvedCurrentCaptionStyle.font_size * 0.12}vh, ${resolvedCurrentCaptionStyle.font_size}px)`,
+                      fontWeight: resolvedCurrentCaptionStyle.font_weight,
+                      fontStyle: resolvedCurrentCaptionStyle.italic ? "italic" : "normal",
+                      textDecoration: resolvedCurrentCaptionStyle.underline ? "underline" : "none",
+                      lineHeight: resolvedCurrentCaptionStyle.line_height,
+                      letterSpacing: `${resolvedCurrentCaptionStyle.letter_spacing}px`,
+                      wordSpacing: `${resolvedCurrentCaptionStyle.word_spacing}px`,
+                      WebkitTextStroke: resolvedCurrentCaptionStyle.stroke_enabled
+                        ? `${resolvedCurrentCaptionStyle.stroke_width}px ${resolvedCurrentCaptionStyle.stroke_color}`
+                        : undefined,
+                      paintOrder: "stroke fill",
+                      textShadow: resolvedCurrentCaptionStyle.shadow_enabled
+                        ? `${resolvedCurrentCaptionStyle.shadow_x}px ${resolvedCurrentCaptionStyle.shadow_y}px ${resolvedCurrentCaptionStyle.shadow_blur}px ${resolvedCurrentCaptionStyle.shadow_color}`
+                        : undefined,
+                    }}
+                  >
+                    {isSelected && (
+                      <div className="pointer-events-none absolute -inset-2 rounded border-2 border-cyan-400 shadow-[0_0_0_1px_rgba(0,0,0,0.5)]">
+                        {/* 4 Border Drag Strips */}
+                        <div
+                          className="pointer-events-auto absolute -top-2 inset-x-2 h-3.5 cursor-move"
+                          title="Geser posisi caption"
+                          onPointerDown={(e) =>
+                            startCanvasDrag(
+                              e,
+                              "caption",
+                              currentCaptionCue?.id || "current-caption",
+                              posX,
+                              posY,
+                              1.0,
+                              resolvedCurrentCaptionStyle.font_size,
+                            )
+                          }
+                          onPointerMove={handleCanvasManipulationMove}
+                          onPointerUp={handleCanvasManipulationUp}
+                        />
+                        <div
+                          className="pointer-events-auto absolute -bottom-2 inset-x-2 h-3.5 cursor-move"
+                          title="Geser posisi caption"
+                          onPointerDown={(e) =>
+                            startCanvasDrag(
+                              e,
+                              "caption",
+                              currentCaptionCue?.id || "current-caption",
+                              posX,
+                              posY,
+                              1.0,
+                              resolvedCurrentCaptionStyle.font_size,
+                            )
+                          }
+                          onPointerMove={handleCanvasManipulationMove}
+                          onPointerUp={handleCanvasManipulationUp}
+                        />
+                        <div
+                          className="pointer-events-auto absolute -left-2 inset-y-2 w-3.5 cursor-move"
+                          title="Geser posisi caption"
+                          onPointerDown={(e) =>
+                            startCanvasDrag(
+                              e,
+                              "caption",
+                              currentCaptionCue?.id || "current-caption",
+                              posX,
+                              posY,
+                              1.0,
+                              resolvedCurrentCaptionStyle.font_size,
+                            )
+                          }
+                          onPointerMove={handleCanvasManipulationMove}
+                          onPointerUp={handleCanvasManipulationUp}
+                        />
+                        <div
+                          className="pointer-events-auto absolute -right-2 inset-y-2 w-3.5 cursor-move"
+                          title="Geser posisi caption"
+                          onPointerDown={(e) =>
+                            startCanvasDrag(
+                              e,
+                              "caption",
+                              currentCaptionCue?.id || "current-caption",
+                              posX,
+                              posY,
+                              1.0,
+                              resolvedCurrentCaptionStyle.font_size,
+                            )
+                          }
+                          onPointerMove={handleCanvasManipulationMove}
+                          onPointerUp={handleCanvasManipulationUp}
+                        />
+
+                        {/* 4 Corner Resize Handles */}
+                        <div
+                          aria-label="Resize Top Left"
+                          className="pointer-events-auto absolute -left-1.5 -top-1.5 size-3.5 rounded-full border-2 border-cyan-400 bg-white shadow-md cursor-nwse-resize hover:scale-125 transition-transform"
+                          onPointerDown={(e) =>
+                            startCanvasResize(
+                              e,
+                              "tl",
+                              "caption",
+                              currentCaptionCue?.id || "current-caption",
+                              posX,
+                              posY,
+                              1.0,
+                              resolvedCurrentCaptionStyle.font_size,
+                            )
+                          }
+                        />
+                        <div
+                          aria-label="Resize Top Right"
+                          className="pointer-events-auto absolute -right-1.5 -top-1.5 size-3.5 rounded-full border-2 border-cyan-400 bg-white shadow-md cursor-nesw-resize hover:scale-125 transition-transform"
+                          onPointerDown={(e) =>
+                            startCanvasResize(
+                              e,
+                              "tr",
+                              "caption",
+                              currentCaptionCue?.id || "current-caption",
+                              posX,
+                              posY,
+                              1.0,
+                              resolvedCurrentCaptionStyle.font_size,
+                            )
+                          }
+                        />
+                        <div
+                          aria-label="Resize Bottom Left"
+                          className="pointer-events-auto absolute -left-1.5 -bottom-1.5 size-3.5 rounded-full border-2 border-cyan-400 bg-white shadow-md cursor-nesw-resize hover:scale-125 transition-transform"
+                          onPointerDown={(e) =>
+                            startCanvasResize(
+                              e,
+                              "bl",
+                              "caption",
+                              currentCaptionCue?.id || "current-caption",
+                              posX,
+                              posY,
+                              1.0,
+                              resolvedCurrentCaptionStyle.font_size,
+                            )
+                          }
+                        />
+                        <div
+                          aria-label="Resize Bottom Right"
+                          className="pointer-events-auto absolute -right-1.5 -bottom-1.5 size-3.5 rounded-full border-2 border-cyan-400 bg-white shadow-md cursor-nwse-resize hover:scale-125 transition-transform"
+                          onPointerDown={(e) =>
+                            startCanvasResize(
+                              e,
+                              "br",
+                              "caption",
+                              currentCaptionCue?.id || "current-caption",
+                              posX,
+                              posY,
+                              1.0,
+                              resolvedCurrentCaptionStyle.font_size,
+                            )
+                          }
+                        />
+                      </div>
+                    )}
+
+                    <span
+                      className="inline-block max-w-full"
+                      style={{
+                        backgroundColor: resolvedCurrentCaptionStyle.background_enabled
+                          ? resolvedCurrentCaptionStyle.background_color.startsWith("#")
+                            ? `${resolvedCurrentCaptionStyle.background_color}${Math.round(resolvedCurrentCaptionStyle.background_opacity * 255).toString(16).padStart(2, "0")}`
+                            : resolvedCurrentCaptionStyle.background_color
+                          : "transparent",
+                        borderRadius: `${resolvedCurrentCaptionStyle.background_radius}px`,
+                        padding: resolvedCurrentCaptionStyle.background_enabled ? "4px 12px" : "0px",
+                      }}
+                    >
+                      <span className="block break-words">
+                        {isSelected ? (
+                          <WysiwygInlineTextEditor
+                            value={currentText}
+                            placeholder="Ketik caption..."
+                            className="block break-words"
                             style={{
-                              color:
-                                index === karaokeActiveIndex
-                                  ? captionStyle.highlightColor
-                                  : captionUnifiedTextStyle.color || captionStyle.textColor,
+                              color: resolvedCurrentCaptionStyle.color,
+                              textAlign: resolvedCurrentCaptionStyle.align,
+                            }}
+                            onChange={(nextText) => {
+                              updateSelectedCaptionText(nextText);
+                            }}
+                            onBlur={finishSelectedCaptionTextEdit}
+                          />
+                        ) : resolvedCurrentCaptionStyle.karaoke_enabled ? (
+                          <span
+                            className="cursor-text"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedCaptionId(currentCaptionCue?.id || null);
+                              setSelectedEditorContext("caption");
+                              setCaptionInspectorTab("text");
                             }}
                           >
-                            {word}
-                            {index < karaokeWords.length - 1 ? " " : ""}
+                            {karaokeWords.map((word, index) => {
+                              const isActive = index === karaokeActiveIndex;
+                              if (resolvedCurrentCaptionStyle.karaoke_mode === "highlight") {
+                                return (
+                                  <span
+                                    key={`${word}-${index}`}
+                                    style={{
+                                      backgroundColor: isActive
+                                        ? resolvedCurrentCaptionStyle.karaoke_highlight_color
+                                        : "transparent",
+                                      color: isActive
+                                        ? resolvedCurrentCaptionStyle.karaoke_active_color
+                                        : resolvedCurrentCaptionStyle.karaoke_inactive_color ||
+                                          resolvedCurrentCaptionStyle.color,
+                                      borderRadius: "4px",
+                                      padding: isActive ? "2px 4px" : "0px",
+                                      transition: "all 0.1s ease",
+                                    }}
+                                  >
+                                    {word}
+                                    {index < karaokeWords.length - 1 ? " " : ""}
+                                  </span>
+                                );
+                              }
+                              return (
+                                <span
+                                  key={`${word}-${index}`}
+                                  style={{
+                                    color: isActive
+                                      ? resolvedCurrentCaptionStyle.karaoke_active_color
+                                      : resolvedCurrentCaptionStyle.karaoke_inactive_color ||
+                                        resolvedCurrentCaptionStyle.color,
+                                    transition: "color 0.1s ease",
+                                  }}
+                                >
+                                  {word}
+                                  {index < karaokeWords.length - 1 ? " " : ""}
+                                </span>
+                              );
+                            })}
                           </span>
-                        ))
-                      ) : (
-                        captionOverlayText
-                      )}
+                        ) : (
+                          <span
+                            className="cursor-text"
+                            style={{ color: resolvedCurrentCaptionStyle.color }}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedCaptionId(currentCaptionCue?.id || null);
+                              setSelectedEditorContext("caption");
+                              setCaptionInspectorTab("text");
+                            }}
+                          >
+                            {subtitlePreview}
+                          </span>
+                        )}
+                      </span>
                     </span>
-                  </span>
-                </div>
-              )}
+                  </div>
+                );
+              })()}
             </div>
           </div>
           {activeRender?.status === "failed" && (
@@ -5541,647 +10398,4071 @@ return (
           )}
         </main>
 
-        {/* RIGHT INSPECTOR PANEL (Contextual Properties & Inspector Only) */}
-        <aside className="editor-sidepanel editor-inspector min-h-0 space-y-3 bg-[#17191c] p-3.5 xl:h-full xl:overflow-y-auto">
-          <section className="sticky top-0 z-10 rounded-xl border border-zinc-700 bg-[#22252a]/95 p-3 shadow-lg backdrop-blur">
-            <div className="flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <p className="text-[10px] font-black uppercase tracking-wide text-cyan-400">
-                  Inspector
-                </p>
-                <h2 className="mt-0.5 truncate text-sm font-black text-slate-950">
-                  {!anyTrackSelected && !selectedEvent && !selectedCaption
-                    ? "Project Details"
-                    : selectedEditorContext === "video"
-                    ? "Video Inspector"
-                    : selectedEditorContext === "audio"
-                    ? "Audio Inspector"
-                    : selectedEditorContext === "caption"
-                    ? "Caption Inspector"
-                    : selectedEditorContext === "hook"
-                    ? "Hook Text Inspector"
-                    : selectedEditorContext === "keyword"
-                    ? "Keyword Inspector"
-                    : selectedEditorContext === "effect"
-                    ? "Effect Inspector"
-                    : "Item Inspector"}
-                </h2>
-              </div>
-              <span
-                className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-black ${editorSaveStatusClass}`}
-                title={editorSaveStatusTitle}
-              >
-                {editorSaveStatusLabel}
-              </span>
-            </div>
-          </section>
+        {/* RIGHT INSPECTOR PANEL (Context-Aware Item Properties) */}
+        <aside className="editor-sidepanel editor-inspector min-h-0 bg-[#17191c] xl:h-full xl:overflow-y-auto p-3.5 space-y-4">
+          {/* 1. PROJECT DETAILS (No Item Selected) */}
+          {/* 1. PROJECT DETAILS (No Item Selected) */}
+          {inspectorContext === "details" && (() => {
+            const videoFileName =
+              (manualEditorMode && latestImportedVideo?.name) ||
+              context.data?.candidate_title ||
+              draft?.original_hook ||
+              "source_clip.mp4";
 
-          {/* 1. If NO item selected, show Project Details (CapCut-style) */}
-          {!anyTrackSelected && !selectedEvent && !selectedCaption && (
-            <ToolSection title="Detail Project">
-              <div className="space-y-2.5 text-xs">
-                <div>
-                  <label htmlFor="inspector_project_name" className="text-zinc-400">Nama Project</label>
-                  <input
-                    id="inspector_project_name"
-                    value={uploadTitle}
-                    onChange={(event) => {
-                      setEditorDirty(true);
-                      setUploadTitle(event.target.value);
-                    }}
-                  />
-                </div>
+            const textEventsCount = effectTimeline.filter(
+              (e) =>
+                e.type === "hook_text" ||
+                e.type === "keyword_popup" ||
+                e.type === "text" ||
+                e.type === "title" ||
+                e.type === "quote" ||
+                e.type === "lower_third" ||
+                e.type === "watermark",
+            ).length;
+            const totalTextItems = editableCaptionCues.length + textEventsCount;
 
-                <div className="rounded-xl border border-zinc-700/80 bg-[#22252a] p-3 space-y-2 text-zinc-300">
-                  <div className="flex justify-between py-1 border-b border-zinc-800">
-                    <span className="text-zinc-500">Mode Editor</span>
-                    <span className={`font-bold ${manualEditorMode ? "text-emerald-400" : "text-cyan-400"}`}>
-                      {manualEditorMode ? "Editor Manual" : "Mode AutoClip AI"}
-                    </span>
-                  </div>
-                  <div className="flex justify-between py-1 border-b border-zinc-800">
-                    <span className="text-zinc-500">Aspect Ratio</span>
-                    <span className="font-bold text-cyan-300">9:16 (Portrait)</span>
-                  </div>
-                  <div className="flex justify-between py-1 border-b border-zinc-800">
-                    <span className="text-zinc-500">Resolusi</span>
-                    <span className="font-bold">1080x1920 (Adapted)</span>
-                  </div>
-                  <div className="flex justify-between py-1 border-b border-zinc-800">
-                    <span className="text-zinc-500">Frame Rate</span>
-                    <span className="font-bold">30.00 fps</span>
-                  </div>
-                  <div className="flex justify-between py-1 border-b border-zinc-800">
-                    <span className="text-zinc-500">Warna Ruang</span>
-                    <span className="font-bold">Rec. 709 SDR</span>
-                  </div>
-                  <div className="flex justify-between py-1 border-b border-zinc-800">
-                    <span className="text-zinc-500">Media Project</span>
-                    <span className="font-bold">{(editorMediaQuery.data?.length || 0) + (manualEditorMode ? 0 : 1)} File</span>
-                  </div>
-                  <div className="flex justify-between py-1">
-                    <span className="text-zinc-500">Durasi Timeline</span>
-                    <span className="font-bold text-cyan-300">{formatTimeLabel(clipDuration)}</span>
-                  </div>
-                </div>
+            const overlayEventsCount = effectTimeline.filter(
+              (e) =>
+                e.type === "sticker" ||
+                e.type === "emoji" ||
+                e.type === "shape" ||
+                e.type === "arrow" ||
+                e.type === "badge" ||
+                e.type === "punch_zoom" ||
+                e.type === "pattern_interrupt" ||
+                e.type === "transition",
+            ).length;
 
-                <div className="pt-2">
+            const totalAudioTracks =
+              (audioExtracted && !audioTrackDeleted ? 1 : 0) + additionalAudioTracks.length;
+
+            return (
+              <>
+                <ToolSection title="Project & Clip">
+                  <div className="space-y-2">
+                    <div>
+                      <label htmlFor="inspector_project_title">Nama Project</label>
+                      <input
+                        id="inspector_project_title"
+                        onChange={(event) => setUploadTitle(event.target.value)}
+                        placeholder="Beri nama project..."
+                        value={uploadTitle}
+                      />
+                    </div>
+                  </div>
+                </ToolSection>
+
+                <ToolSection title="Informasi Video">
+                  <div className="space-y-1.5 rounded-lg border border-zinc-800/80 bg-[#1a1c20] p-2.5 text-xs">
+                    <div className="flex items-center justify-between py-0.5 border-b border-zinc-800/60">
+                      <span className="text-zinc-400">Source Video</span>
+                      <span
+                        className="max-w-[140px] truncate font-medium text-zinc-200"
+                        title={videoFileName}
+                      >
+                        {videoFileName}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between py-0.5 border-b border-zinc-800/60">
+                      <span className="text-zinc-400">Mode Editor</span>
+                      <span className="font-semibold text-zinc-200">
+                        {manualEditorMode ? "Editor Manual" : "AutoClip AI"}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between py-0.5 border-b border-zinc-800/60">
+                      <span className="text-zinc-400">Durasi Video</span>
+                      <span className="font-mono font-bold text-cyan-300">
+                        {formatTimeLabel(clipDuration)}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between py-0.5 border-b border-zinc-800/60">
+                      <span className="text-zinc-400">Rasio & Resolusi</span>
+                      <span className="font-mono text-zinc-200">
+                        1080 × 1920 (9:16)
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between py-0.5">
+                      <span className="text-zinc-400">Status Media</span>
+                      <span className="rounded bg-cyan-950/80 px-1.5 py-0.5 text-[9px] font-semibold text-cyan-300">
+                        {manualEditorMode && videoSequence.length > 1
+                          ? `Sequence (${videoSequence.length} file)`
+                          : "Klip Utama"}
+                      </span>
+                    </div>
+                  </div>
+                </ToolSection>
+
+                <ToolSection title="Ringkasan Layer & Item">
+                  <div className="space-y-1.5 rounded-lg border border-zinc-800/80 bg-[#1a1c20] p-2.5 text-xs">
+                    <div className="flex items-center justify-between py-0.5 border-b border-zinc-800/60">
+                      <span className="flex items-center gap-1.5 text-zinc-400">
+                        <span className="text-cyan-400 font-bold">T</span>
+                        <span>Item TEXT</span>
+                      </span>
+                      <span className="font-mono font-semibold text-zinc-200">
+                        {totalTextItems} item {editableCaptionCues.length > 0 ? `(${editableCaptionCues.length} cue)` : ""}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between py-0.5 border-b border-zinc-800/60">
+                      <span className="flex items-center gap-1.5 text-zinc-400">
+                        <span className="text-amber-400">★</span>
+                        <span>Item OVERLAY</span>
+                      </span>
+                      <span className="font-mono font-semibold text-zinc-200">
+                        {overlayEventsCount} item
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between py-0.5 border-b border-zinc-800/60">
+                      <span className="flex items-center gap-1.5 text-zinc-400">
+                        <span className="text-emerald-400">🎵</span>
+                        <span>Item AUDIO</span>
+                      </span>
+                      <span className="font-mono font-semibold text-zinc-200">
+                        {totalAudioTracks > 0
+                          ? `${totalAudioTracks} track ${audioExtracted ? "(Terpisah)" : ""}`
+                          : audioExtracted
+                          ? "1 track (Terpisah)"
+                          : "Audio bawaan video"}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between py-0.5">
+                      <span className="flex items-center gap-1.5 text-zinc-400">
+                        <span>💬</span>
+                        <span>Status Caption</span>
+                      </span>
+                      <span className={`font-semibold ${editableCaptionCues.length > 0 ? "text-cyan-300" : "text-zinc-500"}`}>
+                        {editableCaptionCues.length > 0 ? `Aktif (${editableCaptionCues.length} cue)` : "Belum dibuat"}
+                      </span>
+                    </div>
+                  </div>
+                </ToolSection>
+
+                <ToolSection title="Status Editor">
+                  <div className="space-y-1.5 rounded-lg border border-zinc-800/80 bg-[#1a1c20] p-2.5 text-xs">
+                    <div className="flex items-center justify-between py-0.5 border-b border-zinc-800/60">
+                      <span className="text-zinc-400">Autosave</span>
+                      <span className="flex items-center gap-1 text-[11px] font-medium text-emerald-400">
+                        <span className="inline-block size-1.5 rounded-full bg-emerald-400" />
+                        <span>Tersimpan otomatis</span>
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between py-0.5">
+                      <span className="text-zinc-400">Preview Engine</span>
+                      <span className="font-mono text-[11px] text-zinc-300">
+                        {renderedPreviewUrl ? "Preview HD" : "Realtime Canvas"}
+                      </span>
+                    </div>
+                  </div>
+                </ToolSection>
+
+                <ToolSection title="Export">
                   <button
-                    className="btn w-full py-2 text-xs"
+                    className="btn-primary w-full py-2 text-xs font-bold shadow-lg shadow-cyan-950/40"
                     disabled={!canStartExport}
                     onClick={openExportModal}
                     type="button"
                   >
                     Export Video
                   </button>
-                </div>
-              </div>
-            </ToolSection>
-          )}
+                </ToolSection>
+              </>
+            );
+          })()}
 
-          {/* 2. Contextual Video Inspector */}
-          {selectedEditorContext === "video" && (
-            <>
-              <ToolSection title="Frame & Position">
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    className="btn-secondary px-3 py-1.5 text-xs"
-                    onClick={() => setVideoFraming({ x: videoFraming.x - 5 })}
-                    type="button"
-                  >
-                    Geser Kiri
-                  </button>
-                  <button
-                    className="btn-secondary px-3 py-1.5 text-xs"
-                    onClick={() => setVideoFraming({ x: videoFraming.x + 5 })}
-                    type="button"
-                  >
-                    Geser Kanan
-                  </button>
-                  <button
-                    className="btn-secondary px-3 py-1.5 text-xs"
-                    onClick={() => setVideoFraming({ y: videoFraming.y - 5 })}
-                    type="button"
-                  >
-                    Geser Atas
-                  </button>
-                  <button
-                    className="btn-secondary px-3 py-1.5 text-xs"
-                    onClick={() => setVideoFraming({ y: videoFraming.y + 5 })}
-                    type="button"
-                  >
-                    Geser Bawah
-                  </button>
-                </div>
+                {/* 2. VIDEO INSPECTOR */}
+                {inspectorContext === "video" && (
+                  <>
+                    {/* TAB 1: VIDEO (Framing, Transform, Canvas, Blend, Timing, Actions) */}
+                    {videoInspectorTab === "video" && (
+                      <>
+                        {/* 1. FRAMING */}
+                          <ToolSection title="Framing & Canvas">
+                            <div className="grid grid-cols-2 gap-2">
+                              {videoFramingPresets.map((opt) => {
+                                const isActive = isFramingPresetActive(opt.id);
+                                return (
+                                  <button
+                                    key={opt.id}
+                                    type="button"
+                                    onClick={() => {
+                                      applyVideoFramingPreset(opt.id);
+                                    }}
+                                    className={`group relative flex flex-col items-center gap-1.5 rounded-xl border p-2 text-left transition-all ${
+                                      isActive
+                                        ? "border-cyan-400 bg-cyan-500/10 shadow-[0_0_0_1px_rgba(34,211,238,0.3)] ring-1 ring-cyan-400/40"
+                                        : "border-zinc-700/80 bg-[#1e2024] hover:border-zinc-500 hover:bg-[#25282e]"
+                                    }`}
+                                    title={`${opt.label}: ${opt.desc}`}
+                                  >
+                                    {/* 9:16 Visual Preview Thumbnail */}
+                                    <div className="flex w-full items-center justify-center">
+                                      <FramingThumbnailPreview presetId={opt.id} />
+                                    </div>
 
-                <div className="mt-3 grid gap-3 rounded-xl bg-zinc-850 p-3">
-                  <label className="text-xs font-bold text-zinc-300" htmlFor="video_framing_x">
-                    <span className="flex items-center justify-between gap-2">
-                      <span>Posisi X</span>
-                      <span>{videoFraming.x.toFixed(0)}</span>
-                    </span>
-                    <input
-                      className="mt-1 w-full accent-cyan-400"
-                      id="video_framing_x"
-                      max={40}
-                      min={-40}
-                      onChange={(event) => setVideoFraming({ x: Number(event.target.value) })}
-                      step={1}
-                      type="range"
-                      value={videoFraming.x}
-                    />
-                  </label>
-                  <label className="text-xs font-bold text-zinc-300" htmlFor="video_framing_y">
-                    <span className="flex items-center justify-between gap-2">
-                      <span>Posisi Y</span>
-                      <span>{videoFraming.y.toFixed(0)}</span>
-                    </span>
-                    <input
-                      className="mt-1 w-full accent-cyan-400"
-                      id="video_framing_y"
-                      max={40}
-                      min={-40}
-                      onChange={(event) => setVideoFraming({ y: Number(event.target.value) })}
-                      step={1}
-                      type="range"
-                      value={videoFraming.y}
-                    />
-                  </label>
-                  <label className="text-xs font-bold text-zinc-300" htmlFor="video_framing_scale">
-                    <span className="flex items-center justify-between gap-2">
-                      <span>Zoom / Scale</span>
-                      <span>{videoFraming.scale.toFixed(2)}x</span>
-                    </span>
-                    <input
-                      className="mt-1 w-full accent-cyan-400"
-                      id="video_framing_scale"
-                      max={2}
-                      min={1}
-                      onChange={(event) => setVideoFraming({ scale: Number(event.target.value) })}
-                      step={0.05}
-                      type="range"
-                      value={videoFraming.scale}
-                    />
-                  </label>
-                </div>
+                                    {/* Text Info */}
+                                    <div className="w-full min-w-0 text-center">
+                                      <div className="flex items-center justify-center gap-1">
+                                        <p className="truncate text-xs font-black text-zinc-100 group-hover:text-white">
+                                          {opt.label}
+                                        </p>
+                                        {isActive && (
+                                          <span className="size-1.5 rounded-full bg-cyan-400 shrink-0" />
+                                        )}
+                                      </div>
+                                      <p className="truncate text-[10px] font-semibold text-zinc-400 group-hover:text-zinc-300">
+                                        {opt.subLabel}
+                                      </p>
+                                    </div>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </ToolSection>
 
-                <button
-                  className="btn-secondary mt-3 w-full px-3 py-2 text-xs"
-                  onClick={() => setVideoFraming(defaultVideoFraming)}
-                  type="button"
-                >
-                  Reset Framing
-                </button>
-              </ToolSection>
+                          {/* 3. TRANSFORM */}
+                          <ToolSection title="Transform">
+                            <div className="space-y-3">
+                              <div>
+                                <div className="mb-1 flex items-center justify-between text-[11px]">
+                                  <span className="font-medium text-zinc-400">Scale / Zoom</span>
+                                  <span className="font-mono font-bold text-cyan-300">
+                                    {videoFraming.scale.toFixed(2)}x
+                                  </span>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  <input
+                                    type="range"
+                                    min="0.5"
+                                    max="2.5"
+                                    step="0.05"
+                                    className="h-1.5 w-full accent-cyan-400"
+                                    value={videoFraming.scale}
+                                    onChange={(e) =>
+                                      setVideoFraming({ scale: Number(e.target.value) })
+                                    }
+                                  />
+                                  <input
+                                    type="number"
+                                    min="0.5"
+                                    max="2.5"
+                                    step="0.05"
+                                    className="h-7 w-14 text-center font-mono text-xs"
+                                    value={videoFraming.scale}
+                                    onChange={(e) =>
+                                      setVideoFraming({ scale: Number(e.target.value) })
+                                    }
+                                  />
+                                </div>
+                              </div>
 
-              <ToolSection title="Template Video">
-                <select
-                  className="w-full"
-                  id="context_video_template"
-                  onChange={(event) => selectPreset(event.target.value as RenderPreset)}
-                  value={preset}
-                >
-                  {presetOptions.map(({ value, label }) => (
-                    <option key={value} value={value}>{label}</option>
-                  ))}
-                </select>
-              </ToolSection>
-            </>
-          )}
+                              <div className="grid grid-cols-2 gap-2">
+                                <div>
+                                  <div className="mb-1 flex items-center justify-between text-[11px]">
+                                    <span className="font-medium text-zinc-400">Posisi X</span>
+                                    <span className="font-mono font-bold text-zinc-300">
+                                      {videoFraming.x.toFixed(0)}
+                                    </span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min="-40"
+                                    max="40"
+                                    step="1"
+                                    className="h-1.5 w-full accent-cyan-400"
+                                    value={videoFraming.x}
+                                    onChange={(e) =>
+                                      setVideoFraming({ x: Number(e.target.value) })
+                                    }
+                                  />
+                                </div>
+                                <div>
+                                  <div className="mb-1 flex items-center justify-between text-[11px]">
+                                    <span className="font-medium text-zinc-400">Posisi Y</span>
+                                    <span className="font-mono font-bold text-zinc-300">
+                                      {videoFraming.y.toFixed(0)}
+                                    </span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min="-40"
+                                    max="40"
+                                    step="1"
+                                    className="h-1.5 w-full accent-cyan-400"
+                                    value={videoFraming.y}
+                                    onChange={(e) =>
+                                      setVideoFraming({ y: Number(e.target.value) })
+                                    }
+                                  />
+                                </div>
+                              </div>
 
-          {/* 3. Contextual Audio Inspector (Volume, Mute, Fade In/Out, Ekstrak/Gabung) */}
-          {selectedEditorContext === "audio" && (
-            <ToolSection title="Audio Settings">
-              <div className="grid grid-cols-2 gap-2">
-                <button
-                  className="btn-secondary px-2 py-1.5 text-xs font-bold text-cyan-300"
-                  onClick={extractAudioTrack}
-                  type="button"
-                >
-                  Ekstrak Audio
-                </button>
-                {audioExtracted && (
-                  <button
-                    className="btn-secondary px-2 py-1.5 text-xs font-bold text-amber-300"
-                    onClick={mergeAudioIntoVideoTrack}
-                    type="button"
-                  >
-                    Gabungkan Audio
-                  </button>
+                              <div>
+                                <div className="mb-1 flex items-center justify-between text-[11px]">
+                                  <span className="font-medium text-zinc-400">Rotasi</span>
+                                  <span className="font-mono font-bold text-zinc-300">
+                                    {(videoFraming.rotation || 0).toFixed(0)}°
+                                  </span>
+                                </div>
+                                <input
+                                  type="range"
+                                  min="-180"
+                                  max="180"
+                                  step="1"
+                                  className="h-1.5 w-full accent-cyan-400"
+                                  value={videoFraming.rotation || 0}
+                                  onChange={(e) =>
+                                    setVideoFraming({ rotation: Number(e.target.value) })
+                                  }
+                                />
+                              </div>
+
+                              {/* Quick Nudge + Reset Buttons */}
+                              <div className="flex items-center gap-1.5 border-t border-zinc-800/80 pt-1">
+                                <div className="grid flex-1 grid-cols-4 gap-1">
+                                  <button
+                                    type="button"
+                                    className="btn-secondary h-7 px-1 text-center text-xs font-bold"
+                                    onClick={() =>
+                                      setVideoFraming({ x: Math.max(-40, videoFraming.x - 2) })
+                                    }
+                                    title="Geser Kiri"
+                                  >
+                                    ←
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="btn-secondary h-7 px-1 text-center text-xs font-bold"
+                                    onClick={() =>
+                                      setVideoFraming({ y: Math.max(-40, videoFraming.y - 2) })
+                                    }
+                                    title="Geser Atas"
+                                  >
+                                    ↑
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="btn-secondary h-7 px-1 text-center text-xs font-bold"
+                                    onClick={() =>
+                                      setVideoFraming({ y: Math.min(40, videoFraming.y + 2) })
+                                    }
+                                    title="Geser Bawah"
+                                  >
+                                    ↓
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="btn-secondary h-7 px-1 text-center text-xs font-bold"
+                                    onClick={() =>
+                                      setVideoFraming({ x: Math.min(40, videoFraming.x + 2) })
+                                    }
+                                    title="Geser Kanan"
+                                  >
+                                    →
+                                  </button>
+                                </div>
+                                <button
+                                  type="button"
+                                  className="btn-secondary h-7 px-2.5 text-xs font-semibold text-zinc-300"
+                                  onClick={() =>
+                                    setVideoFraming({ x: 0, y: 0, scale: 1, rotation: 0 })
+                                  }
+                                  title="Reset Transform"
+                                >
+                                  Reset
+                                </button>
+                              </div>
+                            </div>
+                          </ToolSection>
+
+                          {/* 4. FLIP */}
+                          <CollapsibleToolSection
+                            title="Flip & Cermin"
+                            badge={
+                              videoFraming.flip_h || videoFraming.flip_v ? "Aktif" : undefined
+                            }
+                          >
+                            <div className="grid grid-cols-2 gap-2">
+                              <button
+                                type="button"
+                                className={`flex h-8 items-center justify-center gap-1.5 rounded-lg border text-xs font-semibold transition ${
+                                  videoFraming.flip_h
+                                    ? "border-cyan-500/40 bg-cyan-500/20 text-cyan-300"
+                                    : "border-zinc-700/80 bg-[#1e2024] text-zinc-300 hover:text-white"
+                                }`}
+                                onClick={() =>
+                                  setVideoFraming({ flip_h: !videoFraming.flip_h })
+                                }
+                              >
+                                <span>⇄</span>
+                                <span>Horizontal</span>
+                              </button>
+                              <button
+                                type="button"
+                                className={`flex h-8 items-center justify-center gap-1.5 rounded-lg border text-xs font-semibold transition ${
+                                  videoFraming.flip_v
+                                    ? "border-cyan-500/40 bg-cyan-500/20 text-cyan-300"
+                                    : "border-zinc-700/80 bg-[#1e2024] text-zinc-300 hover:text-white"
+                                }`}
+                                onClick={() =>
+                                  setVideoFraming({ flip_v: !videoFraming.flip_v })
+                                }
+                              >
+                                <span>⇅</span>
+                                <span>Vertical</span>
+                              </button>
+                            </div>
+                          </CollapsibleToolSection>
+
+                          {/* 5. CANVAS / BACKGROUND */}
+                          <CollapsibleToolSection
+                            title="Canvas & Background"
+                            badge={
+                              videoFraming.blur_background || preset === "blurred_background"
+                                ? "Blur"
+                                : undefined
+                            }
+                          >
+                            <div className="space-y-3">
+                              <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-200">
+                                <input
+                                  type="checkbox"
+                                  className="rounded border-zinc-700 bg-zinc-800 text-cyan-500 focus:ring-cyan-400"
+                                  checked={
+                                    videoFraming.blur_background ||
+                                    preset === "blurred_background"
+                                  }
+                                  onChange={(e) => {
+                                    const isChecked = e.target.checked;
+                                    if (isChecked) {
+                                      applyVideoFramingPreset("blurred_background");
+                                    } else {
+                                      applyVideoFramingPreset("fit_background");
+                                    }
+                                  }}
+                                />
+                                <span className="font-medium">Aktifkan Background Blur</span>
+                              </label>
+
+                              {(videoFraming.blur_background ||
+                                preset === "blurred_background") && (
+                                <div>
+                                  <div className="mb-1 flex items-center justify-between text-[11px]">
+                                    <span className="font-medium text-zinc-400">
+                                      Intensitas Blur
+                                    </span>
+                                    <span className="font-mono font-bold text-cyan-300">
+                                      {videoFraming.blur_strength || 20}px
+                                    </span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min="5"
+                                    max="50"
+                                    step="1"
+                                    className="h-1.5 w-full accent-cyan-400"
+                                    value={videoFraming.blur_strength || 20}
+                                    onChange={(e) =>
+                                      setVideoFraming({
+                                        blur_strength: Number(e.target.value),
+                                      })
+                                    }
+                                  />
+                                </div>
+                              )}
+
+                              <div>
+                                <label className="mb-1 block text-[11px] font-medium text-zinc-400">
+                                  Warna Latar (Canvas Color)
+                                </label>
+                                <div className="flex items-center gap-2">
+                                  <div className="relative size-8 shrink-0 cursor-pointer overflow-hidden rounded-lg border border-zinc-700 shadow-sm">
+                                    <input
+                                      type="color"
+                                      aria-label="Pilih warna latar canvas"
+                                      className="absolute -inset-2 size-12 cursor-pointer opacity-0"
+                                      value={videoFraming.background_color || "#000000"}
+                                      onChange={(e) =>
+                                        setVideoFraming({ background_color: e.target.value })
+                                      }
+                                    />
+                                    <div
+                                      className="size-full rounded-lg"
+                                      style={{
+                                        backgroundColor:
+                                          videoFraming.background_color || "#000000",
+                                      }}
+                                    />
+                                  </div>
+                                  <input
+                                    type="text"
+                                    aria-label="Hex warna latar canvas"
+                                    className="h-8 flex-1 font-mono text-xs uppercase"
+                                    value={videoFraming.background_color || "#000000"}
+                                    onChange={(e) =>
+                                      setVideoFraming({ background_color: e.target.value })
+                                    }
+                                  />
+                                </div>
+                              </div>
+                            </div>
+                          </CollapsibleToolSection>
+
+                          {/* 6. BLEND */}
+                          <CollapsibleToolSection
+                            title="Blend & Opacity"
+                            badge={`${Math.round((videoFraming.opacity ?? 1) * 100)}%`}
+                          >
+                            <div>
+                              <div className="mb-1 flex items-center justify-between text-[11px]">
+                                <span className="font-medium text-zinc-400">Opacity Video</span>
+                                <span className="font-mono font-bold text-cyan-300">
+                                  {Math.round((videoFraming.opacity ?? 1) * 100)}%
+                                </span>
+                              </div>
+                              <input
+                                type="range"
+                                min="0"
+                                max="1"
+                                step="0.05"
+                                className="h-1.5 w-full accent-cyan-400"
+                                value={videoFraming.opacity ?? 1}
+                                onChange={(e) =>
+                                  setVideoFraming({ opacity: Number(e.target.value) })
+                                }
+                              />
+                            </div>
+                          </CollapsibleToolSection>
+
+                          {/* 7. TIMING */}
+                          <CollapsibleToolSection title="Timing Video">
+                            <div className="grid grid-cols-3 gap-1.5 text-[11px]">
+                              <div className="rounded-lg bg-zinc-800/80 p-2">
+                                <span className="block text-[10px] text-zinc-500">Mulai</span>
+                                <p className="font-mono font-bold text-zinc-100">0.00s</p>
+                              </div>
+                              <div className="rounded-lg bg-zinc-800/80 p-2">
+                                <span className="block text-[10px] text-zinc-500">Selesai</span>
+                                <p className="font-mono font-bold text-zinc-100">
+                                  {clipDuration.toFixed(2)}s
+                                </p>
+                              </div>
+                              <div className="rounded-lg bg-zinc-800/80 p-2">
+                                <span className="block text-[10px] text-zinc-500">Durasi</span>
+                                <p className="font-mono font-bold text-cyan-300">
+                                  {clipDuration.toFixed(2)}s
+                                </p>
+                              </div>
+                            </div>
+                          </CollapsibleToolSection>
+
+                          {/* 8. ACTIONS */}
+                          <ToolSection title="Actions">
+                            <div className="space-y-2">
+                              <button
+                                type="button"
+                                className="btn-secondary w-full py-1.5 text-xs font-bold text-zinc-300 hover:text-white"
+                                onClick={() => {
+                                  setVideoAdjustments(defaultVideoAdjustments);
+                                  setVideoSpeed(1.0);
+                                  applyVideoFramingPreset("blurred_background");
+                                  setMessage("Pengaturan video direset ke default.");
+                                }}
+                              >
+                                Reset Video Style
+                              </button>
+                              <button
+                                type="button"
+                                className={`w-full rounded-lg border py-1.5 text-xs font-bold transition ${
+                                  videoTrackDeleted
+                                    ? "border-emerald-800/60 bg-emerald-900/40 text-emerald-300 hover:bg-emerald-900/60"
+                                    : "border-red-800/60 bg-red-900/40 text-red-300 hover:bg-red-900/60"
+                                }`}
+                                onClick={() => {
+                                  setStyle("video_track_deleted", !videoTrackDeleted);
+                                  setMessage(
+                                    videoTrackDeleted
+                                      ? "Video track dipulihkan."
+                                      : "Video track dinonaktifkan.",
+                                  );
+                                }}
+                              >
+                                {videoTrackDeleted ? "Pulihkan Video Track" : "Hapus Video Track"}
+                              </button>
+                            </div>
+                          </ToolSection>
+                        </>
+                      )}
+
+                    {/* TAB 2: ADJUST */}
+                    {videoInspectorTab === "adjust" && (
+                      <>
+                        <ToolSection title="Koreksi Warna Dasar">
+                          <div className="space-y-3">
+                            {/* Brightness */}
+                            <div>
+                              <div className="mb-1 flex items-center justify-between text-[11px]">
+                                <span className="font-medium text-zinc-300">Brightness</span>
+                                <div className="flex items-center gap-1.5">
+                                  <span className="font-mono font-bold text-cyan-300">
+                                    {videoAdjustments.brightness > 0
+                                      ? `+${videoAdjustments.brightness}`
+                                      : videoAdjustments.brightness}
+                                    %
+                                  </span>
+                                  {videoAdjustments.brightness !== 0 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => setVideoAdjustments({ brightness: 0 })}
+                                      className="text-[10px] text-zinc-500 hover:text-zinc-300"
+                                      title="Reset Brightness"
+                                    >
+                                      ↺
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                              <input
+                                type="range"
+                                min="-100"
+                                max="100"
+                                step="1"
+                                className="h-1.5 w-full accent-cyan-400"
+                                value={videoAdjustments.brightness}
+                                onChange={(e) =>
+                                  setVideoAdjustments({ brightness: Number(e.target.value) })
+                                }
+                              />
+                            </div>
+
+                            {/* Contrast */}
+                            <div>
+                              <div className="mb-1 flex items-center justify-between text-[11px]">
+                                <span className="font-medium text-zinc-300">Contrast</span>
+                                <div className="flex items-center gap-1.5">
+                                  <span className="font-mono font-bold text-cyan-300">
+                                    {videoAdjustments.contrast > 0
+                                      ? `+${videoAdjustments.contrast}`
+                                      : videoAdjustments.contrast}
+                                    %
+                                  </span>
+                                  {videoAdjustments.contrast !== 0 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => setVideoAdjustments({ contrast: 0 })}
+                                      className="text-[10px] text-zinc-500 hover:text-zinc-300"
+                                      title="Reset Contrast"
+                                    >
+                                      ↺
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                              <input
+                                type="range"
+                                min="-100"
+                                max="100"
+                                step="1"
+                                className="h-1.5 w-full accent-cyan-400"
+                                value={videoAdjustments.contrast}
+                                onChange={(e) =>
+                                  setVideoAdjustments({ contrast: Number(e.target.value) })
+                                }
+                              />
+                            </div>
+
+                            {/* Saturation */}
+                            <div>
+                              <div className="mb-1 flex items-center justify-between text-[11px]">
+                                <span className="font-medium text-zinc-300">Saturation</span>
+                                <div className="flex items-center gap-1.5">
+                                  <span className="font-mono font-bold text-cyan-300">
+                                    {videoAdjustments.saturation > 0
+                                      ? `+${videoAdjustments.saturation}`
+                                      : videoAdjustments.saturation}
+                                    %
+                                  </span>
+                                  {videoAdjustments.saturation !== 0 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => setVideoAdjustments({ saturation: 0 })}
+                                      className="text-[10px] text-zinc-500 hover:text-zinc-300"
+                                      title="Reset Saturation"
+                                    >
+                                      ↺
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                              <input
+                                type="range"
+                                min="-100"
+                                max="100"
+                                step="1"
+                                className="h-1.5 w-full accent-cyan-400"
+                                value={videoAdjustments.saturation}
+                                onChange={(e) =>
+                                  setVideoAdjustments({ saturation: Number(e.target.value) })
+                                }
+                              />
+                            </div>
+
+                            {/* Temperature */}
+                            <div>
+                              <div className="mb-1 flex items-center justify-between text-[11px]">
+                                <span className="font-medium text-zinc-300">Temperature</span>
+                                <div className="flex items-center gap-1.5">
+                                  <span className="font-mono font-bold text-cyan-300">
+                                    {videoAdjustments.temperature > 0
+                                      ? `+${videoAdjustments.temperature} (Warm)`
+                                      : videoAdjustments.temperature < 0
+                                      ? `${videoAdjustments.temperature} (Cool)`
+                                      : "0"}
+                                  </span>
+                                  {videoAdjustments.temperature !== 0 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => setVideoAdjustments({ temperature: 0 })}
+                                      className="text-[10px] text-zinc-500 hover:text-zinc-300"
+                                      title="Reset Temperature"
+                                    >
+                                      ↺
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                              <input
+                                type="range"
+                                min="-100"
+                                max="100"
+                                step="1"
+                                className="h-1.5 w-full accent-cyan-400"
+                                value={videoAdjustments.temperature}
+                                onChange={(e) =>
+                                  setVideoAdjustments({ temperature: Number(e.target.value) })
+                                }
+                              />
+                            </div>
+
+                            {/* Blur */}
+                            <div>
+                              <div className="mb-1 flex items-center justify-between text-[11px]">
+                                <span className="font-medium text-zinc-300">Blur</span>
+                                <div className="flex items-center gap-1.5">
+                                  <span className="font-mono font-bold text-cyan-300">
+                                    {videoAdjustments.blur}px
+                                  </span>
+                                  {videoAdjustments.blur !== 0 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => setVideoAdjustments({ blur: 0 })}
+                                      className="text-[10px] text-zinc-500 hover:text-zinc-300"
+                                      title="Reset Blur"
+                                    >
+                                      ↺
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                              <input
+                                type="range"
+                                min="0"
+                                max="20"
+                                step="0.5"
+                                className="h-1.5 w-full accent-cyan-400"
+                                value={videoAdjustments.blur}
+                                onChange={(e) =>
+                                  setVideoAdjustments({ blur: Number(e.target.value) })
+                                }
+                              />
+                            </div>
+
+                            {/* Vignette */}
+                            <div>
+                              <div className="mb-1 flex items-center justify-between text-[11px]">
+                                <span className="font-medium text-zinc-300">Vignette</span>
+                                <div className="flex items-center gap-1.5">
+                                  <span className="font-mono font-bold text-cyan-300">
+                                    {videoAdjustments.vignette}%
+                                  </span>
+                                  {videoAdjustments.vignette !== 0 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => setVideoAdjustments({ vignette: 0 })}
+                                      className="text-[10px] text-zinc-500 hover:text-zinc-300"
+                                      title="Reset Vignette"
+                                    >
+                                      ↺
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                              <input
+                                type="range"
+                                min="0"
+                                max="100"
+                                step="1"
+                                className="h-1.5 w-full accent-cyan-400"
+                                value={videoAdjustments.vignette}
+                                onChange={(e) =>
+                                  setVideoAdjustments({ vignette: Number(e.target.value) })
+                                }
+                              />
+                            </div>
+                          </div>
+                        </ToolSection>
+
+                        <ToolSection title="Actions">
+                          <button
+                            type="button"
+                            className="btn-secondary w-full py-1.5 text-xs font-bold text-zinc-300 hover:text-white"
+                            onClick={() => {
+                              setVideoAdjustments(defaultVideoAdjustments);
+                              setMessage("Koreksi warna video direset.");
+                            }}
+                          >
+                            Reset Semua Koreksi Warna
+                          </button>
+                        </ToolSection>
+                      </>
+                    )}
+
+                    {/* TAB 3: SPEED */}
+                    {videoInspectorTab === "speed" && (
+                      <>
+                        <ToolSection title="Kecepatan Putar (Playback Speed)">
+                          <div className="space-y-3">
+                            <div>
+                              <div className="mb-1 flex items-center justify-between text-[11px]">
+                                <span className="font-medium text-zinc-400">Kecepatan</span>
+                                <span className="font-mono font-bold text-cyan-300">
+                                  {videoSpeed.toFixed(2)}x{" "}
+                                  {videoSpeed === 1
+                                    ? "(Normal)"
+                                    : videoSpeed > 1
+                                    ? "(Cepat)"
+                                    : "(Lambat)"}
+                                </span>
+                              </div>
+                              <input
+                                type="range"
+                                min="0.25"
+                                max="4.0"
+                                step="0.05"
+                                className="h-1.5 w-full accent-cyan-400"
+                                value={videoSpeed}
+                                onChange={(e) => setVideoSpeed(Number(e.target.value))}
+                              />
+                            </div>
+
+                            {/* Quick Speed Preset Buttons */}
+                            <div>
+                              <span className="mb-1 block text-[10px] font-semibold uppercase text-zinc-400">
+                                Preset Kecepatan
+                              </span>
+                              <div className="grid grid-cols-4 gap-1">
+                                {[0.5, 1.0, 1.5, 2.0].map((spd) => (
+                                  <button
+                                    key={spd}
+                                    type="button"
+                                    className={`h-7 rounded text-xs font-semibold transition ${
+                                      videoSpeed === spd
+                                        ? "border border-cyan-500/40 bg-cyan-500/20 text-cyan-300 font-bold"
+                                        : "border border-zinc-700/80 bg-[#1e2024] text-zinc-400 hover:text-zinc-200"
+                                    }`}
+                                    onClick={() => setVideoSpeed(spd)}
+                                  >
+                                    {spd}x
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+
+                            {/* Duration Preview Card */}
+                            {(() => {
+                              const videoBaseDuration = videoSequence.reduce(
+                                (acc, s) => acc + Math.max(0, s.sourceEnd - s.sourceStart),
+                                0,
+                              ) || originalClipDuration;
+                              return (
+                                <div className="rounded-lg border border-zinc-800 bg-[#1a1c20] p-2.5 text-[11px]">
+                                  <div className="flex items-center justify-between text-zinc-400">
+                                    <span>Durasi Asli Track</span>
+                                    <span className="font-mono text-zinc-300">
+                                      {videoBaseDuration.toFixed(2)}s
+                                    </span>
+                                  </div>
+                                  <div className="mt-1 flex items-center justify-between border-t border-zinc-800/60 pt-1 text-zinc-400">
+                                    <span>Durasi Efektif ({videoSpeed.toFixed(2)}x)</span>
+                                    <span className="font-mono font-bold text-cyan-300">
+                                      {videoLayout.duration.toFixed(2)}s
+                                    </span>
+                                  </div>
+                                </div>
+                              );
+                            })()}
+                          </div>
+                        </ToolSection>
+
+                        <ToolSection title="Actions">
+                          <button
+                            type="button"
+                            className="btn-secondary w-full py-1.5 text-xs font-bold text-zinc-300 hover:text-white"
+                            onClick={() => {
+                              setVideoSpeed(1.0);
+                              setMessage("Kecepatan video dikembalikan ke 1.0x (Normal).");
+                            }}
+                          >
+                            Reset Speed (1.0x)
+                          </button>
+                        </ToolSection>
+                      </>
+                    )}
+
+                    {/* TAB 4: AUDIO */}
+                    {videoInspectorTab === "audio" && (
+                      <>
+                        {audioExtracted ? (
+                          <>
+                            <ToolSection title="Status Audio">
+                              <div className="rounded-lg border border-cyan-800/60 bg-cyan-950/30 p-3 text-xs">
+                                <div className="mb-1 flex items-center gap-1.5 font-bold text-cyan-300">
+                                  <span>ℹ️</span>
+                                  <span>Audio Sudah Dipisahkan</span>
+                                </div>
+                                <p className="text-[11px] leading-relaxed text-zinc-300">
+                                  Audio video sudah diekstrak ke track <strong>AUDIO</strong>. Atur volume, mute, fade, dan timing melalui <strong>Audio Inspector</strong> dengan memilih track Audio pada timeline.
+                                </p>
+                              </div>
+                            </ToolSection>
+
+                            <ToolSection title="Ekstrak & Gabungkan">
+                              <button
+                                className="btn-secondary w-full py-1.5 text-xs font-bold text-zinc-300 hover:text-white"
+                                onClick={mergeAudioIntoVideoTrack}
+                                type="button"
+                              >
+                                Gabungkan Audio ke Video
+                              </button>
+                            </ToolSection>
+                          </>
+                        ) : (
+                          <>
+                            <ToolSection title="Audio Bawaan Video">
+                              <div className="space-y-3">
+                                <div>
+                                  <div className="mb-1 flex items-center justify-between text-[11px]">
+                                    <span className="font-medium text-zinc-400">Volume Klip</span>
+                                    <span className="font-mono font-bold text-cyan-300">
+                                      {Math.round(audioSettings.volume * 100)}%
+                                    </span>
+                                  </div>
+                                  <input
+                                    className="h-1.5 w-full accent-cyan-400"
+                                    id="inspector_video_audio_volume"
+                                    max="2"
+                                    min="0"
+                                    step="0.05"
+                                    type="range"
+                                    value={audioSettings.volume}
+                                    onChange={(e) =>
+                                      setAudioSettings({ volume: Number(e.target.value) })
+                                    }
+                                  />
+                                </div>
+
+                                <label className="flex cursor-pointer items-center gap-2 pt-0.5 text-xs text-zinc-200">
+                                  <input
+                                    checked={audioSettings.muted}
+                                    className="rounded border-zinc-700 bg-zinc-800 text-cyan-500 focus:ring-cyan-400"
+                                    type="checkbox"
+                                    onChange={(e) =>
+                                      setAudioSettings({ muted: e.target.checked })
+                                    }
+                                  />
+                                  <span className="font-medium">Bisukan Suara Video (Mute)</span>
+                                </label>
+                              </div>
+                            </ToolSection>
+
+                            <CollapsibleToolSection
+                              title="Fade Audio"
+                              badge={
+                                audioSettings.fade_in || audioSettings.fade_out ? "Aktif" : undefined
+                              }
+                            >
+                              <div className="grid grid-cols-2 gap-3">
+                                <div>
+                                  <div className="mb-1 flex items-center justify-between text-[11px]">
+                                    <span className="font-medium text-zinc-400">Fade In</span>
+                                    <span className="font-mono font-bold text-zinc-300">
+                                      {(audioSettings.fade_in || 0).toFixed(1)}s
+                                    </span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min="0"
+                                    max="5"
+                                    step="0.1"
+                                    className="h-1.5 w-full accent-cyan-400"
+                                    value={audioSettings.fade_in || 0}
+                                    onChange={(e) =>
+                                      setAudioSettings({ fade_in: Number(e.target.value) })
+                                    }
+                                  />
+                                </div>
+                                <div>
+                                  <div className="mb-1 flex items-center justify-between text-[11px]">
+                                    <span className="font-medium text-zinc-400">Fade Out</span>
+                                    <span className="font-mono font-bold text-zinc-300">
+                                      {(audioSettings.fade_out || 0).toFixed(1)}s
+                                    </span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min="0"
+                                    max="5"
+                                    step="0.1"
+                                    className="h-1.5 w-full accent-cyan-400"
+                                    value={audioSettings.fade_out || 0}
+                                    onChange={(e) =>
+                                      setAudioSettings({ fade_out: Number(e.target.value) })
+                                    }
+                                  />
+                                </div>
+                              </div>
+                            </CollapsibleToolSection>
+
+                            <ToolSection title="Ekstrak Track Audio">
+                              <button
+                                className="btn-secondary w-full py-1.5 text-xs font-bold text-zinc-300 hover:text-white"
+                                onClick={extractAudioTrack}
+                                type="button"
+                              >
+                                Ekstrak Audio ke Track Terpisah
+                              </button>
+                            </ToolSection>
+
+                            <ToolSection title="Actions">
+                              <button
+                                type="button"
+                                className="btn-secondary w-full py-1.5 text-xs font-bold text-zinc-300 hover:text-white"
+                                onClick={() => {
+                                  setAudioSettings({
+                                    volume: 1.0,
+                                    muted: false,
+                                    fade_in: 0,
+                                    fade_out: 0,
+                                  });
+                                  setMessage("Pengaturan audio video direset.");
+                                }}
+                              >
+                                Reset Audio
+                              </button>
+                            </ToolSection>
+                          </>
+                        )}
+                      </>
+                    )}
+                  </>
                 )}
-              </div>
 
-              <label className="flex items-center justify-between rounded-xl bg-zinc-850 p-3 text-xs font-bold">
-                <span>Mute Audio</span>
-                <input
-                  checked={audioSettings.muted}
-                  className="size-4 accent-cyan-400"
-                  onChange={(event) => setAudioSettings({ muted: event.target.checked })}
-                  type="checkbox"
-                />
-              </label>
+                {/* 3. AUDIO INSPECTOR */}
+                {inspectorContext === "audio" && (() => {
+                  const selectedTrack = selectedAdditionalAudioTrackId
+                    ? additionalAudioTracks.find((t) => t.id === selectedAdditionalAudioTrackId)
+                    : null;
+                  const isAdditional = Boolean(selectedTrack);
 
-              <div>
-                <div className="mb-2 flex items-center justify-between gap-3 text-xs">
-                  <label htmlFor="inspector_source_audio_volume">Volume</label>
-                  <strong className="text-cyan-300">{Math.round(audioSettings.volume * 100)}%</strong>
-                </div>
-                <input
-                  className="w-full accent-cyan-400"
-                  disabled={audioSettings.muted}
-                  id="inspector_source_audio_volume"
-                  max={2}
-                  min={0}
-                  onChange={(event) => setAudioSettings({ volume: Number(event.target.value) })}
-                  step={0.05}
-                  type="range"
-                  value={audioSettings.volume}
-                />
-              </div>
+                  const currentVolume = isAdditional
+                    ? selectedTrack?.volume ?? 1
+                    : audioSettings.volume;
+                  const currentMuted = isAdditional
+                    ? Boolean(selectedTrack?.muted)
+                    : audioSettings.muted;
+                  const currentFadeIn = isAdditional
+                    ? selectedTrack?.fade_in || 0
+                    : audioSettings.fade_in || 0;
+                  const currentFadeOut = isAdditional
+                    ? selectedTrack?.fade_out || 0
+                    : audioSettings.fade_out || 0;
+                  const currentSpeed = isAdditional
+                    ? selectedTrack?.speed || 1.0
+                    : audioSettings.speed || 1.0;
+                  const audioBaseDuration = audioSequence.reduce(
+                    (acc, s) => acc + Math.max(0, s.sourceEnd - s.sourceStart),
+                    0,
+                  ) || originalClipDuration;
+                  const currentBaseDuration = isAdditional
+                    ? (selectedTrack?.base_duration || Math.max(0.1, (selectedTrack?.end ?? 0) - (selectedTrack?.start ?? 0)))
+                    : audioBaseDuration;
+                  const currentEffectiveDuration = isAdditional
+                    ? (currentBaseDuration / currentSpeed)
+                    : audioLayout.duration;
 
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <label htmlFor="inspector_audio_fade_in">Fade In (s)</label>
-                  <input
-                    id="inspector_audio_fade_in"
-                    max={5}
-                    min={0}
-                    onChange={(event) => setAudioSettings({ fade_in: Number(event.target.value) })}
-                    step={0.1}
-                    type="number"
-                    value={audioSettings.fade_in}
-                  />
-                </div>
-                <div>
-                  <label htmlFor="inspector_audio_fade_out">Fade Out (s)</label>
-                  <input
-                    id="inspector_audio_fade_out"
-                    max={5}
-                    min={0}
-                    onChange={(event) => setAudioSettings({ fade_out: Number(event.target.value) })}
-                    step={0.1}
-                    type="number"
-                    value={audioSettings.fade_out}
-                  />
-                </div>
-              </div>
-              <button
-                className="btn-secondary w-full px-3 py-2 text-xs"
-                onClick={() => setAudioSettings(defaultAudioSettings)}
-                type="button"
-              >
-                Reset Audio
-              </button>
-            </ToolSection>
-          )}
-
-          {/* 4. Contextual Caption Inspector (Selected Cue Text & Detailed Typography) */}
-          {selectedEditorContext === "caption" && (
-            <>
-              <ToolSection title="Caption Cue Inspector">
-                {selectedCaption ? (
-                  <div className="space-y-3">
-                    <div>
-                      <label htmlFor="inspector_caption_text">Teks Caption</label>
-                      <textarea
-                        className="min-h-24 w-full"
-                        id="inspector_caption_text"
-                        onBlur={finishSelectedCaptionTextEdit}
-                        onChange={(event) => updateSelectedCaptionText(event.target.value)}
-                        value={selectedCaption.text || ""}
-                      />
-                    </div>
-                    <div className="grid grid-cols-2 gap-2 text-xs">
-                      <div className="rounded-lg bg-zinc-800 p-2">
-                        <span className="text-zinc-400">Mulai:</span>
-                        <p className="font-bold text-zinc-100">{formatTimePrecise(selectedCaption.start)}</p>
-                      </div>
-                      <div className="rounded-lg bg-zinc-800 p-2">
-                        <span className="text-zinc-400">Selesai:</span>
-                        <p className="font-bold text-zinc-100">{formatTimePrecise(selectedCaption.end)}</p>
-                      </div>
-                    </div>
-                    <div className="grid grid-cols-2 gap-2">
-                      <button
-                        className="btn-secondary px-3 py-1.5 text-xs font-bold"
-                        onClick={reflowSelectedCaption}
-                        type="button"
-                      >
-                        Rapikan Cue
-                      </button>
-                      <button
-                        className="rounded-lg bg-red-900/40 text-red-300 border border-red-800/60 px-3 py-1.5 text-xs font-bold hover:bg-red-900/60"
-                        onClick={deleteSelectedCaptionCue}
-                        type="button"
-                      >
-                        Hapus Cue
-                      </button>
-                    </div>
-                  </div>
-                ) : (
-                  <p className="rounded-xl bg-zinc-850 p-3 text-xs text-zinc-400">
-                    Pilih salah satu cue caption di timeline atau daftar sebelah kiri untuk mengedit teks.
-                  </p>
-                )}
-              </ToolSection>
-
-              <ToolSection title="Tipografi & Gaya Caption">
-                <div className="grid grid-cols-2 gap-2">
-                  <div>
-                    <label htmlFor="caption_font_size">Ukuran</label>
-                    <select
-                      id="caption_font_size"
-                      value={captionStyle.fontSize}
-                      onChange={(event) =>
-                        setCaptionStyle({
-                          fontSize: event.target.value as CaptionStyleConfig["fontSize"],
-                        })
-                      }
-                    >
-                      <option value="small">Small</option>
-                      <option value="medium">Medium</option>
-                      <option value="large">Large</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label htmlFor="caption_font_weight">Ketebalan</label>
-                    <select
-                      id="caption_font_weight"
-                      value={captionStyle.fontWeight}
-                      onChange={(event) =>
-                        setCaptionStyle({
-                          fontWeight: event.target.value as CaptionStyleConfig["fontWeight"],
-                        })
-                      }
-                    >
-                      <option value="normal">Normal</option>
-                      <option value="semibold">Semibold</option>
-                      <option value="bold">Bold</option>
-                    </select>
-                  </div>
-                </div>
-
-                <div className="mt-2 grid grid-cols-2 gap-2">
-                  <div>
-                    <label htmlFor="caption_position">Posisi</label>
-                    <select
-                      id="caption_position"
-                      value={captionStyle.position}
-                      onChange={(event) =>
-                        setCaptionStyle({
-                          position: event.target.value as CaptionStyleConfig["position"],
-                        })
-                      }
-                    >
-                      <option value="bottom">Bawah</option>
-                      <option value="center_lower">Bawah Tengah</option>
-                      <option value="center">Tengah</option>
-                      <option value="top">Atas</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label htmlFor="caption_text_color">Warna Teks</label>
-                    <input
-                      className="h-10 p-1 w-full rounded bg-zinc-800"
-                      id="caption_text_color"
-                      onChange={(event) => setCaptionStyle({ textColor: event.target.value })}
-                      type="color"
-                      value={captionStyle.textColor}
-                    />
-                  </div>
-                </div>
-
-                <div className="mt-2">
-                  <label htmlFor="caption_highlight_color">Warna Sorotan Karaoke</label>
-                  <input
-                    className="h-10 p-1 w-full rounded bg-zinc-800"
-                    id="caption_highlight_color"
-                    onChange={(event) => setCaptionStyle({ highlightColor: event.target.value })}
-                    type="color"
-                    value={captionStyle.highlightColor}
-                  />
-                </div>
-
-                <div className="mt-3 grid grid-cols-2 gap-2">
-                  <label className="flex items-center gap-2 rounded-lg bg-zinc-850 p-2 text-xs font-bold">
-                    <input
-                      checked={captionStyle.outlineEnabled}
-                      className="size-4 accent-cyan-400"
-                      onChange={(event) =>
-                        setCaptionStyle({ outlineEnabled: event.target.checked })
-                      }
-                      type="checkbox"
-                    />
-                    <span>Garis Luar</span>
-                  </label>
-                  <label className="flex items-center gap-2 rounded-lg bg-zinc-850 p-2 text-xs font-bold">
-                    <input
-                      checked={captionStyle.shadowEnabled}
-                      className="size-4 accent-cyan-400"
-                      onChange={(event) =>
-                        setCaptionStyle({ shadowEnabled: event.target.checked })
-                      }
-                      type="checkbox"
-                    />
-                    <span>Bayangan</span>
-                  </label>
-                </div>
-
-                <label className="mt-2 flex items-center justify-between rounded-lg bg-zinc-850 p-2 text-xs font-bold">
-                  <span>Latar Belakang</span>
-                  <input
-                    checked={captionStyle.backgroundEnabled}
-                    className="size-4 accent-cyan-400"
-                    onChange={(event) =>
-                      setCaptionStyle({ backgroundEnabled: event.target.checked })
+                  const updateVolume = (val: number) => {
+                    const clean = Math.max(0, Math.min(2, val));
+                    if (isAdditional && selectedTrack) {
+                      updateAdditionalAudioTrack(selectedTrack.id, { volume: clean });
+                    } else {
+                      setAudioSettings({ volume: clean });
                     }
-                    type="checkbox"
-                  />
-                </label>
+                  };
+                  const updateMuted = (muted: boolean) => {
+                    if (isAdditional && selectedTrack) {
+                      updateAdditionalAudioTrack(selectedTrack.id, { muted });
+                    } else {
+                      setAudioSettings({ muted });
+                    }
+                  };
+                  const updateFade = (patch: { fade_in?: number; fade_out?: number }) => {
+                    if (isAdditional && selectedTrack) {
+                      updateAdditionalAudioTrack(selectedTrack.id, patch);
+                    } else {
+                      setAudioSettings(patch);
+                    }
+                  };
+                  const updateSpeed = (speed: number) => {
+                    const clean = Math.max(0.5, Math.min(2.0, speed));
+                    if (isAdditional && selectedTrack) {
+                      updateAdditionalAudioTrack(selectedTrack.id, { speed: clean });
+                    } else {
+                      setAudioSettings({ speed: clean });
+                    }
+                  };
+                  const resetAudio = () => {
+                    if (isAdditional && selectedTrack) {
+                      updateAdditionalAudioTrack(selectedTrack.id, {
+                        volume: 1.0,
+                        muted: false,
+                        fade_in: 0,
+                        fade_out: 0,
+                        speed: 1.0,
+                        loop: false,
+                      });
+                    } else {
+                      setAudioSettings({
+                        volume: 1.0,
+                        muted: false,
+                        fade_in: 0,
+                        fade_out: 0,
+                        speed: 1.0,
+                      });
+                    }
+                    setMessage("Pengaturan audio direset ke default.");
+                  };
 
-                {captionStyle.backgroundEnabled && (
-                  <div className="mt-2">
-                    <div className="flex items-center justify-between text-xs">
-                      <span>Transparansi Latar</span>
-                      <span>{Math.round(captionStyle.backgroundOpacity * 100)}%</span>
-                    </div>
-                    <input
-                      className="w-full accent-cyan-400"
-                      max={0.85}
-                      min={0.1}
-                      onChange={(event) =>
-                        setCaptionStyle({ backgroundOpacity: Number(event.target.value) })
-                      }
-                      step={0.05}
-                      type="range"
-                      value={captionStyle.backgroundOpacity}
-                    />
-                  </div>
+                  const trackTypeBadge = isAdditional
+                    ? selectedTrack?.asset_id.startsWith("sfx-") || selectedTrack?.kind === "sfx"
+                      ? { label: "Sound Effect", color: "bg-amber-500/20 text-amber-300 border-amber-500/30" }
+                      : selectedTrack?.asset_id.startsWith("mus-") || selectedTrack?.kind === "backsound"
+                      ? { label: "Backsound", color: "bg-fuchsia-500/20 text-fuchsia-300 border-fuchsia-500/30" }
+                      : { label: "Upload", color: "bg-emerald-500/20 text-emerald-300 border-emerald-500/30" }
+                    : { label: "Extracted", color: "bg-cyan-500/20 text-cyan-300 border-cyan-500/30" };
+
+                  const trackDisplayName = isAdditional
+                    ? selectedTrack?.label || "Audio Track"
+                    : "Audio Asli Video";
+
+                  return (
+                    <>
+                      {/* TAB 1: AUDIO */}
+                      {audioInspectorTab === "audio" && (
+                        <>
+                          {/* 1. AUDIO IDENTITY */}
+                          <ToolSection title="Identitas Audio">
+                            <div className="space-y-2.5 rounded-lg border border-zinc-800/80 bg-[#1a1c20] p-2.5 text-xs">
+                              <div className="flex items-center justify-between">
+                                <span className="text-zinc-400">Tipe Audio</span>
+                                <span className={`rounded-md border px-2 py-0.5 text-[10px] font-bold uppercase ${trackTypeBadge.color}`}>
+                                  {trackTypeBadge.label}
+                                </span>
+                              </div>
+                              {isAdditional && selectedTrack ? (
+                                <div>
+                                  <label htmlFor="inspector_audio_label" className="text-zinc-400 text-[11px] block mb-1">
+                                    Nama Track
+                                  </label>
+                                  <input
+                                    id="inspector_audio_label"
+                                    className="w-full rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-100 focus:border-cyan-400"
+                                    value={selectedTrack.label}
+                                    onChange={(e) =>
+                                      updateAdditionalAudioTrack(selectedTrack.id, {
+                                        label: e.target.value,
+                                      })
+                                    }
+                                  />
+                                </div>
+                              ) : (
+                                <div className="flex items-center justify-between border-t border-zinc-800/60 pt-1.5">
+                                  <span className="text-zinc-400">Sumber</span>
+                                  <span className="font-medium text-zinc-200 truncate max-w-[150px]">
+                                    {trackDisplayName}
+                                  </span>
+                                </div>
+                              )}
+                              <div className="flex items-center justify-between border-t border-zinc-800/60 pt-1.5">
+                                <span className="text-zinc-400">Durasi</span>
+                                <span className="font-mono font-bold text-cyan-300">
+                                  {currentEffectiveDuration.toFixed(2)}s
+                                </span>
+                              </div>
+                            </div>
+                          </ToolSection>
+
+                          {/* 2. VOLUME */}
+                          <ToolSection title="Volume & Mute">
+                            <div className="space-y-3">
+                              <div>
+                                <div className="mb-1 flex items-center justify-between text-[11px]">
+                                  <span className="font-medium text-zinc-400">Volume</span>
+                                  <span className="font-mono font-bold text-cyan-300">
+                                    {Math.round(currentVolume * 100)}%
+                                  </span>
+                                </div>
+                                <input
+                                  className="h-1.5 w-full accent-cyan-400"
+                                  id="inspector_audio_volume_slider"
+                                  max="2"
+                                  min="0"
+                                  step="0.05"
+                                  type="range"
+                                  value={currentVolume}
+                                  onChange={(e) => updateVolume(Number(e.target.value))}
+                                />
+                              </div>
+
+                              {/* Quick volume preset buttons */}
+                              <div>
+                                <span className="mb-1 block text-[10px] font-semibold uppercase text-zinc-400">
+                                  Preset Volume
+                                </span>
+                                <div className="grid grid-cols-4 gap-1">
+                                  {[0, 0.5, 1.0, 1.5].map((vol) => (
+                                    <button
+                                      key={vol}
+                                      type="button"
+                                      className={`h-7 rounded text-xs font-semibold transition ${
+                                        Math.abs(currentVolume - vol) < 0.01
+                                          ? "border border-cyan-500/40 bg-cyan-500/20 text-cyan-300 font-bold"
+                                          : "border border-zinc-700/80 bg-[#1e2024] text-zinc-400 hover:text-zinc-200"
+                                      }`}
+                                      onClick={() => updateVolume(vol)}
+                                    >
+                                      {Math.round(vol * 100)}%
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+
+                              <label className="flex cursor-pointer items-center gap-2 pt-0.5 text-xs text-zinc-200">
+                                <input
+                                  checked={currentMuted}
+                                  className="rounded border-zinc-700 bg-zinc-800 text-cyan-500 focus:ring-cyan-400"
+                                  type="checkbox"
+                                  onChange={(e) => updateMuted(e.target.checked)}
+                                />
+                                <span className="font-medium">Bisukan Suara (Mute)</span>
+                              </label>
+                            </div>
+                          </ToolSection>
+
+                          {/* 3. PLAYBACK (Loop for BGM/Upload) */}
+                          {isAdditional && selectedTrack && selectedTrack.kind !== "sfx" && (
+                            <ToolSection title="Playback">
+                              <label className="flex cursor-pointer items-center gap-2 pt-0.5 text-xs text-zinc-200">
+                                <input
+                                  checked={Boolean(selectedTrack.loop)}
+                                  className="rounded border-zinc-700 bg-zinc-800 text-cyan-500 focus:ring-cyan-400"
+                                  type="checkbox"
+                                  onChange={(e) =>
+                                    updateAdditionalAudioTrack(selectedTrack.id, {
+                                      loop: e.target.checked,
+                                    })
+                                  }
+                                />
+                                <span className="font-medium">Loop Audio (Ulangi Otomatis)</span>
+                              </label>
+                            </ToolSection>
+                          )}
+
+                          {/* 4. AUDIO ACTIONS */}
+                          <ToolSection title="Actions">
+                            <div className="space-y-2">
+                              {!isAdditional && (
+                                <button
+                                  className="btn-secondary w-full py-1.5 text-xs font-bold text-zinc-300 hover:text-white"
+                                  onClick={mergeAudioIntoVideoTrack}
+                                  type="button"
+                                >
+                                  Gabungkan Audio ke Video
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                className="btn-secondary w-full py-1.5 text-xs font-bold text-zinc-300 hover:text-white"
+                                onClick={resetAudio}
+                              >
+                                Reset Audio
+                              </button>
+                              {isAdditional && selectedTrack && (
+                                <button
+                                  type="button"
+                                  onClick={() => deleteAdditionalAudioTrack(selectedTrack.id)}
+                                  className="w-full rounded-lg border border-red-800/60 bg-red-900/40 py-1.5 text-xs font-bold text-red-300 hover:bg-red-900/60 transition"
+                                >
+                                  Hapus Track Audio
+                                </button>
+                              )}
+                              {!isAdditional && (
+                                <button
+                                  type="button"
+                                  className={`w-full rounded-lg border py-1.5 text-xs font-bold transition ${
+                                    audioTrackDeleted
+                                      ? "border-emerald-800/60 bg-emerald-900/40 text-emerald-300 hover:bg-emerald-900/60"
+                                      : "border-red-800/60 bg-red-900/40 text-red-300 hover:bg-red-900/60"
+                                  }`}
+                                  onClick={() => {
+                                    setStyle("audio_track_deleted", !audioTrackDeleted);
+                                    setMessage(
+                                      audioTrackDeleted
+                                        ? "Audio track dipulihkan."
+                                        : "Audio track dinonaktifkan.",
+                                    );
+                                  }}
+                                >
+                                  {audioTrackDeleted ? "Pulihkan Track Audio" : "Hapus Track Audio"}
+                                </button>
+                              )}
+                            </div>
+                          </ToolSection>
+                        </>
+                      )}
+
+                      {/* TAB 2: FADE */}
+                      {audioInspectorTab === "fade" && (
+                        <>
+                          <ToolSection title="Fade Audio">
+                            <div className="space-y-3">
+                              {/* Fade In */}
+                              <div>
+                                <div className="mb-1 flex items-center justify-between text-[11px]">
+                                  <span className="font-medium text-zinc-400">Fade In</span>
+                                  <span className="font-mono font-bold text-zinc-300">
+                                    {currentFadeIn.toFixed(1)}s
+                                  </span>
+                                </div>
+                                <input
+                                  type="range"
+                                  min="0"
+                                  max="10"
+                                  step="0.1"
+                                  className="h-1.5 w-full accent-cyan-400"
+                                  value={currentFadeIn}
+                                  onChange={(e) => updateFade({ fade_in: Number(e.target.value) })}
+                                />
+                              </div>
+
+                              {/* Fade Out */}
+                              <div>
+                                <div className="mb-1 flex items-center justify-between text-[11px]">
+                                  <span className="font-medium text-zinc-400">Fade Out</span>
+                                  <span className="font-mono font-bold text-zinc-300">
+                                    {currentFadeOut.toFixed(1)}s
+                                  </span>
+                                </div>
+                                <input
+                                  type="range"
+                                  min="0"
+                                  max="10"
+                                  step="0.1"
+                                  className="h-1.5 w-full accent-cyan-400"
+                                  value={currentFadeOut}
+                                  onChange={(e) => updateFade({ fade_out: Number(e.target.value) })}
+                                />
+                              </div>
+
+                              {/* Quick Fade Presets */}
+                              <div>
+                                <span className="mb-1 block text-[10px] font-semibold uppercase text-zinc-400">
+                                  Preset Fade
+                                </span>
+                                <div className="grid grid-cols-4 gap-1">
+                                  {[
+                                    { label: "None", inVal: 0, outVal: 0 },
+                                    { label: "Soft", inVal: 0.5, outVal: 0.5 },
+                                    { label: "Medium", inVal: 1.5, outVal: 1.5 },
+                                    { label: "Long", inVal: 3.0, outVal: 3.0 },
+                                  ].map((p) => (
+                                    <button
+                                      key={p.label}
+                                      type="button"
+                                      className={`h-7 rounded text-xs font-semibold transition ${
+                                        Math.abs(currentFadeIn - p.inVal) < 0.05 &&
+                                        Math.abs(currentFadeOut - p.outVal) < 0.05
+                                          ? "border border-cyan-500/40 bg-cyan-500/20 text-cyan-300 font-bold"
+                                          : "border border-zinc-700/80 bg-[#1e2024] text-zinc-400 hover:text-zinc-200"
+                                      }`}
+                                      onClick={() =>
+                                        updateFade({ fade_in: p.inVal, fade_out: p.outVal })
+                                      }
+                                    >
+                                      {p.label}
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+                            </div>
+                          </ToolSection>
+
+                          <ToolSection title="Actions">
+                            <button
+                              type="button"
+                              className="btn-secondary w-full py-1.5 text-xs font-bold text-zinc-300 hover:text-white"
+                              onClick={() => updateFade({ fade_in: 0, fade_out: 0 })}
+                            >
+                              Reset Fade
+                            </button>
+                          </ToolSection>
+                        </>
+                      )}
+
+                      {/* TAB 3: SPEED */}
+                      {audioInspectorTab === "speed" && (
+                        <>
+                          <ToolSection title="Kecepatan Putar Audio">
+                            <div className="space-y-3">
+                              {/* Slider Speed */}
+                              <div>
+                                <div className="mb-1 flex items-center justify-between text-[11px]">
+                                  <span className="font-medium text-zinc-300">Kecepatan</span>
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="font-mono font-bold text-cyan-300">
+                                      {currentSpeed.toFixed(2)}x
+                                    </span>
+                                    <span
+                                      className={`rounded px-1.5 py-0.5 text-[9px] font-bold uppercase ${
+                                        currentSpeed === 1
+                                          ? "bg-zinc-800 text-zinc-400"
+                                          : currentSpeed > 1
+                                          ? "bg-cyan-950 text-cyan-300 border border-cyan-800/60"
+                                          : "bg-amber-950 text-amber-300 border border-amber-800/60"
+                                      }`}
+                                    >
+                                      {currentSpeed === 1
+                                        ? "Normal"
+                                        : currentSpeed > 1
+                                        ? "Cepat"
+                                        : "Lambat"}
+                                    </span>
+                                  </div>
+                                </div>
+                                <input
+                                  type="range"
+                                  min="0.5"
+                                  max="2.0"
+                                  step="0.05"
+                                  className="h-1.5 w-full accent-cyan-400"
+                                  value={currentSpeed}
+                                  onChange={(e) => updateSpeed(Number(e.target.value))}
+                                />
+                              </div>
+
+                              {/* Quick Speed Presets */}
+                              <div>
+                                <span className="mb-1 block text-[10px] font-semibold uppercase text-zinc-400">
+                                  Preset Kecepatan
+                                </span>
+                                <div className="grid grid-cols-4 gap-1">
+                                  {[0.75, 1.0, 1.25, 1.5].map((spd) => (
+                                    <button
+                                      key={spd}
+                                      type="button"
+                                      className={`h-7 rounded text-xs font-semibold transition ${
+                                        Math.abs(currentSpeed - spd) < 0.01
+                                          ? "border border-cyan-500/40 bg-cyan-500/20 text-cyan-300 font-bold"
+                                          : "border border-zinc-700/80 bg-[#1e2024] text-zinc-400 hover:text-zinc-200"
+                                      }`}
+                                      onClick={() => updateSpeed(spd)}
+                                    >
+                                      {spd}x
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+
+                              {/* Duration Preview Card */}
+                              <div className="rounded-lg border border-zinc-800 bg-[#1a1c20] p-2.5 text-[11px]">
+                                <div className="flex items-center justify-between text-zinc-400">
+                                  <span>Durasi Asli Track</span>
+                                  <span className="font-mono text-zinc-300">
+                                    {currentBaseDuration.toFixed(2)}s
+                                  </span>
+                                </div>
+                                <div className="mt-1 flex items-center justify-between border-t border-zinc-800/60 pt-1 text-zinc-400">
+                                  <span>Durasi Efektif ({currentSpeed.toFixed(2)}x)</span>
+                                  <span className="font-mono font-bold text-cyan-300">
+                                    {currentEffectiveDuration.toFixed(2)}s
+                                  </span>
+                                </div>
+                              </div>
+                            </div>
+                          </ToolSection>
+
+                          <ToolSection title="Actions">
+                            <button
+                              type="button"
+                              className="btn-secondary w-full py-1.5 text-xs font-bold text-zinc-300 hover:text-white"
+                              onClick={() => updateSpeed(1.0)}
+                            >
+                              Reset Speed (1.0x)
+                            </button>
+                          </ToolSection>
+                        </>
+                      )}
+
+                      {/* TAB 4: TIMING */}
+                      {audioInspectorTab === "timing" && (
+                        <>
+                          <ToolSection title="Durasi & Posisi Audio">
+                            {isAdditional && selectedTrack ? (
+                              <div className="space-y-3">
+                                {/* Start Time with Nudge */}
+                                <div>
+                                  <div className="mb-1 flex items-center justify-between text-[11px]">
+                                    <span className="font-medium text-zinc-400">Waktu Mulai</span>
+                                    <span className="font-mono font-bold text-zinc-200">
+                                      {selectedTrack.start.toFixed(2)}s
+                                    </span>
+                                  </div>
+                                  <div className="flex items-center gap-1.5">
+                                    <button
+                                      type="button"
+                                      className="btn-secondary h-7 flex-1 text-xs font-semibold"
+                                      onClick={() => {
+                                        const newStart = Math.max(0, Number((selectedTrack.start - 0.1).toFixed(2)));
+                                        if (newStart < selectedTrack.end) {
+                                          updateAdditionalAudioTrack(selectedTrack.id, { start: newStart });
+                                        }
+                                      }}
+                                    >
+                                      ← -0.1s
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="btn-secondary h-7 flex-1 text-xs font-semibold"
+                                      onClick={() => {
+                                        const newStart = Math.min(selectedTrack.end - 0.1, Number((selectedTrack.start + 0.1).toFixed(2)));
+                                        updateAdditionalAudioTrack(selectedTrack.id, { start: Math.max(0, newStart) });
+                                      }}
+                                    >
+                                      +0.1s →
+                                    </button>
+                                  </div>
+                                </div>
+
+                                {/* End Time with Nudge */}
+                                <div>
+                                  <div className="mb-1 flex items-center justify-between text-[11px]">
+                                    <span className="font-medium text-zinc-400">Waktu Selesai</span>
+                                    <span className="font-mono font-bold text-zinc-200">
+                                      {selectedTrack.end.toFixed(2)}s
+                                    </span>
+                                  </div>
+                                  <div className="flex items-center gap-1.5">
+                                    <button
+                                      type="button"
+                                      className="btn-secondary h-7 flex-1 text-xs font-semibold"
+                                      onClick={() => {
+                                        const newEnd = Math.max(selectedTrack.start + 0.1, Number((selectedTrack.end - 0.1).toFixed(2)));
+                                        updateAdditionalAudioTrack(selectedTrack.id, { end: newEnd });
+                                      }}
+                                    >
+                                      ← -0.1s
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="btn-secondary h-7 flex-1 text-xs font-semibold"
+                                      onClick={() => {
+                                        const newEnd = Math.min(clipDuration, Number((selectedTrack.end + 0.1).toFixed(2)));
+                                        updateAdditionalAudioTrack(selectedTrack.id, { end: newEnd });
+                                      }}
+                                    >
+                                      +0.1s →
+                                    </button>
+                                  </div>
+                                </div>
+
+                                {/* Duration & Position Nudge Card */}
+                                <div className="space-y-2 rounded-lg border border-zinc-800 bg-[#1a1c20] p-2.5 text-xs">
+                                  <div className="flex items-center justify-between">
+                                    <span className="text-zinc-400">Total Durasi</span>
+                                    <span className="font-mono font-bold text-cyan-300">
+                                      {(selectedTrack.end - selectedTrack.start).toFixed(2)}s
+                                    </span>
+                                  </div>
+                                  <div className="border-t border-zinc-800/60 pt-2">
+                                    <span className="mb-1 block text-[10px] font-semibold uppercase text-zinc-400">
+                                      Geser Posisi Track
+                                    </span>
+                                    <div className="flex items-center gap-1.5">
+                                      <button
+                                        type="button"
+                                        className="btn-secondary h-7 flex-1 text-xs font-semibold"
+                                        onClick={() => {
+                                          const dur = selectedTrack.end - selectedTrack.start;
+                                          const newStart = Math.max(0, Number((selectedTrack.start - 0.5).toFixed(2)));
+                                          updateAdditionalAudioTrack(selectedTrack.id, {
+                                            start: newStart,
+                                            end: Number((newStart + dur).toFixed(2)),
+                                          });
+                                        }}
+                                      >
+                                        ← Geser -0.5s
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="btn-secondary h-7 flex-1 text-xs font-semibold"
+                                        onClick={() => {
+                                          const dur = selectedTrack.end - selectedTrack.start;
+                                          const newStart = Math.min(
+                                            Math.max(0, clipDuration - dur),
+                                            Number((selectedTrack.start + 0.5).toFixed(2)),
+                                          );
+                                          updateAdditionalAudioTrack(selectedTrack.id, {
+                                            start: newStart,
+                                            end: Number((newStart + dur).toFixed(2)),
+                                          });
+                                        }}
+                                      >
+                                        Geser +0.5s →
+                                      </button>
+                                    </div>
+                                  </div>
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="space-y-2 rounded-lg border border-zinc-800 bg-[#1a1c20] p-2.5 text-xs">
+                                <div className="flex items-center justify-between border-b border-zinc-800/60 pb-1.5">
+                                  <span className="text-zinc-400">Mulai</span>
+                                  <span className="font-mono font-bold text-zinc-200">0.00s</span>
+                                </div>
+                                <div className="flex items-center justify-between border-b border-zinc-800/60 py-1.5">
+                                  <span className="text-zinc-400">Selesai</span>
+                                  <span className="font-mono font-bold text-zinc-200">
+                                    {clipDuration.toFixed(2)}s
+                                  </span>
+                                </div>
+                                <div className="flex items-center justify-between pt-1">
+                                  <span className="text-zinc-400">Durasi</span>
+                                  <span className="font-mono font-bold text-cyan-300">
+                                    {clipDuration.toFixed(2)}s
+                                  </span>
+                                </div>
+                                <p className="text-[10px] text-zinc-500 pt-1 border-t border-zinc-800/60">
+                                  Track audio utama ini terkunci mengikuti durasi klip video.
+                                </p>
+                              </div>
+                            )}
+                          </ToolSection>
+                        </>
+                      )}
+                    </>
+                  );
+                })()}
+
+                {/* 4. TEXT / HOOK / KEYWORD INSPECTOR */}
+                {(inspectorContext === "hook" || inspectorContext === "keyword") && (
+                  <>
+                    {textInspectorTab === "text" && (
+                      <>
+                        {inspectorContext === "hook" && (() => {
+                          const currentText = selectedEvent?.text ?? (styleConfig.hook_text || "");
+                          const currentPreset = normalizeTextStylePreset(
+                            (selectedEvent?.preset as TextStylePresetKey) ||
+                              styleConfig.hook_text_style_preset ||
+                              "clean_white",
+                          );
+                          const presetStyle = resolveTextOverlayStyle(currentPreset);
+                          const currentFont = selectedEvent?.font_family || hookTextFont;
+                          const fontSizeVal =
+                            selectedEvent?.font_size ?? (hookTextSize === "large" ? 36 : 26);
+                          const isBold = selectedEvent?.font_weight
+                            ? Number(selectedEvent.font_weight) >= 700
+                            : (presetStyle.fontWeight ?? 700) >= 700;
+                          const isItalic = selectedEvent?.font_style === "italic";
+                          const isUnderline = selectedEvent?.text_decoration === "underline";
+                          const currentCase =
+                            selectedEvent?.text_case ||
+                            (presetStyle.textTransform === "uppercase" ? "uppercase" : "normal");
+                          const textColorVal = selectedEvent?.color || presetStyle.color || "#ffffff";
+                          const letterSpacingVal = selectedEvent?.letter_spacing ?? 0;
+                          const lineHeightVal = selectedEvent?.line_height ?? 1.15;
+                          const textAlignVal = selectedEvent?.text_align || "center";
+                          const scaleVal = selectedEvent?.scale ?? 1.0;
+                          const posXVal = selectedEvent?.position_x_percent ?? 50;
+                          const defaultPosY =
+                            selectedEvent?.position === "bottom"
+                              ? 84
+                              : selectedEvent?.position === "center"
+                              ? 50
+                              : selectedEvent?.position === "top"
+                              ? 10
+                              : 18;
+                          const posYVal = selectedEvent?.position_y_percent ?? defaultPosY;
+                          const opacityVal = selectedEvent?.opacity ?? 1.0;
+                          const isStrokeEnabled =
+                            selectedEvent?.stroke_enabled ?? Boolean(presetStyle.WebkitTextStroke);
+                          const strokeColorVal = selectedEvent?.stroke_color || "#000000";
+                          const strokeWidthVal = selectedEvent?.stroke_width ?? 2;
+                          const isBgEnabled =
+                            selectedEvent?.background_enabled ?? Boolean(presetStyle.backgroundColor);
+                          const bgColorVal = selectedEvent?.background_color || "#000000";
+                          const bgOpacityVal = selectedEvent?.background_opacity ?? 0.8;
+                          const bgRadiusVal = selectedEvent?.background_radius ?? 8;
+                          const isShadowEnabled =
+                            selectedEvent?.shadow_enabled ?? Boolean(presetStyle.textShadow);
+                          const shadowColorVal = selectedEvent?.shadow_color || "rgba(0,0,0,0.85)";
+                          const shadowBlurVal = selectedEvent?.shadow_blur ?? 4;
+
+                          const updateSelectedText = (patch: Partial<EffectTimelineEvent>) => {
+                            if (selectedEvent) {
+                              replaceEvent(selectedEvent.id || "", patch);
+                            }
+                            if (patch.text !== undefined) {
+                              setStyle("hook_text", patch.text);
+                            }
+                            if (patch.preset !== undefined) {
+                              setStyle("hook_text_style_preset", patch.preset as TextStylePresetKey);
+                            }
+                            if (patch.font_family !== undefined) {
+                              setStyle("hook_text_font", patch.font_family as HookTextFont);
+                            }
+                          };
+
+                          return (
+                            <>
+                              {/* 1. TEXT CONTENT */}
+                              <ToolSection title="Isi Teks">
+                                <div className="space-y-1.5">
+                                  <div className="flex items-center justify-between text-[11px] text-zinc-400">
+                                    <span className="font-semibold text-zinc-300">
+                                      {selectedEvent?.reason?.includes("lower_third")
+                                        ? "Lower Third"
+                                        : selectedEvent?.reason?.includes("quote")
+                                        ? "Kutipan"
+                                        : selectedEvent?.reason?.includes("big_title")
+                                        ? "Big Title"
+                                        : selectedEvent?.reason?.includes("basic_text")
+                                        ? "Basic Text"
+                                        : "Teks Hook"}
+                                    </span>
+                                    <span className="font-mono text-[10px]">
+                                      {currentText.length}/120
+                                    </span>
+                                  </div>
+                                  <textarea
+                                    id="inspector_hook_text"
+                                    className="h-16 min-h-16 w-full resize-none text-xs font-medium"
+                                    maxLength={120}
+                                    placeholder="Ketik teks di sini..."
+                                    value={currentText}
+                                    onChange={(e) => updateSelectedText({ text: e.target.value })}
+                                  />
+                                </div>
+                              </ToolSection>
+
+                              {/* 2. FONT */}
+                              <ToolSection title="Font">
+                                <div className="space-y-2.5">
+                                  <div>
+                                    <label
+                                      htmlFor="inspector_hook_font"
+                                      className="mb-1 block text-[11px] font-medium text-zinc-400"
+                                    >
+                                      Font Family
+                                    </label>
+                                    <select
+                                      id="inspector_hook_font"
+                                      className="h-8 w-full text-xs font-medium"
+                                      value={currentFont}
+                                      onChange={(e) =>
+                                        updateSelectedText({ font_family: e.target.value })
+                                      }
+                                    >
+                                      {hookTextFonts.map((f) => (
+                                        <option key={f.value} value={f.value}>
+                                          {f.label}
+                                        </option>
+                                      ))}
+                                    </select>
+                                  </div>
+
+                                  <div>
+                                    <div className="mb-1 flex items-center justify-between text-[11px]">
+                                      <span className="font-medium text-zinc-400">Font Size</span>
+                                      <span className="font-mono font-bold text-cyan-300">
+                                        {fontSizeVal}px
+                                      </span>
+                                    </div>
+                                    <div className="flex items-center gap-2">
+                                      <input
+                                        type="range"
+                                        min="12"
+                                        max="80"
+                                        step="1"
+                                        className="h-1.5 w-full accent-cyan-400"
+                                        value={fontSizeVal}
+                                        onChange={(e) =>
+                                          updateSelectedText({ font_size: Number(e.target.value) })
+                                        }
+                                      />
+                                      <input
+                                        type="number"
+                                        min="12"
+                                        max="80"
+                                        className="h-7 w-14 text-center font-mono text-xs"
+                                        value={fontSizeVal}
+                                        onChange={(e) =>
+                                          updateSelectedText({ font_size: Number(e.target.value) })
+                                        }
+                                      />
+                                    </div>
+                                  </div>
+
+                                  <div className="grid grid-cols-2 gap-2 pt-1">
+                                    <div>
+                                      <span className="mb-1 block text-[10px] font-semibold uppercase text-zinc-400">
+                                        Style
+                                      </span>
+                                      <div className="flex items-center gap-0.5 rounded-lg border border-zinc-700/80 bg-[#1e2024] p-0.5">
+                                        <button
+                                          type="button"
+                                          className={`h-7 flex-1 rounded text-xs font-black transition ${
+                                            isBold
+                                              ? "border border-cyan-500/40 bg-cyan-500/20 text-cyan-300"
+                                              : "text-zinc-400 hover:text-zinc-200"
+                                          }`}
+                                          onClick={() =>
+                                            updateSelectedText({
+                                              font_weight: isBold ? 400 : 800,
+                                            })
+                                          }
+                                          title="Bold"
+                                        >
+                                          B
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className={`h-7 flex-1 rounded font-serif text-xs italic transition ${
+                                            isItalic
+                                              ? "border border-cyan-500/40 bg-cyan-500/20 text-cyan-300"
+                                              : "text-zinc-400 hover:text-zinc-200"
+                                          }`}
+                                          onClick={() =>
+                                            updateSelectedText({
+                                              font_style: isItalic ? "normal" : "italic",
+                                            })
+                                          }
+                                          title="Italic"
+                                        >
+                                          I
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className={`h-7 flex-1 rounded text-xs font-medium underline transition ${
+                                            isUnderline
+                                              ? "border border-cyan-500/40 bg-cyan-500/20 text-cyan-300"
+                                              : "text-zinc-400 hover:text-zinc-200"
+                                          }`}
+                                          onClick={() =>
+                                            updateSelectedText({
+                                              text_decoration: isUnderline ? "none" : "underline",
+                                            })
+                                          }
+                                          title="Underline"
+                                        >
+                                          U
+                                        </button>
+                                      </div>
+                                    </div>
+
+                                    <div>
+                                      <span className="mb-1 block text-[10px] font-semibold uppercase text-zinc-400">
+                                        Case
+                                      </span>
+                                      <div className="flex items-center gap-0.5 rounded-lg border border-zinc-700/80 bg-[#1e2024] p-0.5">
+                                        <button
+                                          type="button"
+                                          className={`h-7 flex-1 rounded text-[10px] font-bold transition ${
+                                            currentCase === "normal"
+                                              ? "border border-cyan-500/40 bg-cyan-500/20 text-cyan-300"
+                                              : "text-zinc-400 hover:text-zinc-200"
+                                          }`}
+                                          onClick={() =>
+                                            updateSelectedText({ text_case: "normal" })
+                                          }
+                                          title="Normal Case (Aa)"
+                                        >
+                                          Aa
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className={`h-7 flex-1 rounded text-[10px] font-black uppercase transition ${
+                                            currentCase === "uppercase"
+                                              ? "border border-cyan-500/40 bg-cyan-500/20 text-cyan-300"
+                                              : "text-zinc-400 hover:text-zinc-200"
+                                          }`}
+                                          onClick={() =>
+                                            updateSelectedText({ text_case: "uppercase" })
+                                          }
+                                          title="Uppercase (TT)"
+                                        >
+                                          TT
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className={`h-7 flex-1 rounded text-[10px] font-medium lowercase transition ${
+                                            currentCase === "lowercase"
+                                              ? "border border-cyan-500/40 bg-cyan-500/20 text-cyan-300"
+                                              : "text-zinc-400 hover:text-zinc-200"
+                                          }`}
+                                          onClick={() =>
+                                            updateSelectedText({ text_case: "lowercase" })
+                                          }
+                                          title="Lowercase (tt)"
+                                        >
+                                          tt
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className={`h-7 flex-1 rounded text-[10px] font-medium capitalize transition ${
+                                            currentCase === "titlecase"
+                                              ? "border border-cyan-500/40 bg-cyan-500/20 text-cyan-300"
+                                              : "text-zinc-400 hover:text-zinc-200"
+                                          }`}
+                                          onClick={() =>
+                                            updateSelectedText({ text_case: "titlecase" })
+                                          }
+                                          title="Title Case (Tt)"
+                                        >
+                                          Tt
+                                        </button>
+                                      </div>
+                                    </div>
+                                  </div>
+                                </div>
+                              </ToolSection>
+
+                              {/* 3. COLOR */}
+                              <ToolSection title="Warna Teks">
+                                <div className="space-y-2">
+                                  <div className="flex items-center gap-2">
+                                    <div className="relative size-8 shrink-0 cursor-pointer overflow-hidden rounded-lg border border-zinc-700 shadow-sm">
+                                      <input
+                                        type="color"
+                                        aria-label="Pilih warna teks"
+                                        className="absolute -inset-2 size-12 cursor-pointer opacity-0"
+                                        value={textColorVal.startsWith("#") ? textColorVal.slice(0, 7) : "#ffffff"}
+                                        onChange={(e) => updateSelectedText({ color: e.target.value })}
+                                      />
+                                      <div
+                                        className="size-full rounded-lg"
+                                        style={{ backgroundColor: textColorVal }}
+                                      />
+                                    </div>
+                                    <input
+                                      type="text"
+                                      aria-label="Hex warna teks"
+                                      className="h-8 flex-1 font-mono text-xs uppercase"
+                                      value={textColorVal}
+                                      onChange={(e) => updateSelectedText({ color: e.target.value })}
+                                    />
+                                  </div>
+                                  <div className="flex items-center gap-1.5 pt-0.5">
+                                    {["#ffffff", "#ffeb3b", "#00e5ff", "#ff1744", "#00e676", "#ff9100", "#e040fb"].map(
+                                      (swatch) => (
+                                        <button
+                                          key={swatch}
+                                          type="button"
+                                          className="size-5 rounded-full border border-zinc-600 shadow-sm transition hover:scale-110"
+                                          style={{ backgroundColor: swatch }}
+                                          onClick={() => updateSelectedText({ color: swatch })}
+                                          title={swatch}
+                                        />
+                                      ),
+                                    )}
+                                  </div>
+                                </div>
+                              </ToolSection>
+
+                              {/* 4. SPACING */}
+                              <ToolSection title="Spacing">
+                                <div className="grid grid-cols-2 gap-3">
+                                  <div>
+                                    <div className="mb-1 flex items-center justify-between text-[11px]">
+                                      <span className="font-medium text-zinc-400">Karakter</span>
+                                      <span className="font-mono font-bold text-zinc-300">
+                                        {letterSpacingVal}px
+                                      </span>
+                                    </div>
+                                    <input
+                                      type="range"
+                                      min="-2"
+                                      max="10"
+                                      step="0.5"
+                                      className="h-1.5 w-full accent-cyan-400"
+                                      value={letterSpacingVal}
+                                      onChange={(e) =>
+                                        updateSelectedText({
+                                          letter_spacing: Number(e.target.value),
+                                        })
+                                      }
+                                    />
+                                  </div>
+                                  <div>
+                                    <div className="mb-1 flex items-center justify-between text-[11px]">
+                                      <span className="font-medium text-zinc-400">Baris</span>
+                                      <span className="font-mono font-bold text-zinc-300">
+                                        {lineHeightVal.toFixed(2)}
+                                      </span>
+                                    </div>
+                                    <input
+                                      type="range"
+                                      min="0.8"
+                                      max="2.0"
+                                      step="0.05"
+                                      className="h-1.5 w-full accent-cyan-400"
+                                      value={lineHeightVal}
+                                      onChange={(e) =>
+                                        updateSelectedText({
+                                          line_height: Number(e.target.value),
+                                        })
+                                      }
+                                    />
+                                  </div>
+                                </div>
+                              </ToolSection>
+
+                              {/* 5. ALIGNMENT */}
+                              <ToolSection title="Alignment">
+                                <div className="flex items-center gap-1 rounded-lg border border-zinc-700/80 bg-[#1e2024] p-1">
+                                  <button
+                                    type="button"
+                                    className={`flex h-7 flex-1 items-center justify-center gap-1 rounded text-xs font-semibold transition ${
+                                      textAlignVal === "left"
+                                        ? "border border-cyan-500/40 bg-cyan-500/20 text-cyan-300"
+                                        : "text-zinc-400 hover:text-zinc-200"
+                                    }`}
+                                    onClick={() => updateSelectedText({ text_align: "left" })}
+                                  >
+                                    <span>⇤</span>
+                                    <span>Kiri</span>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className={`flex h-7 flex-1 items-center justify-center gap-1 rounded text-xs font-semibold transition ${
+                                      textAlignVal === "center"
+                                        ? "border border-cyan-500/40 bg-cyan-500/20 text-cyan-300"
+                                        : "text-zinc-400 hover:text-zinc-200"
+                                    }`}
+                                    onClick={() => updateSelectedText({ text_align: "center" })}
+                                  >
+                                    <span>≡</span>
+                                    <span>Tengah</span>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className={`flex h-7 flex-1 items-center justify-center gap-1 rounded text-xs font-semibold transition ${
+                                      textAlignVal === "right"
+                                        ? "border border-cyan-500/40 bg-cyan-500/20 text-cyan-300"
+                                        : "text-zinc-400 hover:text-zinc-200"
+                                    }`}
+                                    onClick={() => updateSelectedText({ text_align: "right" })}
+                                  >
+                                    <span>⇥</span>
+                                    <span>Kanan</span>
+                                  </button>
+                                </div>
+                              </ToolSection>
+
+                              {/* 6. PRESET STYLE */}
+                              <ToolSection title="Preset Gaya Teks">
+                                <TextStylePresetSelector
+                                  value={currentPreset}
+                                  onChange={(value) => updateSelectedText({ preset: value })}
+                                />
+                              </ToolSection>
+
+                              {/* 7. TRANSFORM (Collapsible) */}
+                              <CollapsibleToolSection title="Transform" badge={`${Math.round(scaleVal * 100)}%`}>
+                                <div className="space-y-3">
+                                  <div>
+                                    <div className="mb-1 flex items-center justify-between text-[11px]">
+                                      <span className="font-medium text-zinc-400">Scale</span>
+                                      <span className="font-mono font-bold text-cyan-300">
+                                        {scaleVal.toFixed(2)}x
+                                      </span>
+                                    </div>
+                                    <input
+                                      type="range"
+                                      min="0.5"
+                                      max="2.5"
+                                      step="0.05"
+                                      className="h-1.5 w-full accent-cyan-400"
+                                      value={scaleVal}
+                                      onChange={(e) =>
+                                        updateSelectedText({ scale: Number(e.target.value) })
+                                      }
+                                    />
+                                  </div>
+
+                                  <div className="grid grid-cols-2 gap-2">
+                                    <div>
+                                      <div className="mb-1 flex items-center justify-between text-[11px]">
+                                        <span className="font-medium text-zinc-400">Posisi X</span>
+                                        <span className="font-mono font-bold text-zinc-300">
+                                          {Math.round(posXVal)}%
+                                        </span>
+                                      </div>
+                                      <input
+                                        type="range"
+                                        min="0"
+                                        max="100"
+                                        step="1"
+                                        className="h-1.5 w-full accent-cyan-400"
+                                        value={posXVal}
+                                        onChange={(e) =>
+                                          updateSelectedText({
+                                            position_x_percent: Number(e.target.value),
+                                          })
+                                        }
+                                      />
+                                    </div>
+
+                                    <div>
+                                      <div className="mb-1 flex items-center justify-between text-[11px]">
+                                        <span className="font-medium text-zinc-400">Posisi Y</span>
+                                        <span className="font-mono font-bold text-zinc-300">
+                                          {Math.round(posYVal)}%
+                                        </span>
+                                      </div>
+                                      <input
+                                        type="range"
+                                        min="0"
+                                        max="100"
+                                        step="1"
+                                        className="h-1.5 w-full accent-cyan-400"
+                                        value={posYVal}
+                                        onChange={(e) =>
+                                          updateSelectedText({
+                                            position_y_percent: Number(e.target.value),
+                                          })
+                                        }
+                                      />
+                                    </div>
+                                  </div>
+
+                                  <div className="grid grid-cols-4 gap-1 pt-1">
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        updateSelectedText({ position_x_percent: 50, position_y_percent: 18 })
+                                      }
+                                      className="rounded bg-zinc-800 py-1 text-[10px] font-semibold text-zinc-300 hover:bg-zinc-700"
+                                    >
+                                      Atas
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        updateSelectedText({ position_x_percent: 50, position_y_percent: 50 })
+                                      }
+                                      className="rounded bg-zinc-800 py-1 text-[10px] font-semibold text-zinc-300 hover:bg-zinc-700"
+                                    >
+                                      Tengah
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        updateSelectedText({ position_x_percent: 50, position_y_percent: 84 })
+                                      }
+                                      className="rounded bg-zinc-800 py-1 text-[10px] font-semibold text-zinc-300 hover:bg-zinc-700"
+                                    >
+                                      Bawah
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        updateSelectedText({ scale: 1.0, position_x_percent: 50, position_y_percent: 18 })
+                                      }
+                                      className="rounded bg-zinc-800 py-1 text-[10px] font-semibold text-cyan-300 hover:bg-zinc-700"
+                                    >
+                                      Reset
+                                    </button>
+                                  </div>
+                                </div>
+                              </CollapsibleToolSection>
+
+                              {/* 8. BLEND (Collapsible) */}
+                              <CollapsibleToolSection title="Blend & Opacity" badge={`${Math.round(opacityVal * 100)}%`}>
+                                <div>
+                                  <div className="mb-1 flex items-center justify-between text-[11px]">
+                                    <span className="font-medium text-zinc-400">Opacity</span>
+                                    <span className="font-mono font-bold text-cyan-300">
+                                      {Math.round(opacityVal * 100)}%
+                                    </span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min="0"
+                                    max="1"
+                                    step="0.05"
+                                    className="h-1.5 w-full accent-cyan-400"
+                                    value={opacityVal}
+                                    onChange={(e) =>
+                                      updateSelectedText({ opacity: Number(e.target.value) })
+                                    }
+                                  />
+                                </div>
+                              </CollapsibleToolSection>
+
+                              {/* 9. STROKE (Collapsible) */}
+                              <CollapsibleToolSection
+                                title="Stroke / Outline"
+                                badge={isStrokeEnabled ? `${strokeWidthVal}px` : "Nonaktif"}
+                              >
+                                <div className="space-y-3">
+                                  <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-200">
+                                    <input
+                                      type="checkbox"
+                                      className="rounded border-zinc-700 bg-zinc-800 text-cyan-500 focus:ring-cyan-400"
+                                      checked={isStrokeEnabled}
+                                      onChange={(e) =>
+                                        updateSelectedText({ stroke_enabled: e.target.checked })
+                                      }
+                                    />
+                                    <span className="font-medium">Aktifkan Stroke Teks</span>
+                                  </label>
+
+                                  {isStrokeEnabled && (
+                                    <>
+                                      <div className="flex items-center gap-2">
+                                        <div className="relative size-8 shrink-0 cursor-pointer overflow-hidden rounded-lg border border-zinc-700 shadow-sm">
+                                          <input
+                                            type="color"
+                                            aria-label="Pilih warna stroke"
+                                            className="absolute -inset-2 size-12 cursor-pointer opacity-0"
+                                            value={strokeColorVal.startsWith("#") ? strokeColorVal.slice(0, 7) : "#000000"}
+                                            onChange={(e) =>
+                                              updateSelectedText({ stroke_color: e.target.value })
+                                            }
+                                          />
+                                          <div
+                                            className="size-full rounded-lg"
+                                            style={{ backgroundColor: strokeColorVal }}
+                                          />
+                                        </div>
+                                        <input
+                                          type="text"
+                                          aria-label="Hex warna stroke"
+                                          className="h-8 flex-1 font-mono text-xs uppercase"
+                                          value={strokeColorVal}
+                                          onChange={(e) =>
+                                            updateSelectedText({ stroke_color: e.target.value })
+                                          }
+                                        />
+                                      </div>
+
+                                      <div>
+                                        <div className="mb-1 flex items-center justify-between text-[11px]">
+                                          <span className="font-medium text-zinc-400">Ketebalan</span>
+                                          <span className="font-mono font-bold text-cyan-300">
+                                            {strokeWidthVal}px
+                                          </span>
+                                        </div>
+                                        <input
+                                          type="range"
+                                          min="0.5"
+                                          max="12"
+                                          step="0.5"
+                                          className="h-1.5 w-full accent-cyan-400"
+                                          value={strokeWidthVal}
+                                          onChange={(e) =>
+                                            updateSelectedText({
+                                              stroke_width: Number(e.target.value),
+                                            })
+                                          }
+                                        />
+                                      </div>
+                                    </>
+                                  )}
+                                </div>
+                              </CollapsibleToolSection>
+
+                              {/* 10. BACKGROUND (Collapsible) */}
+                              <CollapsibleToolSection
+                                title="Background Box"
+                                badge={isBgEnabled ? `${Math.round(bgOpacityVal * 100)}%` : "Nonaktif"}
+                              >
+                                <div className="space-y-3">
+                                  <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-200">
+                                    <input
+                                      type="checkbox"
+                                      className="rounded border-zinc-700 bg-zinc-800 text-cyan-500 focus:ring-cyan-400"
+                                      checked={isBgEnabled}
+                                      onChange={(e) =>
+                                        updateSelectedText({ background_enabled: e.target.checked })
+                                      }
+                                    />
+                                    <span className="font-medium">Aktifkan Background Box</span>
+                                  </label>
+
+                                  {isBgEnabled && (
+                                    <>
+                                      <div className="flex items-center gap-2">
+                                        <div className="relative size-8 shrink-0 cursor-pointer overflow-hidden rounded-lg border border-zinc-700 shadow-sm">
+                                          <input
+                                            type="color"
+                                            aria-label="Pilih warna background"
+                                            className="absolute -inset-2 size-12 cursor-pointer opacity-0"
+                                            value={bgColorVal.startsWith("#") ? bgColorVal.slice(0, 7) : "#000000"}
+                                            onChange={(e) =>
+                                              updateSelectedText({ background_color: e.target.value })
+                                            }
+                                          />
+                                          <div
+                                            className="size-full rounded-lg"
+                                            style={{ backgroundColor: bgColorVal }}
+                                          />
+                                        </div>
+                                        <input
+                                          type="text"
+                                          aria-label="Hex warna background"
+                                          className="h-8 flex-1 font-mono text-xs uppercase"
+                                          value={bgColorVal}
+                                          onChange={(e) =>
+                                            updateSelectedText({ background_color: e.target.value })
+                                          }
+                                        />
+                                      </div>
+
+                                      <div className="grid grid-cols-2 gap-2">
+                                        <div>
+                                          <div className="mb-1 flex items-center justify-between text-[11px]">
+                                            <span className="font-medium text-zinc-400">Opacity</span>
+                                            <span className="font-mono font-bold text-zinc-300">
+                                              {Math.round(bgOpacityVal * 100)}%
+                                            </span>
+                                          </div>
+                                          <input
+                                            type="range"
+                                            min="0"
+                                            max="1"
+                                            step="0.05"
+                                            className="h-1.5 w-full accent-cyan-400"
+                                            value={bgOpacityVal}
+                                            onChange={(e) =>
+                                              updateSelectedText({
+                                                background_opacity: Number(e.target.value),
+                                              })
+                                            }
+                                          />
+                                        </div>
+                                        <div>
+                                          <div className="mb-1 flex items-center justify-between text-[11px]">
+                                            <span className="font-medium text-zinc-400">Radius</span>
+                                            <span className="font-mono font-bold text-zinc-300">
+                                              {bgRadiusVal}px
+                                            </span>
+                                          </div>
+                                          <input
+                                            type="range"
+                                            min="0"
+                                            max="24"
+                                            step="1"
+                                            className="h-1.5 w-full accent-cyan-400"
+                                            value={bgRadiusVal}
+                                            onChange={(e) =>
+                                              updateSelectedText({
+                                                background_radius: Number(e.target.value),
+                                              })
+                                            }
+                                          />
+                                        </div>
+                                      </div>
+                                    </>
+                                  )}
+                                </div>
+                              </CollapsibleToolSection>
+
+                              {/* 11. GLOW / SHADOW (Collapsible) */}
+                              <CollapsibleToolSection
+                                title="Shadow / Bayangan"
+                                badge={isShadowEnabled ? `${shadowBlurVal}px` : "Nonaktif"}
+                              >
+                                <div className="space-y-3">
+                                  <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-200">
+                                    <input
+                                      type="checkbox"
+                                      className="rounded border-zinc-700 bg-zinc-800 text-cyan-500 focus:ring-cyan-400"
+                                      checked={isShadowEnabled}
+                                      onChange={(e) =>
+                                        updateSelectedText({ shadow_enabled: e.target.checked })
+                                      }
+                                    />
+                                    <span className="font-medium">Aktifkan Bayangan Teks</span>
+                                  </label>
+
+                                  {isShadowEnabled && (
+                                    <>
+                                      <div className="flex items-center gap-2">
+                                        <div className="relative size-8 shrink-0 cursor-pointer overflow-hidden rounded-lg border border-zinc-700 shadow-sm">
+                                          <input
+                                            type="color"
+                                            aria-label="Pilih warna bayangan"
+                                            className="absolute -inset-2 size-12 cursor-pointer opacity-0"
+                                            value={shadowColorVal.startsWith("#") ? shadowColorVal.slice(0, 7) : "#000000"}
+                                            onChange={(e) =>
+                                              updateSelectedText({ shadow_color: e.target.value })
+                                            }
+                                          />
+                                          <div
+                                            className="size-full rounded-lg"
+                                            style={{ backgroundColor: shadowColorVal }}
+                                          />
+                                        </div>
+                                        <input
+                                          type="text"
+                                          aria-label="Hex warna bayangan"
+                                          className="h-8 flex-1 font-mono text-xs uppercase"
+                                          value={shadowColorVal}
+                                          onChange={(e) =>
+                                            updateSelectedText({ shadow_color: e.target.value })
+                                          }
+                                        />
+                                      </div>
+
+                                      <div>
+                                        <div className="mb-1 flex items-center justify-between text-[11px]">
+                                          <span className="font-medium text-zinc-400">Blur Radius</span>
+                                          <span className="font-mono font-bold text-cyan-300">
+                                            {shadowBlurVal}px
+                                          </span>
+                                        </div>
+                                        <input
+                                          type="range"
+                                          min="0"
+                                          max="20"
+                                          step="1"
+                                          className="h-1.5 w-full accent-cyan-400"
+                                          value={shadowBlurVal}
+                                          onChange={(e) =>
+                                            updateSelectedText({
+                                              shadow_blur: Number(e.target.value),
+                                            })
+                                          }
+                                        />
+                                      </div>
+                                    </>
+                                  )}
+                                </div>
+                              </CollapsibleToolSection>
+
+                              {/* TIMING & ACTIONS */}
+                              {selectedEvent && (
+                                <ToolSection title="Timing">
+                                  <div className="grid grid-cols-3 gap-1.5 text-[11px]">
+                                    <div className="rounded-lg bg-zinc-800/80 p-2">
+                                      <span className="block text-[10px] text-zinc-500">Mulai</span>
+                                      <p className="font-mono font-bold text-zinc-100">
+                                        {formatTimePrecise(selectedEvent.start)}
+                                      </p>
+                                    </div>
+                                    <div className="rounded-lg bg-zinc-800/80 p-2">
+                                      <span className="block text-[10px] text-zinc-500">Selesai</span>
+                                      <p className="font-mono font-bold text-zinc-100">
+                                        {formatTimePrecise(selectedEvent.end)}
+                                      </p>
+                                    </div>
+                                    <div className="rounded-lg bg-zinc-800/80 p-2">
+                                      <span className="block text-[10px] text-zinc-500">Durasi</span>
+                                      <p className="font-mono font-bold text-cyan-300">
+                                        {(selectedEvent.end - selectedEvent.start).toFixed(2)}s
+                                      </p>
+                                    </div>
+                                  </div>
+                                </ToolSection>
+                              )}
+
+                              <ToolSection title="Actions">
+                                <button
+                                  className="w-full rounded-lg border border-red-800/60 bg-red-900/40 py-1.5 text-xs font-bold text-red-300 hover:bg-red-900/60"
+                                  onClick={() => {
+                                    if (selectedEvent) {
+                                      deleteEvent(selectedEvent.id || "");
+                                    } else {
+                                      setStyle("hook_text_enabled", false);
+                                      setMessage("Hook dinonaktifkan.");
+                                    }
+                                  }}
+                                  type="button"
+                                >
+                                  Hapus Teks
+                                </button>
+                              </ToolSection>
+                            </>
+                          );
+                        })()}
+
+                        {inspectorContext === "keyword" && (
+                          <>
+                            {selectedEvent ? (
+                              selectedEvent.reason?.toLowerCase().includes("sticker") || selectedEvent.type === "sticker" ? (
+                                <>
+                                  <ToolSection title="Sticker Properties">
+                                    <div className="space-y-3">
+                                      <div className="flex items-center justify-center rounded-xl bg-zinc-900/60 p-4 border border-zinc-800">
+                                        <span className="text-4xl filter drop-shadow-md">
+                                          {selectedEvent.text}
+                                        </span>
+                                      </div>
+                                      <div>
+                                        <label htmlFor="inspector_sticker_pos">Posisi Layar</label>
+                                        <select
+                                          id="inspector_sticker_pos"
+                                          value={selectedEvent.position || "center"}
+                                          onChange={(e) =>
+                                            replaceEvent(selectedEvent.id || "", {
+                                              position: e.target.value,
+                                            })
+                                          }
+                                        >
+                                          <option value="center">Tengah Layar (Center)</option>
+                                          <option value="top_right">Kanan Atas</option>
+                                          <option value="top_left">Kiri Atas</option>
+                                          <option value="bottom_right">Kanan Bawah</option>
+                                          <option value="bottom_left">Kiri Bawah</option>
+                                        </select>
+                                      </div>
+                                      <div>
+                                        <label htmlFor="inspector_sticker_size">Ukuran Sticker</label>
+                                        <select
+                                          id="inspector_sticker_size"
+                                          value={selectedEvent.size || "medium"}
+                                          onChange={(e) =>
+                                            replaceEvent(selectedEvent.id || "", {
+                                              size: e.target.value,
+                                            })
+                                          }
+                                        >
+                                          <option value="small">Kecil</option>
+                                          <option value="medium">Sedang (Default)</option>
+                                          <option value="large">Besar</option>
+                                        </select>
+                                      </div>
+                                    </div>
+                                  </ToolSection>
+
+                                  <ToolSection title="Timing">
+                                    <div className="grid grid-cols-3 gap-1.5 text-[11px]">
+                                      <div className="rounded-lg bg-zinc-800/80 p-2">
+                                        <span className="block text-[10px] text-zinc-500">Mulai</span>
+                                        <p className="font-mono font-bold text-zinc-100">
+                                          {formatTimePrecise(selectedEvent.start)}
+                                        </p>
+                                      </div>
+                                      <div className="rounded-lg bg-zinc-800/80 p-2">
+                                        <span className="block text-[10px] text-zinc-500">Selesai</span>
+                                        <p className="font-mono font-bold text-zinc-100">
+                                          {formatTimePrecise(selectedEvent.end)}
+                                        </p>
+                                      </div>
+                                      <div className="rounded-lg bg-zinc-800/80 p-2">
+                                        <span className="block text-[10px] text-zinc-500">Durasi</span>
+                                        <p className="font-mono font-bold text-cyan-300">
+                                          {(selectedEvent.end - selectedEvent.start).toFixed(2)}s
+                                        </p>
+                                      </div>
+                                    </div>
+                                  </ToolSection>
+
+                                  <ToolSection title="Actions">
+                                    <button
+                                      className="rounded-lg border border-red-800/60 bg-red-900/40 w-full py-1.5 text-xs font-bold text-red-300 hover:bg-red-900/60"
+                                      onClick={() => deleteEvent(selectedEvent.id || "")}
+                                      type="button"
+                                    >
+                                      Hapus Sticker
+                                    </button>
+                                  </ToolSection>
+                                </>
+                              ) : (
+                                <>
+                                  <ToolSection title="Keyword Text">
+                                    <div>
+                                      <label htmlFor="inspector_keyword_text">Teks Keyword</label>
+                                      <input
+                                        id="inspector_keyword_text"
+                                        onChange={(event) => {
+                                          const text = sanitizeKeywordInput(event.target.value);
+                                          replaceEvent(selectedEvent.id || "", { text });
+                                        }}
+                                        value={selectedEvent.text || ""}
+                                      />
+                                    </div>
+                                  </ToolSection>
+
+                                  <ToolSection title="Gaya Teks Keyword">
+                                    <TextStylePresetSelector
+                                      label="Preset Gaya Teks"
+                                      onChange={(value) => {
+                                        replaceEvent(selectedEvent.id || "", { preset: value });
+                                        setStyle("keyword_text_style_preset", value);
+                                      }}
+                                      value={
+                                        normalizeTextStylePreset(
+                                          (selectedEvent.preset as TextStylePresetKey) ||
+                                            styleConfig.keyword_text_style_preset ||
+                                            "yellow_viral",
+                                        )
+                                      }
+                                    />
+                                  </ToolSection>
+
+                                  <ToolSection title="Timing">
+                                    <div className="grid grid-cols-3 gap-1.5 text-[11px]">
+                                      <div className="rounded-lg bg-zinc-800/80 p-2">
+                                        <span className="block text-[10px] text-zinc-500">Mulai</span>
+                                        <p className="font-mono font-bold text-zinc-100">
+                                          {formatTimePrecise(selectedEvent.start)}
+                                        </p>
+                                      </div>
+                                      <div className="rounded-lg bg-zinc-800/80 p-2">
+                                        <span className="block text-[10px] text-zinc-500">Selesai</span>
+                                        <p className="font-mono font-bold text-zinc-100">
+                                          {formatTimePrecise(selectedEvent.end)}
+                                        </p>
+                                      </div>
+                                      <div className="rounded-lg bg-zinc-800/80 p-2">
+                                        <span className="block text-[10px] text-zinc-500">Durasi</span>
+                                        <p className="font-mono font-bold text-cyan-300">
+                                          {(selectedEvent.end - selectedEvent.start).toFixed(2)}s
+                                        </p>
+                                      </div>
+                                    </div>
+                                  </ToolSection>
+
+                                  <ToolSection title="Actions">
+                                    <button
+                                      className="rounded-lg border border-red-800/60 bg-red-900/40 w-full py-1.5 text-xs font-bold text-red-300 hover:bg-red-900/60"
+                                      onClick={() => deleteEvent(selectedEvent.id || "")}
+                                      type="button"
+                                    >
+                                      Hapus Keyword
+                                    </button>
+                                  </ToolSection>
+                                </>
+                              )
+                            ) : (
+                              <ToolSection title="Keyword / Sticker">
+                                <p className="rounded-xl bg-zinc-850 p-3 text-xs text-zinc-400">
+                                  Pilih keyword atau sticker di timeline untuk mengedit teks atau properti.
+                                </p>
+                              </ToolSection>
+                            )}
+                          </>
+                        )}
+                      </>
+                    )}
+
+                    {(textInspectorTab === "animation" ||
+                      textInspectorTab === "tracking" ||
+                      textInspectorTab === "tts") && (
+                      <ToolSection title="Coming Soon">
+                        <div className="rounded-xl border border-zinc-800 bg-[#202226] p-4 text-center text-xs text-zinc-400">
+                          <p className="font-bold text-zinc-300 capitalize">
+                            {textInspectorTab === "tts" ? "Text to Speech" : textInspectorTab}
+                          </p>
+                          <p className="mt-1 text-[11px] text-zinc-500">
+                            Fitur {textInspectorTab === "tts" ? "text to speech" : textInspectorTab} teks akan aktif pada update berikutnya.
+                          </p>
+                        </div>
+                      </ToolSection>
+                    )}
+                  </>
                 )}
-              </ToolSection>
-            </>
-          )}
 
-          {/* 5. Contextual Hook / Keyword / Effects Inspector */}
-          {(selectedEditorContext === "hook" || selectedEditorContext === "keyword" || selectedEditorContext === "effect") && (
-            <ToolSection title={selectedEditorContext === "hook" ? "Hook Inspector" : selectedEditorContext === "keyword" ? "Keyword Inspector" : "Effect Inspector"}>
-              {selectedEditorContext === "hook" && (
-                <div className="space-y-3">
-                  <div>
-                    <label htmlFor="inspector_hook_text">Teks Hook</label>
-                    <input
-                      id="inspector_hook_text"
-                      value={styleConfig.hook_text}
-                      maxLength={70}
-                      onChange={(event) => setStyle("hook_text", event.target.value)}
-                    />
-                  </div>
+                {/* 5. CAPTION INSPECTOR (CapCut Structure: Captions | Text | Animation | Tracking | TTS) */}
+                {inspectorContext === "caption" && (
+                  <>
+                    {/* TAB 1: CAPTIONS (Cue Search, List, Global Apply to All, Actions) */}
+                    {captionInspectorTab === "captions" && (
+                      <>
+                        <ToolSection title="Caption Manager">
+                          <div className="space-y-3">
+                            <label className="flex items-center justify-between gap-2 cursor-pointer text-xs font-bold text-zinc-200 bg-zinc-900/90 p-2.5 rounded-xl border border-zinc-800 shadow-sm">
+                              <span className="flex items-center gap-1.5">
+                                <span className="text-cyan-400">✨</span>
+                                <span>Apply to all main captions</span>
+                              </span>
+                              <input
+                                type="checkbox"
+                                checked={captionApplyToAll}
+                                onChange={(e) => setCaptionApplyToAll(e.target.checked)}
+                                className="accent-cyan-400 h-4 w-4 rounded cursor-pointer"
+                              />
+                            </label>
 
-                  <div className="grid grid-cols-2 gap-2">
-                    <div>
-                      <label htmlFor="inspector_hook_font">Font</label>
-                      <select
-                        id="inspector_hook_font"
-                        value={hookTextFont}
-                        onChange={(event) => setStyle("hook_text_font", event.target.value as HookTextFont)}
-                      >
-                        {hookTextFonts.map((f) => (
-                          <option key={f.value} value={f.value}>{f.label}</option>
-                        ))}
-                      </select>
-                    </div>
-                    <div>
-                      <label htmlFor="inspector_hook_size">Ukuran</label>
-                      <select
-                        id="inspector_hook_size"
-                        value={hookTextSize}
-                        onChange={(event) => setStyle("hook_text_size", event.target.value as HookTextSize)}
-                      >
-                        <option value="normal">Normal</option>
-                        <option value="large">Besar</option>
-                      </select>
-                    </div>
-                  </div>
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (editableCaptionCues.length > 0) {
+                                    setSelectedCaptionId(editableCaptionCues[0].id);
+                                    setMessage(`Semua caption (${editableCaptionCues.length} cue) siap diedit massal.`);
+                                  }
+                                }}
+                                className="btn-secondary flex-1 py-1.5 text-[11px] font-bold"
+                              >
+                                Pilih Semua ({editableCaptionCues.length})
+                              </button>
+                              <button
+                                type="button"
+                                onClick={applyCurrentStyleToAllCaptions}
+                                className="btn-secondary flex-1 py-1.5 text-[11px] font-bold text-cyan-300"
+                                title="Terapkan style aktif ke semua cue"
+                              >
+                                Terapkan ke Semua
+                              </button>
+                              <button
+                                type="button"
+                                onClick={resetCaptionStyle}
+                                className="btn-secondary px-2.5 py-1.5 text-[11px] font-bold text-zinc-400 hover:text-zinc-200"
+                                title="Reset style caption ke default"
+                              >
+                                Reset
+                              </button>
+                            </div>
 
-                  <div>
-                    <label htmlFor="inspector_hook_pos">Posisi</label>
-                    <select
-                      id="inspector_hook_pos"
-                      value={hookTextPosition}
-                      onChange={(event) => setStyle("hook_text_position", event.target.value as HookTextPosition)}
-                    >
-                      <option value="safe_top">Paling Atas</option>
-                      <option value="top">Atas</option>
-                      <option value="upper_center">Tengah Atas</option>
-                    </select>
-                  </div>
+                            <div>
+                              <input
+                                placeholder="Cari isi teks caption..."
+                                value={captionCueSearch}
+                                onChange={(e) => setCaptionCueSearch(e.target.value)}
+                                className="w-full text-xs"
+                              />
+                            </div>
 
-                  <div>
-                    <label htmlFor="inspector_hook_template">Template</label>
-                    <select
-                      id="inspector_hook_template"
-                      value={hookTextTemplate}
-                      onChange={(event) => setStyle("hook_text_template", event.target.value as HookTextTemplate)}
-                    >
-                      {hookTextTemplates.map((t) => (
-                        <option key={t.value} value={t.value}>{t.label}</option>
-                      ))}
-                    </select>
-                  </div>
-                </div>
-              )}
+                            {/* Cues List */}
+                            <div className="max-h-56 space-y-1.5 overflow-y-auto pr-1">
+                              {editableCaptionCues
+                                .filter((cue) =>
+                                  !captionCueSearch
+                                    ? true
+                                    : cue.text.toLowerCase().includes(captionCueSearch.toLowerCase()),
+                                )
+                                .map((cue, idx) => {
+                                  const isSelected = selectedCaptionId === cue.id;
+                                  return (
+                                    <div
+                                      key={cue.id}
+                                      onClick={() => {
+                                        seekPreviewTo(cue.start);
+                                        setSelectedCaptionId(cue.id);
+                                        setSelectedEditorContext("caption");
+                                      }}
+                                      className={`group cursor-pointer rounded-lg border p-2 text-xs transition ${
+                                        isSelected
+                                          ? "border-cyan-400 bg-cyan-500/10 shadow-sm"
+                                          : "border-zinc-800/80 bg-zinc-900/60 hover:border-zinc-700 hover:bg-zinc-900"
+                                      }`}
+                                    >
+                                      <div className="flex items-center justify-between text-[10px] text-zinc-400 mb-1">
+                                        <span className="font-mono font-bold text-zinc-300">
+                                          #{idx + 1} [{formatTimePrecise(cue.start)} - {formatTimePrecise(cue.end)}]
+                                        </span>
+                                        <span className="font-mono text-cyan-400">
+                                          {(cue.end - cue.start).toFixed(2)}s
+                                        </span>
+                                      </div>
+                                      <p className="line-clamp-2 font-medium text-zinc-200">{cue.text}</p>
+                                    </div>
+                                  );
+                                })}
+                            </div>
+                          </div>
+                        </ToolSection>
 
-              {selectedEditorContext === "keyword" && selectedEvent && (
-                <div className="space-y-3">
-                  <div>
-                    <label htmlFor="inspector_keyword_text">Teks Keyword</label>
-                    <input
-                      id="inspector_keyword_text"
-                      value={selectedEvent.text || ""}
-                      onChange={(event) => {
-                        const text = sanitizeKeywordInput(event.target.value);
-                        replaceEvent(selectedEvent.id || "", { text });
-                      }}
-                    />
-                  </div>
-                  <button
-                    className="rounded-lg bg-red-900/40 text-red-300 border border-red-800/60 w-full py-1.5 text-xs font-bold"
-                    onClick={() => deleteEvent(selectedEvent.id || "")}
-                    type="button"
-                  >
-                    Hapus Keyword
-                  </button>
-                </div>
-              )}
+                        {selectedCaption && (
+                          <ToolSection title="Active Cue Editor">
+                            <div className="space-y-3">
+                              <div>
+                                <label htmlFor="inspector_active_caption_text">Teks Cue Terpilih</label>
+                                <textarea
+                                  className="min-h-16 w-full text-xs"
+                                  id="inspector_active_caption_text"
+                                  onBlur={finishSelectedCaptionTextEdit}
+                                  onChange={(event) => updateSelectedCaptionText(event.target.value)}
+                                  value={selectedCaption.text || ""}
+                                />
+                              </div>
 
-              {selectedEditorContext === "effect" && selectedEvent && (
-                <div className="space-y-3">
-                  {selectedEvent.type === "punch_zoom" && (
-                    <div>
-                      <label htmlFor="inspector_punch_zoom">Zoom Level</label>
-                      <input
-                        id="inspector_punch_zoom"
-                        max={1.18}
-                        min={1.01}
-                        step={0.01}
-                        type="number"
-                        value={selectedEvent.zoom || 1.1}
-                        onChange={(event) =>
-                          replaceEvent(selectedEvent.id || "", {
-                            zoom: Number(Number(event.target.value).toFixed(2)),
-                          })
-                        }
-                      />
-                    </div>
-                  )}
-                  {selectedEvent.type === "pattern_interrupt" && (
-                    <div>
-                      <label htmlFor="inspector_pattern_effect">Effect Type</label>
-                      <select
-                        id="inspector_pattern_effect"
-                        value={selectedEvent.effect || "quick_zoom_shift"}
-                        onChange={(event) =>
-                          replaceEvent(selectedEvent.id || "", { effect: event.target.value })
-                        }
-                      >
-                        <option value="quick_zoom_shift">quick_zoom_shift</option>
-                        <option value="flash_cut">flash_cut</option>
-                      </select>
-                    </div>
-                  )}
-                  <button
-                    className="rounded-lg bg-red-900/40 text-red-300 border border-red-800/60 w-full py-1.5 text-xs font-bold"
-                    onClick={() => deleteEvent(selectedEvent.id || "")}
-                    type="button"
-                  >
-                    Hapus Event
-                  </button>
-                </div>
-              )}
-            </ToolSection>
-          )}
+                              <div className="grid grid-cols-3 gap-1.5 text-[11px]">
+                                <div className="rounded-lg bg-zinc-800/80 p-2">
+                                  <span className="block text-[10px] text-zinc-500">Mulai</span>
+                                  <p className="font-mono font-bold text-zinc-100">
+                                    {formatTimePrecise(selectedCaption.start)}
+                                  </p>
+                                </div>
+                                <div className="rounded-lg bg-zinc-800/80 p-2">
+                                  <span className="block text-[10px] text-zinc-500">Selesai</span>
+                                  <p className="font-mono font-bold text-zinc-100">
+                                    {formatTimePrecise(selectedCaption.end)}
+                                  </p>
+                                </div>
+                                <div className="rounded-lg bg-zinc-800/80 p-2">
+                                  <span className="block text-[10px] text-zinc-500">Durasi</span>
+                                  <p className="font-mono font-bold text-cyan-300">
+                                    {selectedCaptionDuration.toFixed(2)}s
+                                  </p>
+                                </div>
+                              </div>
+
+                              <div className="flex items-center justify-between text-[11px] text-zinc-400 px-1">
+                                <span>
+                                  Kata: <strong className="text-zinc-200">{selectedCaptionWordCount}</strong>
+                                </span>
+                                <span>
+                                  Karakter: <strong className="text-zinc-200">{selectedCaptionCharacterCount}</strong>
+                                </span>
+                              </div>
+
+                              <div className="grid grid-cols-2 gap-2 pt-1">
+                                <button
+                                  className="btn-secondary px-3 py-1.5 text-xs font-bold"
+                                  onClick={reflowSelectedCaption}
+                                  type="button"
+                                >
+                                  Rapikan Cue
+                                </button>
+                                <button
+                                  className="rounded-lg border border-red-800/60 bg-red-900/40 px-3 py-1.5 text-xs font-bold text-red-300 hover:bg-red-900/60"
+                                  onClick={deleteSelectedCaptionCue}
+                                  type="button"
+                                >
+                                  Hapus Cue
+                                </button>
+                              </div>
+                            </div>
+                          </ToolSection>
+                        )}
+                      </>
+                    )}
+
+                    {/* TAB 2: TEXT (Sub-tabs: Basic | Templates | Effects) */}
+                    {captionInspectorTab === "text" && (
+                      <>
+                        {/* Sub-tab Pill Strip */}
+                        <div className="flex items-center gap-1 rounded-xl bg-zinc-900/90 p-1 border border-zinc-800/80">
+                          {(
+                            [
+                              { id: "basic", label: "Basic" },
+                              { id: "templates", label: "Templates" },
+                              { id: "effects", label: "Effects" },
+                            ] as const
+                          ).map((sub) => (
+                            <button
+                              key={sub.id}
+                              type="button"
+                              onClick={() => setCaptionTextSubTab(sub.id)}
+                              className={`flex-1 rounded-lg py-1 text-xs font-bold transition ${
+                                captionTextSubTab === sub.id
+                                  ? "bg-cyan-500/20 text-cyan-300 shadow-sm"
+                                  : "text-zinc-400 hover:text-zinc-200"
+                              }`}
+                            >
+                              {sub.label}
+                            </button>
+                          ))}
+                        </div>
+
+                        {/* Global Apply Banner */}
+                        <label className="flex items-center justify-between gap-2 cursor-pointer text-xs font-bold text-zinc-200 bg-zinc-900/90 p-2.5 rounded-xl border border-zinc-800 shadow-sm">
+                          <span className="flex items-center gap-1.5">
+                            <span className="text-cyan-400">✨</span>
+                            <span>Apply to all main captions</span>
+                          </span>
+                          <input
+                            type="checkbox"
+                            checked={captionApplyToAll}
+                            onChange={(e) => setCaptionApplyToAll(e.target.checked)}
+                            className="accent-cyan-400 h-4 w-4 rounded cursor-pointer"
+                          />
+                        </label>
+
+                        {/* Sub-tab 1: BASIC TYPOGRAPHY CONTROLS */}
+                        {captionTextSubTab === "basic" && (
+                          <ToolSection title="Typography & Colors">
+                            <div className="space-y-3.5">
+                              {selectedCaption && (
+                                <div>
+                                  <label htmlFor="caption_text_quick_edit">Teks Cue Terpilih</label>
+                                  <textarea
+                                    className="min-h-16 w-full text-xs font-medium"
+                                    id="caption_text_quick_edit"
+                                    onBlur={finishSelectedCaptionTextEdit}
+                                    onChange={(event) => updateSelectedCaptionText(event.target.value)}
+                                    value={selectedCaption.text || ""}
+                                  />
+                                </div>
+                              )}
+
+                              {/* Font Family */}
+                              <div>
+                                <label htmlFor="caption_font_family">Font Family</label>
+                                <select
+                                  id="caption_font_family"
+                                  value={mainCaptionStyle.font_family}
+                                  onChange={(e) => updateMainCaptionStyle({ font_family: e.target.value })}
+                                >
+                                  <option value="Inter, sans-serif">Inter (Clean Modern)</option>
+                                  <option value="Montserrat, sans-serif">Montserrat (Bold Viral)</option>
+                                  <option value="Impact, Montserrat, sans-serif">Impact (Big Impact)</option>
+                                  <option value="Oswald, sans-serif">Oswald (Compact Bold)</option>
+                                  <option value="Georgia, serif">Georgia (Classic Serif)</option>
+                                  <option value="'Playfair Display', serif">Playfair Display (Elegant)</option>
+                                  <option value="'Bebas Neue', sans-serif">Bebas Neue (Headline)</option>
+                                  <option value="system-ui, sans-serif">System Sans</option>
+                                </select>
+                              </div>
+
+                              {/* Font Size & Weight */}
+                              <div className="grid grid-cols-2 gap-2">
+                                <div>
+                                  <div className="flex items-center justify-between text-xs mb-1">
+                                    <label htmlFor="caption_font_size_slider">Ukuran Font</label>
+                                    <span className="font-mono text-cyan-300 font-bold">
+                                      {mainCaptionStyle.font_size}px
+                                    </span>
+                                  </div>
+                                  <input
+                                    id="caption_font_size_slider"
+                                    type="range"
+                                    min="12"
+                                    max="44"
+                                    step="1"
+                                    value={mainCaptionStyle.font_size}
+                                    onChange={(e) => updateMainCaptionStyle({ font_size: Number(e.target.value) })}
+                                    className="w-full accent-cyan-400"
+                                  />
+                                </div>
+                                <div>
+                                  <label htmlFor="caption_font_weight_select">Ketebalan</label>
+                                  <select
+                                    id="caption_font_weight_select"
+                                    value={mainCaptionStyle.font_weight}
+                                    onChange={(e) => updateMainCaptionStyle({ font_weight: e.target.value })}
+                                  >
+                                    <option value="400">Normal (400)</option>
+                                    <option value="600">Semi Bold (600)</option>
+                                    <option value="700">Bold (700)</option>
+                                    <option value="800">Extra Bold (800)</option>
+                                    <option value="900">Black (900)</option>
+                                  </select>
+                                </div>
+                              </div>
+
+                              {/* Style Buttons (Bold / Italic / Underline / Case Mode) */}
+                              <div className="flex items-center gap-1 pt-1">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    updateMainCaptionStyle({
+                                      font_weight: mainCaptionStyle.font_weight === "800" ? "400" : "800",
+                                    })
+                                  }
+                                  className={`flex-1 rounded-lg py-1.5 text-xs font-black transition border ${
+                                    mainCaptionStyle.font_weight === "800" || mainCaptionStyle.font_weight === "900"
+                                      ? "border-cyan-400 bg-cyan-500/20 text-cyan-300"
+                                      : "border-zinc-800 bg-zinc-900 text-zinc-400"
+                                  }`}
+                                  title="Tebal (Bold)"
+                                >
+                                  B
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => updateMainCaptionStyle({ italic: !mainCaptionStyle.italic })}
+                                  className={`flex-1 rounded-lg py-1.5 text-xs font-serif italic transition border ${
+                                    mainCaptionStyle.italic
+                                      ? "border-cyan-400 bg-cyan-500/20 text-cyan-300"
+                                      : "border-zinc-800 bg-zinc-900 text-zinc-400"
+                                  }`}
+                                  title="Miring (Italic)"
+                                >
+                                  I
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => updateMainCaptionStyle({ underline: !mainCaptionStyle.underline })}
+                                  className={`flex-1 rounded-lg py-1.5 text-xs underline transition border ${
+                                    mainCaptionStyle.underline
+                                      ? "border-cyan-400 bg-cyan-500/20 text-cyan-300"
+                                      : "border-zinc-800 bg-zinc-900 text-zinc-400"
+                                  }`}
+                                  title="Garis Bawah (Underline)"
+                                >
+                                  U
+                                </button>
+                                {(
+                                  [
+                                    { mode: "none", label: "Normal" },
+                                    { mode: "uppercase", label: "TT" },
+                                    { mode: "lowercase", label: "tt" },
+                                    { mode: "title", label: "Tt" },
+                                  ] as const
+                                ).map((item) => (
+                                  <button
+                                    key={item.mode}
+                                    type="button"
+                                    onClick={() => updateMainCaptionStyle({ case_mode: item.mode })}
+                                    className={`flex-1 rounded-lg py-1.5 text-[11px] font-bold transition border ${
+                                      mainCaptionStyle.case_mode === item.mode
+                                        ? "border-cyan-400 bg-cyan-500/20 text-cyan-300"
+                                        : "border-zinc-800 bg-zinc-900 text-zinc-400"
+                                    }`}
+                                    title={`Format huruf: ${item.label}`}
+                                  >
+                                    {item.label}
+                                  </button>
+                                ))}
+                              </div>
+
+                              {/* Color Controls */}
+                              <div>
+                                <label htmlFor="caption_primary_color">Warna Teks Utama</label>
+                                <div className="flex items-center gap-2">
+                                  <input
+                                    className="h-8 w-10 cursor-pointer rounded border-0 bg-transparent p-0"
+                                    id="caption_primary_color"
+                                    type="color"
+                                    value={mainCaptionStyle.color}
+                                    onChange={(event) =>
+                                      updateMainCaptionStyle({ color: event.target.value })
+                                    }
+                                  />
+                                  <input
+                                    className="flex-1 font-mono text-xs"
+                                    type="text"
+                                    value={mainCaptionStyle.color}
+                                    onChange={(event) =>
+                                      updateMainCaptionStyle({ color: event.target.value })
+                                    }
+                                  />
+                                </div>
+                              </div>
+
+                              {/* Stroke / Outline */}
+                              <div className="space-y-2 border-t border-zinc-800/80 pt-2.5">
+                                <label className="flex items-center gap-2 cursor-pointer text-xs text-zinc-300">
+                                  <input
+                                    checked={mainCaptionStyle.stroke_enabled}
+                                    className="rounded border-zinc-700 bg-zinc-800 text-cyan-500 focus:ring-cyan-400"
+                                    type="checkbox"
+                                    onChange={(event) =>
+                                      updateMainCaptionStyle({ stroke_enabled: event.target.checked })
+                                    }
+                                  />
+                                  <span className="font-bold">Garis Luar (Stroke / Outline)</span>
+                                </label>
+                                {mainCaptionStyle.stroke_enabled && (
+                                  <div className="space-y-2 pl-6 pt-1">
+                                    <div className="flex items-center gap-2">
+                                      <input
+                                        className="h-7 w-9 cursor-pointer rounded border-0 bg-transparent p-0"
+                                        type="color"
+                                        value={mainCaptionStyle.stroke_color}
+                                        onChange={(e) => updateMainCaptionStyle({ stroke_color: e.target.value })}
+                                      />
+                                      <input
+                                        className="flex-1 font-mono text-xs"
+                                        type="text"
+                                        value={mainCaptionStyle.stroke_color}
+                                        onChange={(e) => updateMainCaptionStyle({ stroke_color: e.target.value })}
+                                      />
+                                    </div>
+                                    <div>
+                                      <div className="flex items-center justify-between text-[11px] text-zinc-400 mb-1">
+                                        <span>Ketebalan Stroke</span>
+                                        <span className="font-mono text-zinc-200">{mainCaptionStyle.stroke_width}px</span>
+                                      </div>
+                                      <input
+                                        type="range"
+                                        min="1"
+                                        max="8"
+                                        step="0.5"
+                                        value={mainCaptionStyle.stroke_width}
+                                        onChange={(e) => updateMainCaptionStyle({ stroke_width: Number(e.target.value) })}
+                                        className="w-full accent-cyan-400"
+                                      />
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+
+                              {/* Shadow */}
+                              <div className="space-y-2 border-t border-zinc-800/80 pt-2.5">
+                                <label className="flex items-center gap-2 cursor-pointer text-xs text-zinc-300">
+                                  <input
+                                    checked={mainCaptionStyle.shadow_enabled}
+                                    className="rounded border-zinc-700 bg-zinc-800 text-cyan-500 focus:ring-cyan-400"
+                                    type="checkbox"
+                                    onChange={(event) =>
+                                      updateMainCaptionStyle({ shadow_enabled: event.target.checked })
+                                    }
+                                  />
+                                  <span className="font-bold">Bayangan (Shadow)</span>
+                                </label>
+                                {mainCaptionStyle.shadow_enabled && (
+                                  <div className="space-y-2 pl-6 pt-1">
+                                    <div>
+                                      <div className="flex items-center justify-between text-[11px] text-zinc-400 mb-1">
+                                        <span>Radius Blur</span>
+                                        <span className="font-mono text-zinc-200">{mainCaptionStyle.shadow_blur}px</span>
+                                      </div>
+                                      <input
+                                        type="range"
+                                        min="0"
+                                        max="20"
+                                        step="1"
+                                        value={mainCaptionStyle.shadow_blur}
+                                        onChange={(e) => updateMainCaptionStyle({ shadow_blur: Number(e.target.value) })}
+                                        className="w-full accent-cyan-400"
+                                      />
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+
+                              {/* Background Box */}
+                              <div className="space-y-2 border-t border-zinc-800/80 pt-2.5">
+                                <label className="flex items-center gap-2 cursor-pointer text-xs text-zinc-300">
+                                  <input
+                                    checked={mainCaptionStyle.background_enabled}
+                                    className="rounded border-zinc-700 bg-zinc-800 text-cyan-500 focus:ring-cyan-400"
+                                    type="checkbox"
+                                    onChange={(event) =>
+                                      updateMainCaptionStyle({ background_enabled: event.target.checked })
+                                    }
+                                  />
+                                  <span className="font-bold">Latar Belakang (Background Box)</span>
+                                </label>
+                                {mainCaptionStyle.background_enabled && (
+                                  <div className="space-y-2 pl-6 pt-1">
+                                    <div className="flex items-center gap-2">
+                                      <input
+                                        className="h-7 w-9 cursor-pointer rounded border-0 bg-transparent p-0"
+                                        type="color"
+                                        value={mainCaptionStyle.background_color}
+                                        onChange={(e) => updateMainCaptionStyle({ background_color: e.target.value })}
+                                      />
+                                      <input
+                                        className="flex-1 font-mono text-xs"
+                                        type="text"
+                                        value={mainCaptionStyle.background_color}
+                                        onChange={(e) => updateMainCaptionStyle({ background_color: e.target.value })}
+                                      />
+                                    </div>
+                                    <div>
+                                      <div className="flex items-center justify-between text-[11px] text-zinc-400 mb-1">
+                                        <span>Transparansi Latar</span>
+                                        <span className="font-mono text-zinc-200">
+                                          {Math.round(mainCaptionStyle.background_opacity * 100)}%
+                                        </span>
+                                      </div>
+                                      <input
+                                        type="range"
+                                        min="0.1"
+                                        max="1"
+                                        step="0.05"
+                                        value={mainCaptionStyle.background_opacity}
+                                        onChange={(e) => updateMainCaptionStyle({ background_opacity: Number(e.target.value) })}
+                                        className="w-full accent-cyan-400"
+                                      />
+                                    </div>
+                                    <div>
+                                      <div className="flex items-center justify-between text-[11px] text-zinc-400 mb-1">
+                                        <span>Sudut Membulat (Radius)</span>
+                                        <span className="font-mono text-zinc-200">{mainCaptionStyle.background_radius}px</span>
+                                      </div>
+                                      <input
+                                        type="range"
+                                        min="0"
+                                        max="20"
+                                        step="1"
+                                        value={mainCaptionStyle.background_radius}
+                                        onChange={(e) => updateMainCaptionStyle({ background_radius: Number(e.target.value) })}
+                                        className="w-full accent-cyan-400"
+                                      />
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          </ToolSection>
+                        )}
+
+                        {/* Sub-tab 2: TEMPLATES LIBRARY */}
+                        {captionTextSubTab === "templates" && (
+                          <ToolSection title="Template Caption Library (20+ Presets)">
+                            <div className="space-y-3">
+                              {/* Category Tabs */}
+                              <div className="flex items-center gap-1 overflow-x-auto no-scrollbar pb-1">
+                                {(
+                                  [
+                                    "All",
+                                    "Trending",
+                                    "Karaoke",
+                                    "Clean",
+                                    "News",
+                                    "Social",
+                                    "Classic",
+                                    "Effects",
+                                  ] as const
+                                ).map((cat) => (
+                                  <button
+                                    key={cat}
+                                    type="button"
+                                    onClick={() => setCaptionTemplateCategory(cat)}
+                                    className={`shrink-0 rounded-full px-2.5 py-0.5 text-[10px] font-bold transition ${
+                                      captionTemplateCategory === cat
+                                        ? "bg-cyan-400 text-zinc-950 font-black shadow-sm"
+                                        : "bg-zinc-800/80 text-zinc-400 hover:text-zinc-200"
+                                    }`}
+                                  >
+                                    {cat}
+                                  </button>
+                                ))}
+                              </div>
+
+                              {/* Templates Grid */}
+                              <div className="grid grid-cols-2 gap-2 max-h-96 overflow-y-auto pr-1">
+                                {CAPTION_TEMPLATES.filter((tpl) =>
+                                  captionTemplateCategory === "All" ? true : tpl.category === captionTemplateCategory,
+                                ).map((tpl) => {
+                                  const isSelected = mainCaptionStyle.preset_id === tpl.id;
+                                  return (
+                                    <div
+                                      key={tpl.id}
+                                      onClick={() => {
+                                        updateMainCaptionStyle(tpl.stylePatch);
+                                        setMessage(`Template "${tpl.name}" diterapkan.`);
+                                      }}
+                                      className={`group cursor-pointer rounded-xl border p-2.5 transition flex flex-col justify-between ${
+                                        isSelected
+                                          ? "border-cyan-400 bg-cyan-500/10 shadow-md ring-1 ring-cyan-400"
+                                          : "border-zinc-800 bg-[#22252a] hover:border-zinc-600 hover:bg-[#282b30]"
+                                      }`}
+                                    >
+                                      <div className="flex items-center justify-between mb-1.5">
+                                        <span className="text-[11px] font-bold text-zinc-200 truncate">
+                                          {tpl.name}
+                                        </span>
+                                        {tpl.badge && (
+                                          <span
+                                            className={`rounded px-1 py-0.2 text-[8px] font-black uppercase ${
+                                              tpl.badge === "Karaoke"
+                                                ? "bg-amber-400/20 text-amber-300"
+                                                : tpl.badge === "Viral"
+                                                ? "bg-rose-400/20 text-rose-300"
+                                                : "bg-cyan-400/20 text-cyan-300"
+                                            }`}
+                                          >
+                                            {tpl.badge}
+                                          </span>
+                                        )}
+                                      </div>
+
+                                      {/* Visual Preview Box */}
+                                      <div
+                                        className="h-12 rounded-lg bg-zinc-950/80 flex items-center justify-center p-1 text-center overflow-hidden border border-zinc-800/60"
+                                      >
+                                        <span
+                                          style={{
+                                            color: tpl.stylePatch.color || "#FFFFFF",
+                                            fontFamily: tpl.stylePatch.font_family,
+                                            fontWeight: tpl.stylePatch.font_weight || "800",
+                                            fontStyle: tpl.stylePatch.italic ? "italic" : "normal",
+                                            textTransform: tpl.stylePatch.case_mode === "uppercase" ? "uppercase" : "none",
+                                            WebkitTextStroke: tpl.stylePatch.stroke_enabled
+                                              ? `${tpl.stylePatch.stroke_width || 1}px ${tpl.stylePatch.stroke_color || "#000"}`
+                                              : undefined,
+                                            textShadow: tpl.stylePatch.shadow_enabled
+                                              ? `0 2px 4px ${tpl.stylePatch.shadow_color || "rgba(0,0,0,0.8)"}`
+                                              : undefined,
+                                            backgroundColor: tpl.stylePatch.background_enabled
+                                              ? tpl.stylePatch.background_color || "#000"
+                                              : "transparent",
+                                            borderRadius: tpl.stylePatch.background_enabled ? 4 : 0,
+                                            padding: tpl.stylePatch.background_enabled ? "2px 6px" : 0,
+                                            fontSize: 11,
+                                            lineHeight: 1.1,
+                                          }}
+                                          className="line-clamp-2"
+                                        >
+                                          {tpl.previewText}
+                                        </span>
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          </ToolSection>
+                        )}
+
+                        {/* Sub-tab 3: EFFECTS */}
+                        {captionTextSubTab === "effects" && (
+                          <ToolSection title="Efek Teks Caption">
+                            <div className="grid grid-cols-2 gap-2">
+                              {[
+                                {
+                                  id: "karaoke_highlight",
+                                  label: "Karaoke Highlight",
+                                  icon: "🎤",
+                                  patch: {
+                                    karaoke_enabled: true,
+                                    karaoke_mode: "word" as const,
+                                    color: "#FFFFFF",
+                                    karaoke_active_color: "#FACC15",
+                                    stroke_enabled: true,
+                                    stroke_color: "#000000",
+                                    stroke_width: 2.5,
+                                  },
+                                },
+                                {
+                                  id: "word_pop",
+                                  label: "Word Pop",
+                                  icon: "💥",
+                                  patch: {
+                                    effect: "word_pop",
+                                    animation_in: "pop_in",
+                                    font_weight: "900",
+                                    color: "#FEF08A",
+                                    stroke_enabled: true,
+                                    stroke_color: "#000000",
+                                    stroke_width: 3,
+                                  },
+                                },
+                                {
+                                  id: "glow_cyan",
+                                  label: "Glow Cyan",
+                                  icon: "💡",
+                                  patch: {
+                                    effect: "neon",
+                                    color: "#67E8F9",
+                                    shadow_enabled: true,
+                                    shadow_color: "#06B6D4",
+                                    shadow_blur: 14,
+                                    stroke_enabled: true,
+                                    stroke_color: "#083344",
+                                    stroke_width: 1.5,
+                                  },
+                                },
+                                {
+                                  id: "stroke_bold",
+                                  label: "Stroke Bold",
+                                  icon: "🔲",
+                                  patch: {
+                                    stroke_enabled: true,
+                                    stroke_width: 4,
+                                    stroke_color: "#000000",
+                                    font_weight: "900",
+                                  },
+                                },
+                                {
+                                  id: "box_highlight",
+                                  label: "Box Highlight",
+                                  icon: "📦",
+                                  patch: {
+                                    background_enabled: true,
+                                    background_color: "#000000",
+                                    background_opacity: 0.8,
+                                    background_radius: 8,
+                                    color: "#FFFFFF",
+                                  },
+                                },
+                                {
+                                  id: "neon_purple",
+                                  label: "Neon Purple",
+                                  icon: "⚡",
+                                  patch: {
+                                    effect: "neon",
+                                    color: "#E879F9",
+                                    shadow_enabled: true,
+                                    shadow_color: "#A855F7",
+                                    shadow_blur: 12,
+                                  },
+                                },
+                                {
+                                  id: "typewriter",
+                                  label: "Typewriter",
+                                  icon: "⌨️",
+                                  patch: {
+                                    animation_in: "typewriter",
+                                    font_family: "Inter, sans-serif",
+                                  },
+                                },
+                                {
+                                  id: "fade_in_out",
+                                  label: "Fade In / Out",
+                                  icon: "🌫️",
+                                  patch: {
+                                    animation_in: "fade_in",
+                                    animation_out: "fade_out",
+                                  },
+                                },
+                              ].map((fx) => (
+                                <div
+                                  key={fx.id}
+                                  onClick={() => {
+                                    updateMainCaptionStyle(fx.patch);
+                                    setMessage(`Efek "${fx.label}" diterapkan.`);
+                                  }}
+                                  className="cursor-pointer rounded-xl border border-zinc-800 bg-[#22252a] p-2.5 transition hover:border-cyan-500/60 hover:bg-[#282b30]"
+                                >
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="text-base">{fx.icon}</span>
+                                    <p className="text-xs font-bold text-zinc-200">{fx.label}</p>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </ToolSection>
+                        )}
+                      </>
+                    )}
+
+                    {/* TAB 3: ANIMATION (Sub-tabs: In | Out | Loop | Captions) */}
+                    {captionInspectorTab === "animation" && (
+                      <>
+                        <div className="flex items-center gap-1 rounded-xl bg-zinc-900/90 p-1 border border-zinc-800/80">
+                          {(
+                            [
+                              { id: "in", label: "In" },
+                              { id: "out", label: "Out" },
+                              { id: "loop", label: "Loop" },
+                              { id: "captions", label: "Captions" },
+                            ] as const
+                          ).map((sub) => (
+                            <button
+                              key={sub.id}
+                              type="button"
+                              onClick={() => setCaptionAnimationSubTab(sub.id)}
+                              className={`flex-1 rounded-lg py-1 text-xs font-bold transition ${
+                                captionAnimationSubTab === sub.id
+                                  ? "bg-cyan-500/20 text-cyan-300 shadow-sm"
+                                  : "text-zinc-400 hover:text-zinc-200"
+                              }`}
+                            >
+                              {sub.label}
+                            </button>
+                          ))}
+                        </div>
+
+                        {captionAnimationSubTab === "in" && (
+                          <ToolSection title="In Animation">
+                            <div className="grid grid-cols-2 gap-2">
+                              {[
+                                { id: "none", label: "None" },
+                                { id: "fade_in", label: "Fade In" },
+                                { id: "slide_up", label: "Slide Up" },
+                                { id: "pop_in", label: "Pop In" },
+                                { id: "typewriter", label: "Typewriter" },
+                                { id: "zoom_in", label: "Zoom In" },
+                              ].map((anim) => (
+                                <button
+                                  key={anim.id}
+                                  type="button"
+                                  onClick={() => {
+                                    updateMainCaptionStyle({ animation_in: anim.id });
+                                    setMessage(`Animasi Masuk "${anim.label}" aktif.`);
+                                  }}
+                                  className={`rounded-xl border p-2 text-xs font-bold transition text-left ${
+                                    mainCaptionStyle.animation_in === anim.id
+                                      ? "border-cyan-400 bg-cyan-500/20 text-cyan-300"
+                                      : "border-zinc-800 bg-[#22252a] text-zinc-300 hover:border-zinc-700"
+                                  }`}
+                                >
+                                  {anim.label}
+                                </button>
+                              ))}
+                            </div>
+                          </ToolSection>
+                        )}
+
+                        {captionAnimationSubTab === "out" && (
+                          <ToolSection title="Out Animation">
+                            <div className="grid grid-cols-2 gap-2">
+                              {[
+                                { id: "none", label: "None" },
+                                { id: "fade_out", label: "Fade Out" },
+                                { id: "slide_down", label: "Slide Down" },
+                                { id: "pop_out", label: "Pop Out" },
+                              ].map((anim) => (
+                                <button
+                                  key={anim.id}
+                                  type="button"
+                                  onClick={() => {
+                                    updateMainCaptionStyle({ animation_out: anim.id });
+                                    setMessage(`Animasi Keluar "${anim.label}" aktif.`);
+                                  }}
+                                  className={`rounded-xl border p-2 text-xs font-bold transition text-left ${
+                                    mainCaptionStyle.animation_out === anim.id
+                                      ? "border-cyan-400 bg-cyan-500/20 text-cyan-300"
+                                      : "border-zinc-800 bg-[#22252a] text-zinc-300 hover:border-zinc-700"
+                                  }`}
+                                >
+                                  {anim.label}
+                                </button>
+                              ))}
+                            </div>
+                          </ToolSection>
+                        )}
+
+                        {captionAnimationSubTab === "loop" && (
+                          <ToolSection title="Loop Animation">
+                            <div className="grid grid-cols-2 gap-2">
+                              {[
+                                { id: "none", label: "None" },
+                                { id: "pulse", label: "Pulse" },
+                                { id: "subtle_bounce", label: "Subtle Bounce" },
+                                { id: "glow_pulse", label: "Glow Pulse" },
+                                { id: "karaoke_pulse", label: "Karaoke Pulse" },
+                              ].map((anim) => (
+                                <button
+                                  key={anim.id}
+                                  type="button"
+                                  onClick={() => {
+                                    updateMainCaptionStyle({ animation_loop: anim.id });
+                                    setMessage(`Animasi Loop "${anim.label}" aktif.`);
+                                  }}
+                                  className={`rounded-xl border p-2 text-xs font-bold transition text-left ${
+                                    mainCaptionStyle.animation_loop === anim.id
+                                      ? "border-cyan-400 bg-cyan-500/20 text-cyan-300"
+                                      : "border-zinc-800 bg-[#22252a] text-zinc-300 hover:border-zinc-700"
+                                  }`}
+                                >
+                                  {anim.label}
+                                </button>
+                              ))}
+                            </div>
+                          </ToolSection>
+                        )}
+
+                        {captionAnimationSubTab === "captions" && (
+                          <ToolSection title="Karaoke & Caption Synchronization">
+                            <div className="space-y-3.5">
+                              <label className="flex items-center justify-between gap-2 cursor-pointer text-xs font-bold text-zinc-200 bg-zinc-900/90 p-2.5 rounded-xl border border-zinc-800 shadow-sm">
+                                <span className="flex items-center gap-1.5">
+                                  <span className="text-amber-400">🎤</span>
+                                  <span>Karaoke Mode</span>
+                                </span>
+                                <input
+                                  type="checkbox"
+                                  checked={mainCaptionStyle.karaoke_enabled}
+                                  onChange={(e) =>
+                                    updateMainCaptionStyle({ karaoke_enabled: e.target.checked })
+                                  }
+                                  className="accent-cyan-400 h-4 w-4 rounded cursor-pointer"
+                                />
+                              </label>
+
+                              {mainCaptionStyle.karaoke_enabled && (
+                                <div className="space-y-3 pl-1">
+                                  <div>
+                                    <label htmlFor="caption_karaoke_mode_select">Tipe Sorotan Karaoke</label>
+                                    <select
+                                      id="caption_karaoke_mode_select"
+                                      value={mainCaptionStyle.karaoke_mode}
+                                      onChange={(e) =>
+                                        updateMainCaptionStyle({
+                                          karaoke_mode: e.target.value as MainCaptionStyle["karaoke_mode"],
+                                        })
+                                      }
+                                    >
+                                      <option value="word">Kata per Kata (Word by Word)</option>
+                                      <option value="highlight">Kotak Sorotan (Highlight Box)</option>
+                                      <option value="line">Satu Baris (Line Highlight)</option>
+                                    </select>
+                                  </div>
+
+                                  <div className="grid grid-cols-2 gap-2">
+                                    <div>
+                                      <label htmlFor="caption_karaoke_active_color">Warna Kata Aktif</label>
+                                      <div className="flex items-center gap-2">
+                                        <input
+                                          className="h-8 w-10 cursor-pointer rounded border-0 bg-transparent p-0"
+                                          id="caption_karaoke_active_color"
+                                          type="color"
+                                          value={mainCaptionStyle.karaoke_active_color}
+                                          onChange={(e) =>
+                                            updateMainCaptionStyle({ karaoke_active_color: e.target.value })
+                                          }
+                                        />
+                                        <input
+                                          className="flex-1 font-mono text-xs"
+                                          type="text"
+                                          value={mainCaptionStyle.karaoke_active_color}
+                                          onChange={(e) =>
+                                            updateMainCaptionStyle({ karaoke_active_color: e.target.value })
+                                          }
+                                        />
+                                      </div>
+                                    </div>
+
+                                    <div>
+                                      <label htmlFor="caption_karaoke_inactive_color">Warna Kata Lain</label>
+                                      <div className="flex items-center gap-2">
+                                        <input
+                                          className="h-8 w-10 cursor-pointer rounded border-0 bg-transparent p-0"
+                                          id="caption_karaoke_inactive_color"
+                                          type="color"
+                                          value={mainCaptionStyle.karaoke_inactive_color}
+                                          onChange={(e) =>
+                                            updateMainCaptionStyle({ karaoke_inactive_color: e.target.value })
+                                          }
+                                        />
+                                        <input
+                                          className="flex-1 font-mono text-xs"
+                                          type="text"
+                                          value={mainCaptionStyle.karaoke_inactive_color}
+                                          onChange={(e) =>
+                                            updateMainCaptionStyle({ karaoke_inactive_color: e.target.value })
+                                          }
+                                        />
+                                      </div>
+                                    </div>
+                                  </div>
+
+                                  {mainCaptionStyle.karaoke_mode === "highlight" && (
+                                    <div>
+                                      <label htmlFor="caption_karaoke_highlight_color">Warna Kotak Sorotan</label>
+                                      <div className="flex items-center gap-2">
+                                        <input
+                                          className="h-8 w-10 cursor-pointer rounded border-0 bg-transparent p-0"
+                                          id="caption_karaoke_highlight_color"
+                                          type="color"
+                                          value={mainCaptionStyle.karaoke_highlight_color}
+                                          onChange={(e) =>
+                                            updateMainCaptionStyle({ karaoke_highlight_color: e.target.value })
+                                          }
+                                        />
+                                        <input
+                                          className="flex-1 font-mono text-xs"
+                                          type="text"
+                                          value={mainCaptionStyle.karaoke_highlight_color}
+                                          onChange={(e) =>
+                                            updateMainCaptionStyle({ karaoke_highlight_color: e.target.value })
+                                          }
+                                        />
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          </ToolSection>
+                        )}
+                      </>
+                    )}
+
+                    {/* TAB 4: TRACKING (Detailed Spacing, Margins, Alignment) */}
+                    {captionInspectorTab === "tracking" && (
+                      <ToolSection title="Typography Spacing & Margins">
+                        <div className="space-y-3.5">
+                          <div>
+                            <div className="flex items-center justify-between text-xs mb-1">
+                              <label htmlFor="caption_letter_spacing_slider">Letter Spacing (Jarak Huruf)</label>
+                              <span className="font-mono text-cyan-300 font-bold">
+                                {mainCaptionStyle.letter_spacing}px
+                              </span>
+                            </div>
+                            <input
+                              id="caption_letter_spacing_slider"
+                              type="range"
+                              min="-2"
+                              max="10"
+                              step="0.5"
+                              value={mainCaptionStyle.letter_spacing}
+                              onChange={(e) => updateMainCaptionStyle({ letter_spacing: Number(e.target.value) })}
+                              className="w-full accent-cyan-400"
+                            />
+                          </div>
+
+                          <div>
+                            <div className="flex items-center justify-between text-xs mb-1">
+                              <label htmlFor="caption_word_spacing_slider">Word Spacing (Jarak Kata)</label>
+                              <span className="font-mono text-cyan-300 font-bold">
+                                {mainCaptionStyle.word_spacing}px
+                              </span>
+                            </div>
+                            <input
+                              id="caption_word_spacing_slider"
+                              type="range"
+                              min="-2"
+                              max="15"
+                              step="0.5"
+                              value={mainCaptionStyle.word_spacing}
+                              onChange={(e) => updateMainCaptionStyle({ word_spacing: Number(e.target.value) })}
+                              className="w-full accent-cyan-400"
+                            />
+                          </div>
+
+                          <div>
+                            <div className="flex items-center justify-between text-xs mb-1">
+                              <label htmlFor="caption_line_height_slider">Line Height (Jarak Baris)</label>
+                              <span className="font-mono text-cyan-300 font-bold">
+                                {mainCaptionStyle.line_height.toFixed(2)}
+                              </span>
+                            </div>
+                            <input
+                              id="caption_line_height_slider"
+                              type="range"
+                              min="1"
+                              max="2"
+                              step="0.05"
+                              value={mainCaptionStyle.line_height}
+                              onChange={(e) => updateMainCaptionStyle({ line_height: Number(e.target.value) })}
+                              className="w-full accent-cyan-400"
+                            />
+                          </div>
+
+                          <div>
+                            <div className="flex items-center justify-between text-xs mb-1">
+                              <label htmlFor="caption_max_width_slider">Lebar Maksimal Teks</label>
+                              <span className="font-mono text-cyan-300 font-bold">
+                                {mainCaptionStyle.max_width_percent}%
+                              </span>
+                            </div>
+                            <input
+                              id="caption_max_width_slider"
+                              type="range"
+                              min="50"
+                              max="100"
+                              step="2"
+                              value={mainCaptionStyle.max_width_percent}
+                              onChange={(e) => updateMainCaptionStyle({ max_width_percent: Number(e.target.value) })}
+                              className="w-full accent-cyan-400"
+                            />
+                          </div>
+
+                          <div className="grid grid-cols-2 gap-2">
+                            <div>
+                              <label htmlFor="caption_position_select">Posisi Layar</label>
+                              <select
+                                id="caption_position_select"
+                                value={mainCaptionStyle.position}
+                                onChange={(e) =>
+                                  updateMainCaptionStyle({
+                                    position: e.target.value as MainCaptionStyle["position"],
+                                  })
+                                }
+                              >
+                                <option value="bottom">Bawah (Bottom)</option>
+                                <option value="middle">Tengah (Middle)</option>
+                                <option value="top">Atas (Top)</option>
+                              </select>
+                            </div>
+                            <div>
+                              <label htmlFor="caption_align_select">Rata Teks</label>
+                              <select
+                                id="caption_align_select"
+                                value={mainCaptionStyle.align}
+                                onChange={(e) =>
+                                  updateMainCaptionStyle({
+                                    align: e.target.value as MainCaptionStyle["align"],
+                                  })
+                                }
+                              >
+                                <option value="center">Rata Tengah (Center)</option>
+                                <option value="left">Rata Kiri (Left)</option>
+                                <option value="right">Rata Kanan (Right)</option>
+                              </select>
+                            </div>
+                          </div>
+                        </div>
+                      </ToolSection>
+                    )}
+
+                    {/* TAB 5: TTS (Text to Speech Placeholder) */}
+                    {captionInspectorTab === "tts" && (
+                      <ToolSection title="Text to Speech">
+                        <div className="rounded-xl border border-zinc-800 bg-[#202226] p-4 text-center text-xs text-zinc-400">
+                          <p className="font-bold text-zinc-300">Text to Speech</p>
+                          <p className="mt-1 text-[11px] text-zinc-500">
+                            TTS belum aktif. Akan tersedia pada tahap Audio/Voice/TTS.
+                          </p>
+                        </div>
+                      </ToolSection>
+                    )}
+                  </>
+                )}
+
+                {/* 6. EFFECT INSPECTOR */}
+                {inspectorContext === "effect" && (
+                  <>
+                    {effectInspectorTab === "effect" && (
+                      <>
+                        <ToolSection title={selectedEvent?.reason?.startsWith("transition") ? "TRANSITION PARAMETERS" : "Effect Parameters"}>
+                          {selectedEvent ? (
+                            <div className="space-y-3">
+                              <div className="flex items-center justify-between text-xs">
+                                <span className="text-zinc-400">
+                                  {selectedEvent.reason?.startsWith("transition")
+                                    ? "Kategori"
+                                    : "Tipe Efek"}
+                                </span>
+                                <span
+                                  className={`rounded-lg px-2 py-0.5 font-semibold text-[11px] ${
+                                    selectedEvent.reason?.startsWith("transition")
+                                      ? "bg-cyan-500/20 text-cyan-300"
+                                      : "bg-teal-500/20 text-teal-300"
+                                  }`}
+                                >
+                                  {selectedEvent.reason?.startsWith("transition")
+                                    ? `Transisi: ${selectedEvent.reason.replace("transition:", "")}`
+                                    : selectedEvent.type === "punch_zoom"
+                                    ? "Punch Zoom"
+                                    : selectedEvent.type === "pattern_interrupt"
+                                    ? "Pattern Interrupt"
+                                    : selectedEvent.type}
+                                </span>
+                              </div>
+
+                              {selectedEvent.reason?.startsWith("transition") ? (
+                                <div className="space-y-3">
+                                  {selectedTransitionBoundary && (
+                                    <div className="rounded-xl border border-zinc-700/80 bg-[#1c1f24] p-2.5 text-xs text-zinc-300">
+                                      <div className="flex items-center justify-between text-[11px] text-zinc-400 font-semibold mb-1">
+                                        <span>Posisi Sambungan</span>
+                                        <span className="font-mono text-cyan-300 font-bold">
+                                          @ {formatTimePrecise(selectedTransitionBoundary.time)}
+                                        </span>
+                                      </div>
+                                      <div className="flex items-center justify-center gap-2 rounded-lg bg-zinc-800/90 py-1.5 px-2 text-xs font-bold text-zinc-100">
+                                        <span className="rounded bg-blue-500/20 text-blue-300 px-1.5 py-0.5 text-[10px]">
+                                          Klip {selectedTransitionBoundary.beforeSegment.number}
+                                        </span>
+                                        <span className="text-cyan-400">➔</span>
+                                        <span className="rounded bg-blue-500/20 text-blue-300 px-1.5 py-0.5 text-[10px]">
+                                          Klip {selectedTransitionBoundary.afterSegment.number}
+                                        </span>
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  <div>
+                                    <label htmlFor="inspector_trans_type">Jenis Efek Transisi</label>
+                                    <select
+                                      id="inspector_trans_type"
+                                      value={selectedEvent.effect || "fade"}
+                                      onChange={(e) =>
+                                        replaceEvent(selectedEvent.id || "", {
+                                          effect: e.target.value,
+                                          reason: `transition:${e.target.options[e.target.selectedIndex].text}`,
+                                        })
+                                      }
+                                    >
+                                      <option value="fade">Fade Black</option>
+                                      <option value="fade_white">Fade White</option>
+                                      <option value="flash">White Flash</option>
+                                      <option value="cross_dissolve">Cross Dissolve</option>
+                                      <option value="slide_left">Slide Left</option>
+                                      <option value="slide_right">Slide Right</option>
+                                      <option value="slide_up">Slide Up</option>
+                                      <option value="slide_down">Slide Down</option>
+                                      <option value="zoom_in">Zoom In</option>
+                                      <option value="zoom_out">Zoom Out</option>
+                                      <option value="blur_fade">Blur Fade</option>
+                                      <option value="glitch_cut">Glitch Cut</option>
+                                      <option value="wipe_left">Wipe Left</option>
+                                    </select>
+                                  </div>
+
+                                  <div>
+                                    <div className="flex items-center justify-between text-xs font-medium text-zinc-300 mb-1">
+                                      <label htmlFor="inspector_trans_duration">Durasi Transisi</label>
+                                      <span className="font-mono text-cyan-300 font-bold">
+                                        {(selectedEvent.end - selectedEvent.start).toFixed(2)}s
+                                      </span>
+                                    </div>
+                                    <input
+                                      className="w-full accent-cyan-400"
+                                      id="inspector_trans_duration"
+                                      max="1.5"
+                                      min="0.2"
+                                      step="0.05"
+                                      type="range"
+                                      value={Number((selectedEvent.end - selectedEvent.start).toFixed(2))}
+                                      onChange={(event) => {
+                                        const newDur = Number(event.target.value);
+                                        const center = selectedTransitionBoundary
+                                          ? selectedTransitionBoundary.time
+                                          : (selectedEvent.start + selectedEvent.end) / 2;
+                                        const newStart = Number(Math.max(0, center - newDur / 2).toFixed(2));
+                                        const newEnd = Number(Math.min(clipDuration, center + newDur / 2).toFixed(2));
+                                        replaceEvent(selectedEvent.id || "", {
+                                          start: newStart,
+                                          end: newEnd,
+                                        });
+                                      }}
+                                    />
+                                  </div>
+                                </div>
+                              ) : selectedEvent.type === "punch_zoom" ? (
+                                <div>
+                                  <div className="flex items-center justify-between text-xs font-medium text-zinc-300 mb-1">
+                                    <label htmlFor="inspector_punch_level">Zoom Level</label>
+                                    <span className="font-mono text-cyan-300 font-bold">
+                                      {(selectedEvent.zoom || 1.2).toFixed(2)}x
+                                    </span>
+                                  </div>
+                                  <input
+                                    className="w-full accent-cyan-400"
+                                    id="inspector_punch_level"
+                                    max="1.40"
+                                    min="1.05"
+                                    onChange={(event) =>
+                                      replaceEvent(selectedEvent.id || "", {
+                                        zoom: Number(Number(event.target.value).toFixed(2)),
+                                      })
+                                    }
+                                    step="0.01"
+                                    type="range"
+                                    value={selectedEvent.zoom || 1.2}
+                                  />
+                                </div>
+                              ) : selectedEvent.type === "pattern_interrupt" ? (
+                                <div>
+                                  <label htmlFor="inspector_pattern_effect">Jenis Efek Visual</label>
+                                  <select
+                                    id="inspector_pattern_effect"
+                                    onChange={(event) =>
+                                      replaceEvent(selectedEvent.id || "", {
+                                        effect: event.target.value,
+                                      })
+                                    }
+                                    value={selectedEvent.effect || "quick_zoom"}
+                                  >
+                                    <option value="quick_zoom">Quick Zoom</option>
+                                    <option value="flash_cut">Flash Cut</option>
+                                    <option value="light_leak">Light Leak</option>
+                                    <option value="quick_shake">Quick Shake</option>
+                                    <option value="earthquake">Earthquake</option>
+                                    <option value="blur_pulse">Blur Pulse</option>
+                                    <option value="glitch_pop">Glitch Pop</option>
+                                    <option value="digital_noise">Digital Noise</option>
+                                    <option value="freeze_flash">Freeze Flash</option>
+                                  </select>
+                                </div>
+                              ) : null}
+                            </div>
+                          ) : (
+                            <p className="rounded-xl bg-zinc-850 p-3 text-xs text-zinc-400">
+                              Pilih event efek atau transisi di timeline untuk mengatur parameter.
+                            </p>
+                          )}
+                        </ToolSection>
+
+                        {selectedEvent && (
+                          <ToolSection title="Actions">
+                            <button
+                              className="rounded-lg border border-red-800/60 bg-red-900/40 w-full py-1.5 text-xs font-bold text-red-300 hover:bg-red-900/60"
+                              onClick={() => deleteEvent(selectedEvent.id || "")}
+                              type="button"
+                            >
+                              {selectedEvent.reason?.startsWith("transition") ? "Hapus Transisi" : "Hapus Event"}
+                            </button>
+                          </ToolSection>
+                        )}
+                      </>
+                    )}
+
+                    {effectInspectorTab === "timing" && (
+                      <>
+                        <ToolSection title="Effect Timing">
+                          {selectedEvent ? (
+                            <div className="space-y-3">
+                              <div className="grid grid-cols-3 gap-1.5 text-[11px]">
+                                <div className="rounded-lg bg-zinc-800/80 p-2">
+                                  <span className="block text-[10px] text-zinc-500">Mulai</span>
+                                  <p className="font-mono font-bold text-zinc-100">
+                                    {formatTimePrecise(selectedEvent.start)}
+                                  </p>
+                                </div>
+                                <div className="rounded-lg bg-zinc-800/80 p-2">
+                                  <span className="block text-[10px] text-zinc-500">Selesai</span>
+                                  <p className="font-mono font-bold text-zinc-100">
+                                    {formatTimePrecise(selectedEvent.end)}
+                                  </p>
+                                </div>
+                                <div className="rounded-lg bg-zinc-800/80 p-2">
+                                  <span className="block text-[10px] text-zinc-500">Durasi</span>
+                                  <p className="font-mono font-bold text-cyan-300">
+                                    {(selectedEvent.end - selectedEvent.start).toFixed(2)}s
+                                  </p>
+                                </div>
+                              </div>
+                            </div>
+                          ) : (
+                            <p className="rounded-xl bg-zinc-850 p-3 text-xs text-zinc-400">
+                              Pilih event efek di timeline untuk melihat detail timing.
+                            </p>
+                          )}
+                        </ToolSection>
+
+                        {selectedEvent && (
+                          <ToolSection title="Actions">
+                            <button
+                              className="rounded-lg border border-red-800/60 bg-red-900/40 w-full py-1.5 text-xs font-bold text-red-300 hover:bg-red-900/60"
+                              onClick={() => deleteEvent(selectedEvent.id || "")}
+                              type="button"
+                            >
+                              Hapus Event
+                            </button>
+                          </ToolSection>
+                        )}
+                      </>
+                    )}
+                  </>
+                )}
         </aside>
       </div>
 
-      <section
-        className="editor-timeline relative min-h-0 shrink-0 border-t border-zinc-700 bg-[#181a1e] p-3 text-zinc-100 xl:overflow-hidden"
-        style={{ height: `${timelineHeight}px` }}
-        onClick={(event) => {
-          if (event.target !== event.currentTarget) return;
-          setSelectedEventId(null);
-          setSelectedEditorContext("timeline");
-        }}
-      >
+        <section
+          className="editor-timeline relative min-h-0 shrink-0 border-t border-zinc-700 bg-[#181a1e] p-3 text-zinc-100 xl:overflow-hidden"
+          style={{ height: `${timelineHeight}px` }}
+          onClick={(event) => {
+            if (event.target !== event.currentTarget) return;
+            setSelectedEventId(null);
+            setSelectedCaptionId(null);
+            setSelectedMediaSegmentId(null);
+            setSelectedAdditionalAudioTrackId(null);
+            setSelectedEditorContext("details");
+          }}
+        >
         <div
           aria-label="Ubah tinggi timeline"
           aria-orientation="horizontal"
-          aria-valuemax={Math.max(320, window.innerHeight - 280)}
-          aria-valuemin={220}
+          aria-valuemax={Math.max(320, window.innerHeight - 260)}
+          aria-valuemin={180}
           aria-valuenow={Math.round(timelineHeight)}
           className="timeline-resize-handle group absolute -top-1.5 left-0 right-0 z-30 flex h-3 touch-none cursor-ns-resize items-center justify-center"
           onDoubleClick={() => {
             markEditorPreferenceDirty();
-            setTimelineHeight(320);
+            setTimelineHeight(230);
           }}
           onKeyDown={(event) => {
             if (event.key === "ArrowUp") {
@@ -6197,7 +14478,7 @@ return (
             if (event.key === "Home") {
               event.preventDefault();
               markEditorPreferenceDirty();
-              setTimelineHeight(320);
+              setTimelineHeight(230);
             }
           }}
           onPointerCancel={handleTimelineResizeEnd}
@@ -6213,235 +14494,293 @@ return (
             Tarik untuk ubah tinggi
           </span>
         </div>
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div>
-            <h2 className="text-sm font-black text-zinc-100">Timeline</h2>
-            <p className="mt-1 text-xs font-semibold text-zinc-500">
-              Durasi {formatTimeLabel(clipDuration)} - Playhead {formatTimeLabel(previewTime)}
-            </p>
+        {/* TIMELINE TOP TOOLBAR (1-Row CapCut Minimalist) */}
+        <div className="flex h-9 sm:h-10 items-center justify-between gap-2 border-b border-zinc-800/90 pb-1.5 pt-0.5">
+          {/* A. LEFT: Primary Edit Actions */}
+          <div className="flex items-center gap-1 sm:gap-1.5">
+            {/* 1. Add / Insert Element Dropdown */}
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setTimelineAddMenuOpen((open) => !open)}
+                title="Tambah Elemen (Punch Zoom, Keyword, Pattern, Hook)"
+                aria-label="Tambah Elemen"
+                className={`flex h-7 w-7 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-sm sm:text-base font-black transition shadow-sm ${
+                  timelineAddMenuOpen
+                    ? "bg-cyan-400 text-slate-950 shadow-cyan-500/20"
+                    : "bg-[#25282e] text-cyan-300 border border-zinc-700/80 hover:border-cyan-400/80 hover:bg-[#2f333b] hover:text-cyan-200"
+                }`}
+              >
+                +
+              </button>
+              {timelineAddMenuOpen && (
+                <>
+                  <div
+                    className="fixed inset-0 z-40"
+                    onClick={() => setTimelineAddMenuOpen(false)}
+                  />
+                  <div className="absolute left-0 top-9 z-50 w-48 rounded-xl border border-zinc-700/90 bg-[#1e2126] p-1.5 shadow-2xl shadow-black/80 space-y-1">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        addEvent("punch_zoom");
+                        setTimelineAddMenuOpen(false);
+                      }}
+                      className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-xs font-semibold text-zinc-200 hover:bg-zinc-800 hover:text-rose-300 transition"
+                    >
+                      <span className="size-2.5 rounded-full bg-rose-500 shrink-0" />
+                      <span>Punch Zoom</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        addEvent("keyword_popup");
+                        setTimelineAddMenuOpen(false);
+                      }}
+                      className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-xs font-semibold text-zinc-200 hover:bg-zinc-800 hover:text-yellow-300 transition"
+                    >
+                      <span className="size-2.5 rounded-full bg-yellow-400 shrink-0" />
+                      <span>Keyword Popup</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        addEvent("pattern_interrupt");
+                        setTimelineAddMenuOpen(false);
+                      }}
+                      className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-xs font-semibold text-zinc-200 hover:bg-zinc-800 hover:text-teal-300 transition"
+                    >
+                      <span className="size-2.5 rounded-full bg-teal-500 shrink-0" />
+                      <span>Pattern Interrupt</span>
+                    </button>
+                    {!editableEffectTimeline.some((event) => event.type === "hook_text") && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          addEvent("hook_text");
+                          setTimelineAddMenuOpen(false);
+                        }}
+                        className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-xs font-semibold text-zinc-200 hover:bg-zinc-800 hover:text-cyan-300 transition"
+                      >
+                        <span className="size-2.5 rounded-full bg-cyan-400 shrink-0" />
+                        <span>Hook Text</span>
+                      </button>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+
+            {/* 2. History (Undo / Redo) */}
+            <div className="flex items-center rounded-lg border border-zinc-700/80 bg-[#22252a] p-0.5">
+              <button
+                type="button"
+                onClick={undoEditor}
+                disabled={!canUndo}
+                title="Undo (Ctrl+Z)"
+                aria-label="Undo"
+                className="flex h-6 w-6 sm:h-7 sm:w-7 items-center justify-center rounded text-sm font-bold text-zinc-300 hover:bg-zinc-700 hover:text-zinc-100 transition disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+              >
+                ↶
+              </button>
+              <button
+                type="button"
+                onClick={redoEditor}
+                disabled={!canRedo}
+                title="Redo (Ctrl+Shift+Z atau Ctrl+Y)"
+                aria-label="Redo"
+                className="flex h-6 w-6 sm:h-7 sm:w-7 items-center justify-center rounded text-sm font-bold text-zinc-300 hover:bg-zinc-700 hover:text-zinc-100 transition disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+              >
+                ↷
+              </button>
+            </div>
+
+            <span className="h-4 w-px bg-zinc-700/60 mx-0.5" />
+
+            {/* 3. Primary Edit Tool Group (Split, Trim L, Trim R, Delete, Copy, Paste) */}
+            <div className="flex items-center rounded-lg border border-zinc-700/80 bg-[#22252a] p-0.5">
+              <button
+                type="button"
+                onClick={splitSelectedTrack}
+                disabled={!selectedTrackSupportsMediaEditing}
+                title="Split / Bagi item terpilih pada playhead"
+                aria-label="Split"
+                className="flex h-6 w-6 sm:h-7 sm:w-7 items-center justify-center rounded text-sm text-zinc-300 hover:bg-zinc-700 hover:text-cyan-300 transition disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+              >
+                ✂
+              </button>
+              <button
+                type="button"
+                onClick={deleteLeftSelectedTrack}
+                disabled={!selectedTrackSupportsMediaEditing}
+                title="Potong sisi kiri item terpilih hingga playhead"
+                aria-label="Potong sisi kiri"
+                className="flex h-6 w-6 sm:h-7 sm:w-7 items-center justify-center rounded font-mono text-xs sm:text-sm text-zinc-300 hover:bg-zinc-700 hover:text-cyan-300 transition disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+              >
+                ⇤
+              </button>
+              <button
+                type="button"
+                onClick={deleteRightSelectedTrack}
+                disabled={!selectedTrackSupportsMediaEditing}
+                title="Potong sisi kanan item terpilih hingga playhead"
+                aria-label="Potong sisi kanan"
+                className="flex h-6 w-6 sm:h-7 sm:w-7 items-center justify-center rounded font-mono text-xs sm:text-sm text-zinc-300 hover:bg-zinc-700 hover:text-cyan-300 transition disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+              >
+                ⇥
+              </button>
+              <button
+                type="button"
+                onClick={deleteSelectedTrackItem}
+                disabled={!anyTrackSelected}
+                title="Hapus seluruh item terpilih"
+                aria-label="Hapus"
+                className="flex h-6 w-6 sm:h-7 sm:w-7 items-center justify-center rounded text-sm text-red-300 hover:bg-red-950/60 hover:text-red-200 transition disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+              >
+                🗑
+              </button>
+              <span className="h-4 w-px bg-zinc-700/60 mx-0.5" />
+              <button
+                type="button"
+                onClick={copySelectedTrack}
+                disabled={!selectedTrackSupportsMediaEditing}
+                title="Salin item track yang dipilih (Ctrl+C)"
+                aria-label="Copy"
+                className="flex h-6 w-6 sm:h-7 sm:w-7 items-center justify-center rounded text-sm text-zinc-300 hover:bg-zinc-700 hover:text-zinc-100 transition disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+              >
+                📋
+              </button>
+              <button
+                type="button"
+                onClick={pasteSelectedTrack}
+                disabled={!copiedMediaSegment && !copiedTimedItem}
+                title="Tempel item yang disalin pada playhead (Ctrl+V)"
+                aria-label="Paste"
+                className="flex h-6 w-6 sm:h-7 sm:w-7 items-center justify-center rounded text-sm text-zinc-300 hover:bg-zinc-700 hover:text-zinc-100 transition disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+              >
+                📥
+              </button>
+            </div>
+
+            {/* 4. Extract / Merge Audio Icon Button */}
+            {audioExtracted ? (
+              <button
+                type="button"
+                onClick={mergeAudioIntoVideoTrack}
+                title="Gabungkan Audio kembali ke Video"
+                aria-label="Gabungkan Audio"
+                className="flex h-7 w-7 sm:h-8 sm:w-8 items-center justify-center rounded-lg border border-amber-500/40 bg-amber-500/10 text-sm text-amber-300 hover:bg-amber-500/20 transition"
+              >
+                🔗
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={extractAudioTrack}
+                title="Ekstrak Audio dari Video ke track terpisah"
+                aria-label="Ekstrak Audio"
+                className="flex h-7 w-7 sm:h-8 sm:w-8 items-center justify-center rounded-lg border border-cyan-500/40 bg-cyan-500/10 text-sm text-cyan-300 hover:bg-cyan-500/20 transition"
+              >
+                🎵
+              </button>
+            )}
+
+            {timelineError && (
+              <span className="rounded-full bg-red-500/20 px-2 py-0.5 text-xs font-bold text-red-300 truncate max-w-[140px]" title={timelineError}>
+                {timelineError}
+              </span>
+            )}
           </div>
-          <div className="flex flex-wrap items-center justify-end gap-2">
+
+          {/* B. CENTER: Time Summary Pill */}
+          <div className="flex items-center justify-center">
+            <span className="rounded-lg border border-zinc-700/70 bg-[#22252a] px-2.5 py-1 font-mono text-xs font-bold tracking-wider text-cyan-300 shadow-inner">
+              {formatTimeLabel(previewTime)} / {formatTimeLabel(clipDuration)}
+            </span>
+          </div>
+
+          {/* C. RIGHT: View & Zoom Controls */}
+          <div className="flex items-center gap-2">
+            {/* Track Legend Dots */}
+            <div className="hidden lg:flex items-center gap-1.5 rounded-lg border border-zinc-700/50 bg-[#22252a] px-2.5 py-1">
+              <span className="size-2.5 rounded-full bg-cyan-500 cursor-help" title="Track Text" />
+              <span className="size-2.5 rounded-full bg-amber-400 cursor-help" title="Track Overlay" />
+              <span className="size-2.5 rounded-full bg-blue-600 cursor-help" title="Track Video" />
+              <span className="size-2.5 rounded-full bg-emerald-500 cursor-help" title="Track Audio" />
+            </div>
+
+            {/* Theme Toggle (Icon Only) */}
             <button
-              className="theme-toggle rounded-md border border-zinc-700 bg-[#25282d] px-3 py-1.5 text-xs font-bold text-zinc-300 transition hover:border-cyan-400 hover:text-cyan-300"
+              type="button"
               onClick={() => {
                 markEditorPreferenceDirty();
                 setEditorTheme((theme) => (theme === "dark" ? "light" : "dark"));
               }}
-              type="button"
+              title={editorTheme === "dark" ? "Ubah ke Mode Cerah" : "Ubah ke Mode Gelap"}
+              aria-label="Ubah tema editor"
+              className="flex h-7 w-7 sm:h-8 sm:w-8 items-center justify-center rounded-lg border border-zinc-700 bg-[#22252a] text-sm text-zinc-300 hover:border-cyan-400 hover:text-cyan-300 transition"
             >
-              {editorTheme === "dark" ? "☀ Mode cerah" : "☾ Mode gelap"}
+              {editorTheme === "dark" ? "☀" : "☾"}
             </button>
-            <div className="flex flex-wrap gap-2 text-[11px] font-bold text-zinc-400">
-              <span className="inline-flex items-center gap-1">
-                <span className="h-2 w-4 rounded bg-blue-600" /> Video
-              </span>
-              <span className="inline-flex items-center gap-1">
-                <span className="h-2 w-4 rounded bg-emerald-500" /> Audio
-              </span>
-              <span className="inline-flex items-center gap-1">
-                <span className="h-2 w-4 rounded bg-violet-500" /> Caption
-              </span>
-              <span className="inline-flex items-center gap-1">
-                <span className="h-2 w-4 rounded bg-cyan-500" /> Hook
-              </span>
-              <span className="inline-flex items-center gap-1">
-                <span className="h-2 w-4 rounded bg-rose-500" /> Punch
-              </span>
-              <span className="inline-flex items-center gap-1">
-                <span className="h-2 w-4 rounded bg-yellow-300" /> Keyword
-              </span>
-              <span className="inline-flex items-center gap-1">
-                <span className="h-2 w-4 rounded bg-teal-500" /> Pattern
-              </span>
-            </div>
-            {(editorDirty || timelineDirty || isSavingEditor || saveFailure) && (
-              <span
-                className="rounded-full bg-zinc-800 px-3 py-1.5 text-xs font-black text-cyan-300"
-                title={editorSaveStatusTitle}
-              >
-                {editorSaveStatusLabel}
-              </span>
-            )}
-          </div>
-        </div>
-        <div className="mt-2 flex flex-wrap items-center gap-2">
-          <div className="flex items-center gap-1 rounded-md border border-zinc-700 bg-[#22252a] p-1">
-            <button
-              aria-label="Undo perubahan terakhir"
-              className="rounded px-3 py-1 text-xs font-black text-zinc-200 transition hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
-              disabled={!canUndo}
-              onClick={undoEditor}
-              title="Undo (Ctrl+Z)"
-              type="button"
-            >
-              ↶ Undo
-            </button>
-            <button
-              aria-label="Redo perubahan terakhir"
-              className="rounded px-3 py-1 text-xs font-black text-zinc-200 transition hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
-              disabled={!canRedo}
-              onClick={redoEditor}
-              title="Redo (Ctrl+Shift+Z atau Ctrl+Y)"
-              type="button"
-            >
-              ↷ Redo
-            </button>
-          </div>
-          <div className="mr-1 flex items-center gap-1 rounded-md border border-zinc-700 bg-[#22252a] p-1">
-            <button
-              className="rounded bg-cyan-400 px-3 py-1 text-xs font-black text-slate-950 transition hover:bg-cyan-300"
-              onClick={extractAudioTrack}
-              title={
-                audioExtracted
-                  ? "Ekstrak ulang audio dari track Video dan ganti track Audio saat ini"
-                  : "Pisahkan audio dari file klip kerja ke track Audio"
-              }
-              type="button"
-            >
-              Ekstrak Audio
-            </button>
-            {audioExtracted && (
+
+            {/* Zoom Controls (CapCut Style: [ - ] [ Slider (25..400) ] [ + ] [ 100% ]) */}
+            <div className="flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-[#22252a] px-2 h-7 sm:h-8">
               <button
-                className="rounded px-3 py-1 text-xs font-black text-amber-300 transition hover:bg-amber-950/60"
-                onClick={mergeAudioIntoVideoTrack}
-                title="Hapus track Audio terpisah dan gunakan kembali audio bawaan Video"
                 type="button"
+                onClick={() => {
+                  markEditorPreferenceDirty();
+                  updateTimelineZoomPercent((value) => Math.max(25, value - 25));
+                }}
+                disabled={timelineZoomPercent <= 25}
+                title="Perkecil zoom timeline (Zoom Out)"
+                aria-label="Perkecil zoom timeline"
+                className="text-sm font-black text-zinc-400 hover:text-cyan-300 disabled:opacity-30 disabled:pointer-events-none transition px-0.5"
               >
-                Gabungkan Audio
+                −
               </button>
-            )}
-            <button
-              className="rounded px-3 py-1 text-xs font-black text-zinc-200 transition hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
-              disabled={!selectedTrackSupportsMediaEditing}
-              onClick={copySelectedTrack}
-              title="Salin item track yang dipilih"
-              type="button"
-            >
-              Copy
-            </button>
-            <button
-              className="rounded px-3 py-1 text-xs font-black text-zinc-200 transition hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
-              disabled={!copiedMediaSegment && !copiedTimedItem}
-              onClick={pasteSelectedTrack}
-              title="Tempel item yang disalin pada posisi playhead"
-              type="button"
-            >
-              Paste
-            </button>
-            <span className="mx-1 h-4 w-px bg-zinc-700" />
-            <button
-              className="rounded px-3 py-1 text-xs font-black text-zinc-200 transition hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
-              disabled={!selectedTrackSupportsMediaEditing}
-              onClick={splitSelectedTrack}
-              title="Split item yang dipilih pada posisi playhead"
-              type="button"
-            >
-              Split
-            </button>
-            <button
-              className="rounded px-3 py-1 text-xs font-black text-red-300 transition hover:bg-red-950/60 disabled:cursor-not-allowed disabled:opacity-40"
-              disabled={!anyTrackSelected}
-              onClick={deleteSelectedTrackItem}
-              title="Hapus seluruh item track yang dipilih"
-              type="button"
-            >
-              Hapus
-            </button>
-            <button
-              className="rounded px-3 py-1 text-xs font-black text-zinc-200 transition hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
-              disabled={!selectedTrackSupportsMediaEditing}
-              onClick={deleteLeftSelectedTrack}
-              title="Potong sisi kiri item terpilih hingga playhead"
-              type="button"
-            >
-              Hapus kiri
-            </button>
-            <button
-              className="rounded px-3 py-1 text-xs font-black text-zinc-200 transition hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
-              disabled={!selectedTrackSupportsMediaEditing}
-              onClick={deleteRightSelectedTrack}
-              title="Potong sisi kanan item terpilih hingga playhead"
-              type="button"
-            >
-              Hapus kanan
-            </button>
-          </div>
-          <span className="rounded-full bg-cyan-400/10 px-2.5 py-1 text-[10px] font-bold text-cyan-300">
-            {audioExtracted ? "Audio sudah diekstrak • Track mandiri" : "Audio masih menyatu di file klip kerja"}
-          </span>
-          {anyTrackSelected && (
-            <span className="text-[10px] font-semibold text-zinc-400">
-              Tarik handle putih di ujung bagian untuk mengubah durasi.
-            </span>
-          )}
-          <button className="btn-secondary px-3 py-1.5 text-xs" onClick={() => addEvent("punch_zoom")}>
-            + Punch Zoom
-          </button>
-          <button className="btn-secondary px-3 py-1.5 text-xs" onClick={() => addEvent("keyword_popup")}>
-            + Keyword
-          </button>
-          <button className="btn-secondary px-3 py-1.5 text-xs" onClick={() => addEvent("pattern_interrupt")}>
-            + Pattern
-          </button>
-          {!editableEffectTimeline.some((event) => event.type === "hook_text") && (
-            <button className="btn-secondary px-3 py-1.5 text-xs" onClick={() => addEvent("hook_text")}>
-              + Hook Text
-            </button>
-          )}
-          {timelineError && (
-            <span className="rounded-full bg-red-50 px-3 py-1.5 text-xs font-black text-red-700">
-              {timelineError}
-            </span>
-          )}
-          {selectedEvent && (
-            <span className="rounded-full bg-zinc-800 px-3 py-1.5 text-xs font-bold text-zinc-300">
-              Detail event dibuka di panel kanan.
-            </span>
-          )}
-          <div className="ml-auto flex items-center gap-2 rounded-md border border-zinc-700 bg-[#22252a] px-2 py-1">
-            <button
-              className="text-sm font-black text-zinc-400 hover:text-cyan-300"
-              onClick={() => {
-                markEditorPreferenceDirty();
-                setTimelineZoom((value) => Math.max(1, value - 0.5));
-              }}
-              title="Perkecil timeline"
-              type="button"
-            >
-              −
-            </button>
-            <input
-              aria-label="Zoom timeline"
-              className="h-1 w-24 accent-cyan-400"
-              max={4}
-              min={1}
-              onChange={(event) => {
-                markEditorPreferenceDirty();
-                setTimelineZoom(Number(event.target.value));
-              }}
-              step={0.5}
-              type="range"
-              value={timelineZoom}
-            />
-            <button
-              className="text-sm font-black text-zinc-400 hover:text-cyan-300"
-              onClick={() => {
-                markEditorPreferenceDirty();
-                setTimelineZoom((value) => Math.min(4, value + 0.5));
-              }}
-              title="Perbesar timeline"
-              type="button"
-            >
-              +
-            </button>
-            <span className="min-w-8 text-right text-[10px] font-bold text-zinc-500">
-              {timelineZoom.toFixed(1)}x
-            </span>
+              <input
+                aria-label="Zoom timeline"
+                className="h-1 w-14 sm:w-16 md:w-20 accent-cyan-400 cursor-pointer"
+                max={400}
+                min={25}
+                onChange={(event) => {
+                  markEditorPreferenceDirty();
+                  updateTimelineZoomPercent(Number(event.target.value));
+                }}
+                step={25}
+                type="range"
+                value={timelineZoomPercent}
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  markEditorPreferenceDirty();
+                  updateTimelineZoomPercent((value) => Math.min(400, value + 25));
+                }}
+                disabled={timelineZoomPercent >= 400}
+                title="Perbesar zoom timeline (Zoom In)"
+                aria-label="Perbesar zoom timeline"
+                className="text-sm font-black text-zinc-400 hover:text-cyan-300 disabled:opacity-30 disabled:pointer-events-none transition px-0.5"
+              >
+                +
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  markEditorPreferenceDirty();
+                  updateTimelineZoomPercent(100);
+                }}
+                title="Klik untuk reset zoom ke 100%"
+                className="min-w-8 text-right font-mono text-[10px] sm:text-xs font-bold text-zinc-400 hover:text-cyan-300 transition"
+              >
+                {timelineZoomPercent}%
+              </button>
+            </div>
           </div>
         </div>
 
         <div className="mt-3 min-h-0 overflow-auto pr-1 xl:max-h-[216px]">
-          <div className="min-w-full" style={{ width: `${timelineContentScale * 100}%` }}>
+          <div style={{ width: `${Math.max(25, timelineContentScale * 100)}%`, minWidth: "240px" }}>
           <div className="grid grid-cols-[112px_minmax(0,1fr)] items-end gap-3">
             <div />
             <div className="relative h-7 touch-none border-b border-zinc-700" {...timelinePointerProps}>
@@ -6480,164 +14819,168 @@ return (
                 </span>
               </div>
             </div>
-            <TimelineTrack
-              {...timelineTrackOrderProps("video")}
-              duration={timelineScaleDuration}
-              items={timelineVideoItems}
-              label="Video"
-              onItemClick={selectTimelineItem}
-              onItemContextMenu={handleTrackItemContextMenu}
-              onItemResizePointerDown={startMediaResize}
-              onItemResizePointerMove={moveMediaResize}
-              onItemResizePointerUp={finishMediaResize}
-              resizable={selectedEditorContext === "video"}
-              selectedItemId={selectedMediaSegmentId}
-              {...timelinePointerProps}
-              playheadPercent={playheadPercent}
-              selected={selectedEditorContext === "video"}
-              emptyText={
-                manualEditorMode && videoSequence.length === 0
-                  ? "Belum ada media di timeline"
-                  : "Track Video kosong"
-              }
-            />
-            {manualEditorMode && videoSequence.length === 0 && (
-              <div className="grid grid-cols-[112px_minmax(0,1fr)] items-center gap-3">
+            {!hasAnyTimelineTracks ? (
+              <div className="grid grid-cols-[104px_minmax(0,1fr)] items-center gap-2 py-2">
                 <div />
-                <label className="w-fit">
-                  <span className="btn-secondary inline-flex cursor-pointer px-3 py-1.5 text-[11px] font-black">
-                    Import media
-                  </span>
-                  <input
-                    accept={editorMediaInputConfig.video.accept}
-                    aria-label="Import media ke timeline"
-                    className="sr-only"
-                    disabled={editorMediaUploading}
-                    onChange={(event) => {
-                      const file = event.currentTarget.files?.[0];
-                      if (file) void importEditorMedia("video", file);
-                      event.currentTarget.value = "";
-                    }}
-                    type="file"
-                  />
-                </label>
+                <div
+                  className="flex flex-col items-center justify-center rounded-xl border-2 border-dashed border-zinc-800 bg-[#191b1f]/60 py-6 px-4 text-center transition hover:border-zinc-700"
+                  {...timelinePointerProps}
+                >
+                  <span className="text-xl mb-1 text-zinc-500">🎬</span>
+                  <p className="text-xs font-bold text-zinc-300">
+                    Timeline Kosong
+                  </p>
+                  <p className="mt-1 text-[11px] text-zinc-500 max-w-sm">
+                    Import media dari panel kiri atau klik tombol <span className="font-bold text-cyan-400">+</span> pada toolbar timeline untuk mulai menyusun klip.
+                  </p>
+                </div>
               </div>
+            ) : (
+              <>
+                {textLanes.map((laneItems, laneIndex) => {
+                  const isLaneLocked = laneItems.length > 0 && laneItems.every((item) => Boolean(item.locked));
+                  const isLaneVisible = laneItems.every((item) => item.visible !== false);
+                  return (
+                    <TimelineTrack
+                      trackKey="text"
+                      locked={isLaneLocked}
+                      onToggleLock={() => toggleLaneLock(laneItems)}
+                      visible={isLaneVisible}
+                      onToggleVisibility={() => toggleLaneVisibility(laneItems)}
+                      {...timelineTrackOrderProps("text")}
+                      duration={timelineScaleDuration}
+                      items={laneItems}
+                      key={`text-lane-${laneIndex}`}
+                      label="Text"
+                      {...editableMarkerProps}
+                      onItemResizePointerDown={startTimedItemResize}
+                      onItemResizePointerMove={moveTimedItemResize}
+                      onItemResizePointerUp={finishTimedItemResize}
+                      resizable={
+                        !isLaneLocked && (
+                          selectedEditorContext === "hook" ||
+                          selectedEditorContext === "caption" ||
+                          (selectedEditorContext === "keyword" && !selectedEvent?.reason?.toLowerCase().includes("sticker"))
+                        )
+                      }
+                      selectedItemId={selectedEventId || selectedCaptionId}
+                      {...timelinePointerProps}
+                      playheadPercent={playheadPercent}
+                      selected={
+                        selectedEditorContext === "hook" ||
+                        selectedEditorContext === "caption" ||
+                        (selectedEditorContext === "keyword" && !selectedEvent?.reason?.toLowerCase().includes("sticker"))
+                      }
+                    />
+                  );
+                })}
+                {overlayLanes.map((laneItems, laneIndex) => {
+                  const isLaneLocked = laneItems.length > 0 && laneItems.every((item) => Boolean(item.locked));
+                  const isLaneVisible = laneItems.every((item) => item.visible !== false);
+                  return (
+                    <TimelineTrack
+                      trackKey="overlay"
+                      locked={isLaneLocked}
+                      onToggleLock={() => toggleLaneLock(laneItems)}
+                      visible={isLaneVisible}
+                      onToggleVisibility={() => toggleLaneVisibility(laneItems)}
+                      {...timelineTrackOrderProps("overlay")}
+                      duration={timelineScaleDuration}
+                      items={laneItems}
+                      key={`overlay-lane-${laneIndex}`}
+                      label="Overlay"
+                      {...editableMarkerProps}
+                      onItemResizePointerDown={startTimedItemResize}
+                      onItemResizePointerMove={moveTimedItemResize}
+                      onItemResizePointerUp={finishTimedItemResize}
+                      resizable={
+                        !isLaneLocked && (
+                          selectedEditorContext === "effect" ||
+                          (selectedEditorContext === "keyword" && Boolean(selectedEvent?.reason?.toLowerCase().includes("sticker")))
+                        )
+                      }
+                      selectedItemId={selectedEventId}
+                      {...timelinePointerProps}
+                      playheadPercent={playheadPercent}
+                      selected={
+                        selectedEditorContext === "effect" ||
+                        (selectedEditorContext === "keyword" && Boolean(selectedEvent?.reason?.toLowerCase().includes("sticker")))
+                      }
+                    />
+                  );
+                })}
+                {videoLanes.map((laneItems, laneIndex) => {
+                  const isLaneLocked = laneItems.length > 0 && laneItems.every((item) => Boolean(item.locked));
+                  const isLaneVisible = laneItems.every((item) => item.visible !== false);
+                  return (
+                    <TimelineTrack
+                      trackKey="video"
+                      locked={isLaneLocked}
+                      onToggleLock={() => toggleLaneLock(laneItems)}
+                      visible={isLaneVisible}
+                      onToggleVisibility={() => toggleLaneVisibility(laneItems)}
+                      muted={audioExtracted ? true : (videoMuted || audioSettings.muted)}
+                      onToggleMute={toggleVideoMuted}
+                      muteDisabled={audioExtracted}
+                      muteTooltip={audioExtracted ? "Audio sudah dipisah ke track AUDIO" : undefined}
+                      {...timelineTrackOrderProps("video")}
+                      duration={timelineScaleDuration}
+                      items={laneItems}
+                      key={`video-lane-${laneIndex}`}
+                      label="Video"
+                      onItemClick={selectTimelineItem}
+                      onItemContextMenu={handleTrackItemContextMenu}
+                      onItemResizePointerDown={startMediaResize}
+                      onItemResizePointerMove={moveMediaResize}
+                      onItemResizePointerUp={finishMediaResize}
+                      resizable={!isLaneLocked && selectedEditorContext === "video"}
+                      selectedItemId={selectedMediaSegmentId}
+                      {...timelinePointerProps}
+                      playheadPercent={playheadPercent}
+                      selected={selectedEditorContext === "video"}
+                      transitions={timelineTransitionMarkers}
+                      onTransitionClick={(eventId) => {
+                        setSelectedEventId(eventId);
+                        setSelectedEditorContext("effect");
+                        setEffectInspectorTab("effect");
+                      }}
+                    />
+                  );
+                })}
+                {audioLanes.map((laneItems, laneIndex) => {
+                  const isExtractedAudioLane = laneItems.some((item) => item.type === "audio");
+                  const isLaneLocked = laneItems.length > 0 && laneItems.every((item) => Boolean(item.locked));
+                  const isLaneMuted = isExtractedAudioLane
+                    ? audioSettings.muted
+                    : laneItems.length > 0 && laneItems.every((item) => Boolean(item.muted));
+
+                  return (
+                    <TimelineTrack
+                      trackKey="audio"
+                      locked={isLaneLocked}
+                      onToggleLock={() => toggleLaneLock(laneItems)}
+                      muted={isLaneMuted}
+                      onToggleMute={() => toggleLaneMute(laneItems)}
+                      {...timelineTrackOrderProps("audio")}
+                      duration={timelineScaleDuration}
+                      items={laneItems}
+                      key={`audio-lane-${laneIndex}`}
+                      label="Audio"
+                      onItemClick={selectTimelineItem}
+                      onItemContextMenu={handleTrackItemContextMenu}
+                      onItemResizePointerDown={startMediaResize}
+                      onItemResizePointerMove={moveMediaResize}
+                      onItemResizePointerUp={finishMediaResize}
+                      resizable={!isLaneLocked && selectedEditorContext === "audio"}
+                      selectedItemId={selectedMediaSegmentId || selectedAdditionalAudioTrackId}
+                      {...timelinePointerProps}
+                      playheadPercent={playheadPercent}
+                      selected={selectedEditorContext === "audio"}
+                    />
+                  );
+                })}
+              </>
             )}
-            {audioExtracted && (
-            <TimelineTrack
-              {...timelineTrackOrderProps("audio")}
-              duration={timelineScaleDuration}
-              items={timelineAudioItems}
-              label="Audio"
-              onItemClick={selectTimelineItem}
-              onItemContextMenu={handleTrackItemContextMenu}
-              onItemResizePointerDown={startMediaResize}
-              onItemResizePointerMove={moveMediaResize}
-              onItemResizePointerUp={finishMediaResize}
-              resizable={selectedEditorContext === "audio"}
-              selectedItemId={selectedMediaSegmentId}
-              {...timelinePointerProps}
-              playheadPercent={playheadPercent}
-              selected={selectedEditorContext === "audio"}
-              emptyText="Track Audio kosong"
-            />
-            )}
-            {timelineAdditionalAudioTracks.map(({ track, item }) => (
-              <TimelineTrack
-                duration={timelineScaleDuration}
-                items={[item]}
-                key={track.id}
-                label={track.label}
-                onItemClick={selectTimelineItem}
-                onItemContextMenu={handleTrackItemContextMenu}
-                selected={selectedAdditionalAudioTrackId === track.id}
-                selectedItemId={selectedAdditionalAudioTrackId}
-                order={trackOrder.indexOf("audio")}
-                {...timelinePointerProps}
-                playheadPercent={playheadPercent}
-                emptyText={`${track.label} kosong`}
-              />
-            ))}
-            <TimelineTrack
-              {...timelineTrackOrderProps("caption")}
-              duration={timelineScaleDuration}
-              items={timelineCaptionItems}
-              label="Caption"
-              onItemClick={selectTimelineItem}
-              onItemContextMenu={handleTrackItemContextMenu}
-              onItemResizePointerDown={startTimedItemResize}
-              onItemResizePointerMove={moveTimedItemResize}
-              onItemResizePointerUp={finishTimedItemResize}
-              resizable={selectedEditorContext === "caption"}
-              selectedItemId={selectedCaptionId}
-              {...timelinePointerProps}
-              playheadPercent={playheadPercent}
-              selected={selectedEditorContext === "caption"}
-              emptyText="Belum ada cue caption"
-            />
-            <TimelineTrack
-              {...timelineTrackOrderProps("hook")}
-              duration={timelineScaleDuration}
-              items={timelineHookItems}
-              label="Hook"
-              {...editableMarkerProps}
-              onItemResizePointerDown={startTimedItemResize}
-              onItemResizePointerMove={moveTimedItemResize}
-              onItemResizePointerUp={finishTimedItemResize}
-              resizable={selectedEditorContext === "hook"}
-              selectedItemId={selectedEventId}
-              {...timelinePointerProps}
-              playheadPercent={playheadPercent}
-              selected={selectedEditorContext === "hook"}
-            />
-            <TimelineTrack
-              {...timelineTrackOrderProps("punch")}
-              duration={timelineScaleDuration}
-              items={timelinePunchItems}
-              label="Punch"
-              {...editableMarkerProps}
-              onItemResizePointerDown={startTimedItemResize}
-              onItemResizePointerMove={moveTimedItemResize}
-              onItemResizePointerUp={finishTimedItemResize}
-              resizable={selectedEditorContext === "effect"}
-              selectedItemId={selectedEventId}
-              {...timelinePointerProps}
-              playheadPercent={playheadPercent}
-              selected={selectedEditorContext === "effect" && selectedEvent?.type === "punch_zoom"}
-              emptyText={styleConfig.punch_zoom_enabled ? "Belum ada momen efek" : "Tidak aktif"}
-            />
-            <TimelineTrack
-              {...timelineTrackOrderProps("keyword")}
-              duration={timelineScaleDuration}
-              items={timelineKeywordItems}
-              label="Keyword"
-              {...editableMarkerProps}
-              onItemResizePointerDown={startTimedItemResize}
-              onItemResizePointerMove={moveTimedItemResize}
-              onItemResizePointerUp={finishTimedItemResize}
-              resizable={selectedEditorContext === "keyword"}
-              selectedItemId={selectedEventId}
-              {...timelinePointerProps}
-              playheadPercent={playheadPercent}
-              selected={selectedEditorContext === "keyword"}
-              emptyText={keywordSkipped ? "Tidak ada frasa penting" : "Tidak ada event"}
-            />
-            <TimelineTrack
-              {...timelineTrackOrderProps("pattern")}
-              duration={timelineScaleDuration}
-              items={timelinePatternItems}
-              label="Pattern"
-              {...editableMarkerProps}
-              onItemResizePointerDown={startTimedItemResize}
-              onItemResizePointerMove={moveTimedItemResize}
-              onItemResizePointerUp={finishTimedItemResize}
-              resizable={selectedEditorContext === "effect"}
-              selectedItemId={selectedEventId}
-              {...timelinePointerProps}
-              playheadPercent={playheadPercent}
-              selected={selectedEditorContext === "effect" && selectedEvent?.type === "pattern_interrupt"}
-              emptyText={styleConfig.pattern_interrupt_enabled ? "Belum ada event valid" : "Tidak aktif"}
-            />
           </div>
           </div>
         </div>
@@ -6817,23 +15160,34 @@ return (
                 </div>
                 {(editableCaptionCues.length > 0 ||
                   editableEffectTimeline.some((event) =>
-                    ["hook_text", "pattern_interrupt"].includes(event.type),
+                    ["hook_text", "pattern_interrupt", "keyword_popup"].includes(event.type),
                   ) ||
                   additionalAudioTracks.length > 0) && (
                   <div className="rounded-lg border border-amber-400/30 bg-amber-950/35 p-3 text-xs text-amber-100">
-                    <p className="font-black">Catatan kompatibilitas export</p>
+                    <p className="font-black">Catatan Kompatibilitas Export v1</p>
                     <ul className="mt-1 list-disc space-y-1 pl-4 font-semibold text-amber-100/80">
                       {editableCaptionCues.length > 0 && (
-                        <li>Mode tampilan Caption tertentu belum sepenuhnya identik dengan Live Preview.</li>
+                        <li>Mode tampilan Caption tertentu disesuaikan dengan pipeline render aktif.</li>
                       )}
                       {editableEffectTimeline.some((event) => event.type === "hook_text") && (
-                        <li>Template box Hook lama dapat berbeda, tetapi teks, timing, dan gaya dasarnya tetap diekspor.</li>
+                        <li>Teks, timing, dan gaya dasar hook tetap diekspor.</li>
                       )}
-                      {editableEffectTimeline.some((event) => event.type === "pattern_interrupt") && (
-                        <li>Pattern Effect belum diterapkan pada file export.</li>
+                      {editableEffectTimeline.some(
+                        (event) =>
+                          event.type === "keyword_popup" &&
+                          event.reason?.startsWith("sticker"),
+                      ) && (
+                        <li>Sticker overlay emoji aktif di Live Preview editor; render final akan mengikuti pipeline saat ini.</li>
+                      )}
+                      {editableEffectTimeline.some(
+                        (event) =>
+                          event.type === "pattern_interrupt" &&
+                          event.reason?.startsWith("transition"),
+                      ) && (
+                        <li>Efek transisi visual aktif pada Live Preview editor.</li>
                       )}
                       {additionalAudioTracks.length > 0 && (
-                        <li>Audio tambahan belum dicampur ke file export.</li>
+                        <li>Audio/SFX tambahan aktif di Live Preview editor dan akan dicampur bertahap pada update export pipeline.</li>
                       )}
                     </ul>
                   </div>
@@ -7101,46 +15455,96 @@ return (
   );
 }
 
+function CollapsibleToolSection({
+  title,
+  defaultOpen = false,
+  badge,
+  children,
+}: {
+  title: string;
+  defaultOpen?: boolean;
+  badge?: string;
+  children: ReactNode;
+}) {
+  const [isOpen, setIsOpen] = useState(defaultOpen);
+
+  return (
+    <div className="rounded-xl border border-zinc-800 bg-[#181a1d] overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setIsOpen(!isOpen)}
+        className="flex w-full items-center justify-between p-2.5 text-left text-xs font-bold text-zinc-300 hover:bg-zinc-800/40 transition"
+      >
+        <span className="flex items-center gap-2">
+          <span
+            className="text-[10px] text-zinc-500 transition-transform duration-200 inline-block"
+            style={{ transform: isOpen ? "rotate(90deg)" : "rotate(0deg)" }}
+          >
+            ▶
+          </span>
+          <span className="uppercase text-[11px] tracking-wider text-zinc-300">{title}</span>
+        </span>
+        {badge && (
+          <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-[9px] font-semibold text-cyan-300">
+            {badge}
+          </span>
+        )}
+      </button>
+      {isOpen && <div className="border-t border-zinc-800/80 p-3 space-y-3">{children}</div>}
+    </div>
+  );
+}
+
 function TextStylePresetSelector({
   label,
   onChange,
   value,
 }: {
-  label: string;
+  label?: string;
   onChange: (value: TextStylePresetKey) => void;
   value: TextStylePresetKey;
 }) {
   return (
-    <div>
-      <p className="text-xs font-black uppercase tracking-wide text-slate-500">{label}</p>
-      <div className="mt-2 grid grid-cols-7 gap-1">
+    <div className="space-y-1.5">
+      {label && <p className="text-[11px] font-bold uppercase tracking-wider text-zinc-400">{label}</p>}
+      <div className="grid grid-cols-4 gap-1.5 max-h-48 overflow-y-auto pr-1">
         {TEXT_STYLE_PRESETS.map((preset) => {
           const previewStyle = resolveTextOverlayStyle(preset.key);
+          const isCurrent = value === preset.key;
           return (
             <button
               aria-label={preset.label}
-              className={`aspect-square min-w-0 rounded-md border text-[11px] leading-none transition-colors ${
-                value === preset.key
-                  ? "border-violet-500 ring-2 ring-violet-200"
-                  : "border-slate-300 hover:border-slate-500"
+              className={`flex flex-col items-center justify-center rounded-lg border p-1.5 transition-all text-center ${
+                isCurrent
+                  ? "border-cyan-400 bg-cyan-950/30 ring-2 ring-cyan-400/40 shadow-sm"
+                  : "border-zinc-800 bg-[#1e2024] hover:border-zinc-600 hover:bg-[#25282e]"
               }`}
               key={preset.key}
               onClick={() => onChange(preset.key)}
-              style={{
-                ...previewStyle,
-                backgroundColor: previewStyle.backgroundColor || "#27272a",
-                color: previewStyle.color || "#ffffff",
-              }}
               title={preset.label}
               type="button"
             >
-              Aa
+              <span
+                className="block text-xs font-black leading-none mb-1 select-none"
+                style={{
+                  color: previewStyle.color || "#ffffff",
+                  textShadow: previewStyle.textShadow,
+                  WebkitTextStroke: previewStyle.WebkitTextStroke,
+                  fontFamily: previewStyle.fontFamily,
+                  textTransform: previewStyle.textTransform,
+                }}
+              >
+                Aa
+              </span>
+              <span className="block truncate text-[9px] font-medium text-zinc-400 w-full">
+                {preset.label}
+              </span>
             </button>
           );
         })}
       </div>
-      <p className="mt-1.5 text-[10px] font-semibold text-slate-500">
-        {getTextStylePreset(value).label}
+      <p className="text-[10px] font-medium text-zinc-400">
+        Preset aktif: <span className="text-cyan-300 font-bold">{getTextStylePreset(value).label}</span>
       </p>
     </div>
   );

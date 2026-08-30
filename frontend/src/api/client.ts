@@ -143,3 +143,36 @@ export function uploadMedia<T>(
     xhr.send(form);
   });
 }
+
+export type EditorAutoCaptionPayload = {
+  language?: "id" | "en" | "auto";
+  delete_current_captions?: boolean;
+  identify_filler_words?: boolean;
+  bilingual?: string;
+};
+
+export type EditorAutoCaptionResult = {
+  success: boolean;
+  message: string;
+  language: string;
+  cues_count: number;
+  cues: Array<{
+    id: string;
+    start: number;
+    end: number;
+    text: string;
+  }>;
+  reused_transcript: boolean;
+};
+
+export function generateEditorAutoCaptions(
+  transformationId: string,
+  payload: EditorAutoCaptionPayload,
+): Promise<EditorAutoCaptionResult> {
+  return api<EditorAutoCaptionResult>(`/api/transformations/${transformationId}/auto-captions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
