@@ -13,6 +13,7 @@ from app.services.text_styles import (
 MAX_SUBTITLE_WORDS = 8
 MAX_SUBTITLE_CHARS = 45
 ASS_PLAY_RES_X = 1080
+ASS_PLAY_RES_Y = 1920
 CAPTION_SAFE_WIDTH_RATIO = 0.86
 BOX_CAPTION_SAFE_WIDTH_RATIO = 0.80
 MIN_CAPTION_FONT_SIZE = 24
@@ -252,7 +253,7 @@ def _layout_ass_caption(
         lines = _wrap_words_for_width(text, font_size, safe_width)
         if len(lines) <= max_lines:
             return WrappedCaption(
-                text="\n".join(lines),
+                text=r"\N".join(lines),
                 lines=tuple(lines),
                 font_size=font_size,
                 max_lines=max_lines,
@@ -268,7 +269,7 @@ def _layout_ass_caption(
     )
     emergency_font_size = max(10, min(base_font_size, int(safe_width / widest_at_unit_size)))
     return WrappedCaption(
-        text="\n".join(lines),
+        text=r"\N".join(lines),
         lines=tuple(lines),
         font_size=emergency_font_size,
         max_lines=max_lines,
@@ -283,7 +284,7 @@ def _wrap_ass_caption(
     base_font_size: int = 64,
     safe_width: int = round(ASS_PLAY_RES_X * CAPTION_SAFE_WIDTH_RATIO),
 ) -> str:
-    return _layout_ass_caption(text, base_font_size, safe_width).text
+    return "\n".join(_layout_ass_caption(text, base_font_size, safe_width).lines)
 
 
 def _cue_font_size(
@@ -311,6 +312,58 @@ def _safe_caption_color(value: Any, fallback: str) -> str:
     return fallback
 
 
+def compute_karaoke_word_timings(
+    caption_text: str,
+    start: float,
+    end: float,
+    word_timings: list[dict[str, Any]] | None = None,
+    *,
+    weighted: bool = True,
+) -> list[dict[str, Any]]:
+    words = caption_text.split()
+    if not words:
+        return []
+    total_duration = max(0.05, end - start)
+
+    if word_timings and len(word_timings) == len(words):
+        result = []
+        for i, wt in enumerate(word_timings):
+            w_start = float(wt.get("start", start))
+            w_end = float(wt.get("end", end))
+            w_dur = max(0.01, w_end - w_start)
+            result.append({
+                "word": words[i],
+                "start": w_start,
+                "end": w_end,
+                "duration_cs": max(1, round(w_dur * 100)),
+                "index": i,
+            })
+        return result
+
+    if weighted:
+        weights = [1.0 + len(w.strip(".,!?:;()_-\"'")) * 0.35 for w in words]
+        total_weight = sum(weights) if sum(weights) > 0 else float(len(words))
+    else:
+        weights = [1.0] * len(words)
+        total_weight = float(len(words))
+
+    result = []
+    current_time = start
+    for i, (word, weight) in enumerate(zip(words, weights)):
+        word_dur = (weight / total_weight) * total_duration
+        w_start = current_time
+        w_end = end if i == len(words) - 1 else current_time + word_dur
+        current_time = w_end
+        result.append({
+            "word": word,
+            "start": w_start,
+            "end": w_end,
+            "duration_cs": max(1, round((w_end - w_start) * 100)),
+            "index": i,
+        })
+    return result
+
+
 def _highlight_wrapped_word(
     lines: tuple[str, ...],
     active_index: int,
@@ -321,6 +374,7 @@ def _highlight_wrapped_word(
     rendered_lines: list[str] = []
     base_tag = f"{{\\c{_inline_ass_color(base_color)}}}"
     highlight_tag = f"{{\\c{_inline_ass_color(highlight_color)}}}"
+
     for line in lines:
         rendered_words: list[str] = []
         for word in line.split():
@@ -334,6 +388,34 @@ def _highlight_wrapped_word(
     return r"\N".join(rendered_lines)
 
 
+def _highlight_keywords_in_wrapped_caption(
+    lines: tuple[str, ...],
+    base_color: str,
+    highlight_color: str,
+) -> str:
+    rendered_lines: list[str] = []
+    base_col = _inline_ass_color(base_color)
+    hi_col = _inline_ass_color(highlight_color)
+    base_tag = "{\\c" + base_col + "}"
+    highlight_tag = "{\\c" + hi_col + "\\fscx108\\fscy108\\b1}"
+    reset_tag = base_tag + "{\\fscx100\\fscy100}"
+    
+    first_word_highlighted = False
+    for line in lines:
+        rendered_words: list[str] = []
+        for word in line.split():
+            safe_word = _ass_text(word)
+            # Highlight first word or long emphasis words
+            clean_word = safe_word.strip(".,!?:;()_-\"\'\"").upper()
+            if not first_word_highlighted or (len(clean_word) >= 5 and clean_word in {"PENTING", "TERNYATA", "MASALAH", "GAGAL", "JANGAN", "AKHIRNYA", "BONGKAR", "GRATIS"}):
+                rendered_words.append(f"{highlight_tag}{safe_word}{reset_tag}")
+                first_word_highlighted = True
+            else:
+                rendered_words.append(safe_word)
+        rendered_lines.append(" ".join(rendered_words))
+    return r"\N".join(rendered_lines)
+
+
 def _ass_event(
     start: float,
     end: float,
@@ -342,12 +424,13 @@ def _ass_event(
     base_font_size: int,
     *,
     text_is_ass: bool = False,
+    style_name: str = "Default",
 ) -> str:
     size_override = f"{{\\fs{font_size}}}" if font_size != base_font_size else ""
     event_text = text if text_is_ass else _ass_text(text)
     return (
         f"Dialogue: 0,{ass_timestamp(start)},{ass_timestamp(end)},"
-        f"Default,,0,0,0,,{size_override}{event_text}"
+        f"{style_name},,0,0,0,,{size_override}{event_text}"
     )
 
 
@@ -396,36 +479,107 @@ def write_ass_cues(
     path: Path,
     cues: list[tuple[float, float, str]],
     caption_style: dict[str, Any] | None = None,
+    rich_cues: list[dict[str, Any]] | None = None,
+    style_config: dict[str, Any] | None = None,
 ) -> SubtitleWriteReport:
     config = caption_style if isinstance(caption_style, dict) else {}
     style, style_fallbacks = resolve_caption_export_style(config)
-    font_size = {"small": 54, "medium": 64, "large": 74}.get(
-        str(config.get("fontSize")),
-        64,
-    )
-    position = str(config.get("position") or "center_lower")
-    alignment = {"top": 8, "center": 5}.get(position, 2)
+
+    # 1. Scaling font size for 1080x1920 PlayRes
+    raw_fs = config.get("font_size")
+    if isinstance(raw_fs, (int, float)) and raw_fs > 0:
+        font_size = int(round(float(raw_fs) * 2.2))
+        font_size = max(44, min(96, font_size))
+    else:
+        font_size = {"small": 54, "medium": 64, "large": 74}.get(
+            str(config.get("fontSize")),
+            64,
+        )
+
+    # 2. Layout, positioning & template type
+    template_type = str(config.get("template_type") or "basic_subtitle")
+    layout = config.get("layout") if isinstance(config.get("layout"), dict) else {}
+    behavior = config.get("behavior") if isinstance(config.get("behavior"), dict) else {}
+    animation = config.get("animation") if isinstance(config.get("animation"), dict) else {}
+
+    position = str(layout.get("position") or config.get("position") or "center_lower")
+    alignment = {"top": 8, "center": 5, "middle": 5}.get(position, 2)
     margin_v = {
         "top": 150,
         "center": 0,
+        "middle": 0,
         "center_lower": 300,
         "bottom": 180,
     }.get(position, 300)
+
+    if template_type == "lower_third" or position == "lower_third":
+        alignment = 2
+        margin_v = 130
+
+    # 3. Background, box and outline
+    is_bubble = template_type == "bubble" or bool(config.get("background_enabled") and config.get("background_radius"))
+    is_lower_third = template_type == "lower_third" or position == "lower_third"
+    is_box = bool(style.background_color) or is_bubble or is_lower_third
+
     background_alpha = round((1.0 - style.background_opacity) * 255)
     back_color = ass_color(
-        style.background_color or "#000000",
+        style.background_color or ("#FFFFFF" if is_bubble and style.text_color == "#000000" else "#000000"),
         background_alpha if style.background_color else 128,
     )
-    border_style = 3 if style.background_color else 1
-    outline = round(max(0.0, min(4.0, style.outline_width * 3)), 2)
-    shadow = max(0, min(4, style.shadow_offset))
+    border_style = 3 if is_box else 1
+
+    if is_bubble:
+        outline = round(max(8.0, min(24.0, float(config.get("background_padding_y", 12)) * 1.5)), 1)
+        shadow = 0
+    elif is_lower_third:
+        outline = 16.0
+        shadow = 0
+    else:
+        outline = round(max(0.0, min(8.0, style.outline_width * 3)), 2)
+        shadow = max(0, min(4, style.shadow_offset))
+
+    # Safe width
     safe_width_ratio = (
         BOX_CAPTION_SAFE_WIDTH_RATIO
-        if style.background_color
+        if is_box
         else CAPTION_SAFE_WIDTH_RATIO
     )
     safe_width = round(ASS_PLAY_RES_X * safe_width_ratio)
     horizontal_margin = round((ASS_PLAY_RES_X - safe_width) / 2)
+
+    # 4. Manifest log
+    first_cue_id = rich_cues[0].get("id") if (rich_cues and len(rich_cues) > 0) else "cue-0"
+    template_id = str(config.get("preset_id") or config.get("style_id") or "default")
+
+    if is_bubble or is_lower_third:
+        selected_renderer = "ass_advanced"
+    elif template_type in {"word_highlight", "typewriter", "karaoke"}:
+        selected_renderer = "ass_micro_events"
+    else:
+        selected_renderer = "ass_basic"
+
+    logger.info(
+        "caption_render_manifest",
+        total_captions=len(cues),
+        first_caption_id=first_cue_id,
+        template_id=template_id,
+        template_type=template_type,
+        style_keys=list(config.keys()),
+        layout_position=position,
+        behavior_mode=str(behavior.get("mode") or "static"),
+        animation_mode=str(animation.get("in") or "none"),
+        selected_renderer=selected_renderer,
+    )
+
+    if template_type in {"glitch", "shake"}:
+        logger.warning(
+            "caption_template_export_fallback",
+            template_id=template_id,
+            template_type=template_type,
+            reason=f"css_animation_{template_type}_exported_as_styled_static_caption",
+        )
+
+    # 5. Header Styles
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -440,41 +594,67 @@ Style: Default,{style.font_name},{font_size},{ass_color(style.text_color)},{ass_
 [Events]
 Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
 """
-    requested_display_mode = str(config.get("displayMode") or "segment")
+
+    requested_display_mode = str(config.get("displayMode") or ("karaoke" if template_type == "karaoke" else "segment"))
     display_mode = (
         requested_display_mode
         if requested_display_mode in {"segment", "karaoke", "word_by_word"}
         else "segment"
     )
-    highlight_color = _safe_caption_color(config.get("highlightColor"), "#FFD400")
+    highlight_color = _safe_caption_color(behavior.get("highlight_color") or config.get("highlightColor"), "#FFD400")
     prepared_cues, skip_reasons = _normalize_non_overlapping_cues(cues)
     events: list[str] = []
     animation_modes: set[str] = set()
-    for start, end, cleaned in prepared_cues:
+
+    for cue_idx, (start, end, cleaned) in enumerate(prepared_cues):
         styled_text = transform_export_text(cleaned, style)
         words = styled_text.split()
         wrapped = _layout_ass_caption(styled_text, font_size, safe_width)
         duration = end - start
         can_animate = duration >= 0.35 and len(words) > 1
         event_count_before = len(events)
-        estimated_word_duration: float | None = None
+        estimated_word_duration: float | None = (duration / len(words)) if len(words) > 0 else None
+        cue_id = (
+            rich_cues[cue_idx].get("id", f"cue-{cue_idx}")
+            if (rich_cues and cue_idx < len(rich_cues))
+            else f"cue-{cue_idx}"
+        )
 
-        if display_mode == "karaoke" and can_animate:
-            estimated_word_duration = duration / len(words)
-            for index in range(len(words)):
-                event_start = start + (index * estimated_word_duration)
-                event_end = (
-                    end
-                    if index == len(words) - 1
-                    else start + ((index + 1) * estimated_word_duration)
-                )
+        is_karaoke = (
+            display_mode == "karaoke"
+            or template_type == "karaoke"
+            or behavior.get("mode") == "word_progress"
+            or animation.get("loop") == "highlight_sweep"
+            or bool(config.get("karaoke_enabled"))
+            or template_id in {"karaoke_yellow", "karaoke_cyan", "karaoke_box", "karaoke_pop"}
+        )
+
+        if is_karaoke and can_animate:
+            is_weighted = bool(
+                behavior.get("mode") == "word_progress"
+                or animation.get("loop") == "highlight_sweep"
+                or template_id in {"karaoke_yellow", "karaoke_cyan"}
+            )
+            word_timings = compute_karaoke_word_timings(styled_text, start, end, weighted=is_weighted)
+            logger.info(
+                "karaoke_export_model",
+                caption_id=cue_id,
+                template_id=template_id,
+                behavior_mode=str(behavior.get("mode") or "word_progress"),
+                words_count=len(words),
+                cue_start=round(start, 3),
+                cue_end=round(end, 3),
+                durations_centiseconds=[wt["duration_cs"] for wt in word_timings],
+                ass_mode="micro_cues_progressive",
+            )
+            for wt in word_timings:
                 events.append(
                     _ass_event(
-                        event_start,
-                        event_end,
+                        wt["start"],
+                        wt["end"],
                         _highlight_wrapped_word(
                             wrapped.lines,
-                            index,
+                            wt["index"],
                             style.text_color,
                             highlight_color,
                         ),
@@ -484,24 +664,73 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
                     )
                 )
             cue_animation_mode = "micro_cues"
-        elif display_mode == "word_by_word" and can_animate:
-            estimated_word_duration = duration / len(words)
-            for index in range(len(words)):
-                event_start = start + (index * estimated_word_duration)
-                event_end = (
-                    end
-                    if index == len(words) - 1
-                    else start + ((index + 1) * estimated_word_duration)
+        elif template_type == "typewriter" and duration >= 0.4 and len(styled_text) > 3:
+            # Generate progressive typewriter steps
+            step_count = min(8, max(3, len(words)))
+            step_duration = duration / step_count
+            for step in range(step_count):
+                event_start = start + (step * step_duration)
+                event_end = end if step == step_count - 1 else start + ((step + 1) * step_duration)
+                fraction = (step + 1) / step_count
+                visible_chars = max(1, int(round(fraction * len(styled_text))))
+                sub_text = styled_text[:visible_chars]
+                cursor_tag = "|" if step < step_count - 1 else ""
+                typewriter_layout = _layout_ass_caption(sub_text + cursor_tag, wrapped.font_size, safe_width)
+                events.append(
+                    _ass_event(
+                        event_start,
+                        event_end,
+                        typewriter_layout.text,
+                        typewriter_layout.font_size,
+                        font_size,
+                    )
                 )
+            cue_animation_mode = "typewriter_stepped"
+        elif template_type == "word_highlight" or behavior.get("mode") == "keyword_highlight" or behavior.get("mode") == "emphasis_word":
+            highlighted_text = _highlight_keywords_in_wrapped_caption(
+                wrapped.lines,
+                style.text_color,
+                highlight_color,
+            )
+            events.append(
+                _ass_event(
+                    start,
+                    end,
+                    highlighted_text,
+                    wrapped.font_size,
+                    font_size,
+                    text_is_ass=True,
+                )
+            )
+            cue_animation_mode = "word_highlight"
+        elif is_lower_third:
+            badge_text = str(config.get("badge") or "NEWS").upper()
+            badge_color = _inline_ass_color("#06B6D4")
+            badge_prefix = "{\\c" + badge_color + "\\fs36\\b1}[" + badge_text + "]\\N{\\r\\b1}"
+            lower_third_text = badge_prefix + wrapped.text
+            events.append(
+                _ass_event(
+                    start,
+                    end,
+                    lower_third_text,
+                    wrapped.font_size,
+                    font_size,
+                    text_is_ass=True,
+                )
+            )
+            cue_animation_mode = "lower_third_bar"
+        elif display_mode == "word_by_word" and can_animate:
+            word_timings = compute_karaoke_word_timings(styled_text, start, end)
+            for wt in word_timings:
                 progressive_layout = _layout_ass_caption(
-                    " ".join(words[: index + 1]),
+                    " ".join(words[: wt["index"] + 1]),
                     wrapped.font_size,
                     safe_width,
                 )
                 events.append(
                     _ass_event(
-                        event_start,
-                        event_end,
+                        wt["start"],
+                        wt["end"],
                         progressive_layout.text,
                         progressive_layout.font_size,
                         font_size,
@@ -521,11 +750,11 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
             cue_animation_mode = (
                 "segment_static" if display_mode == "segment" else "static_fallback"
             )
-
         animation_modes.add(cue_animation_mode)
         logger.info(
             "caption_animation_export",
             caption_display_mode=display_mode,
+            template_type=template_type,
             karaoke_export_mode=(
                 cue_animation_mode if display_mode == "karaoke" else None
             ),
@@ -542,21 +771,7 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
             source_end=round(end, 3),
             generated_event_count=len(events) - event_count_before,
         )
-        wrap_log = logger.warning if wrapped.extreme_length else logger.info
-        wrap_log(
-            "caption_safe_wrap",
-            original_text_length=len(cleaned),
-            original_word_count=len(cleaned.split()),
-            wrapped_line_count=len(wrapped.lines),
-            wrapped_text_preview=wrapped.text[:160],
-            selected_font_size=wrapped.font_size,
-            max_lines=wrapped.max_lines,
-            safe_width=wrapped.safe_width,
-            safe_width_ratio=safe_width_ratio,
-            caption_safe_wrap_applied=wrapped.safe_wrap_applied,
-            extreme_length=wrapped.extreme_length,
-            skipped_reason=None,
-        )
+
     animation_mode = (
         "mixed"
         if len(animation_modes) > 1
@@ -567,6 +782,8 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
     logger.info(
         "caption_text_style_export_applied",
         preset=style.key,
+        template_id=template_id,
+        template_type=template_type,
         font_name=style.font_name,
         cue_count=len(events),
         position=position,
@@ -604,7 +821,3 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
         animation_mode=animation_mode,
         source_cues_written=len(prepared_cues),
     )
-
-
-def write_ass(path: Path, text: str, duration: float) -> None:
-    write_ass_cues(path, split_cues(text, duration))

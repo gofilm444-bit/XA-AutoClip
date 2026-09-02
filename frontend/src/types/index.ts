@@ -306,6 +306,8 @@ export type ClipperStyleConfig = {
     type?: "main_caption" | string;
     style_id?: string | null;
     style_override?: Record<string, unknown> | null;
+    source_asset_id?: string;
+    source_segment_id?: string;
   }>;
   main_caption_style?: Record<string, unknown>;
   caption_apply_to_all?: boolean;
@@ -323,6 +325,7 @@ export type EditorMediaAsset = {
   kind: "video" | "audio" | "image";
   name: string;
   url: string;
+  source_url?: string;
   duration_seconds: number | null;
   width: number | null;
   height: number | null;

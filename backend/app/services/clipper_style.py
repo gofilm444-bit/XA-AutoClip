@@ -447,17 +447,50 @@ def normalize_media_sequence(value: Any) -> list[dict[str, Any]]:
         if not isinstance(item, dict):
             continue
         try:
-            source_start = max(0.0, float(item.get("source_start", 0.0)))
-            source_end = max(0.0, float(item.get("source_end", 0.0)))
+            raw_start = item.get("source_start") if "source_start" in item else item.get("sourceStart", 0.0)
+            raw_end = item.get("source_end") if "source_end" in item else item.get("sourceEnd", 0.0)
+            source_start = max(0.0, float(raw_start or 0.0))
+            source_end = max(0.0, float(raw_end or 0.0))
         except (TypeError, ValueError):
             continue
-        if source_end - source_start < 0.1:
+        if source_end - source_start < 0.05:
             continue
         item_dict: dict[str, Any] = {
             "id": str(item.get("id") or f"media-{index}")[:80],
             "source_start": round(source_start, 3),
             "source_end": round(source_end, 3),
         }
+        asset_id = item.get("asset_id") or item.get("assetId")
+        if asset_id:
+            item_dict["asset_id"] = str(asset_id)[:80]
+        if "name" in item and item["name"]:
+            item_dict["name"] = str(item["name"])[:255]
+        src_url = item.get("source_url") or item.get("sourceUrl")
+        if src_url:
+            item_dict["source_url"] = str(src_url)
+        src_path = item.get("source_path") or item.get("sourcePath")
+        if src_path:
+            item_dict["source_path"] = str(src_path)
+        if "duration" in item and item["duration"] is not None:
+            try:
+                item_dict["duration"] = round(float(item["duration"]), 3)
+            except (TypeError, ValueError):
+                pass
+        if "start" in item and item["start"] is not None:
+            try:
+                item_dict["start"] = round(float(item["start"]), 3)
+            except (TypeError, ValueError):
+                pass
+        if "end" in item and item["end"] is not None:
+            try:
+                item_dict["end"] = round(float(item["end"]), 3)
+            except (TypeError, ValueError):
+                pass
+        if "speed" in item and item["speed"] is not None:
+            try:
+                item_dict["speed"] = round(float(item["speed"]), 2)
+            except (TypeError, ValueError):
+                pass
         if "locked" in item:
             item_dict["locked"] = bool(item["locked"])
         if "visible" in item:
@@ -476,9 +509,13 @@ def resolve_media_sequence(
     duration = max(0.1, float(duration_seconds or 0.0))
     resolved: list[dict[str, Any]] = []
     for item in normalize_media_sequence(value):
-        start = min(float(item["source_start"]), max(0.0, duration - 0.1))
-        end = min(float(item["source_end"]), duration)
-        if end - start < 0.1:
+        if item.get("asset_id"):
+            start = max(0.0, float(item["source_start"]))
+            end = max(start + 0.05, float(item["source_end"]))
+        else:
+            start = min(float(item["source_start"]), max(0.0, duration - 0.1))
+            end = min(float(item["source_end"]), duration)
+        if end - start < 0.05:
             continue
         resolved.append({**item, "source_start": round(start, 3), "source_end": round(end, 3)})
     if resolved:

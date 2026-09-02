@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
@@ -227,6 +227,7 @@ class EditorMediaAssetRead(BaseModel):
     kind: str
     name: str
     url: str
+    source_url: str
     duration_seconds: float | None = None
     width: int | None = None
     height: int | None = None
@@ -274,6 +275,11 @@ class RenderCreate(BaseModel):
         "blurred_background", "center_crop", "fit_background", "picture_in_picture"
     ] = "blurred_background"
     subtitle_language: Literal["id", "en"] = "id"
+    resolution: Literal["540", "720", "1080"] | str | None = None
+    quality: Literal["high", "balanced", "standard"] | str | None = "high"
+    frame_rate: float | str | None = 30.0
+    force: bool = False
+    editor_state: dict[str, Any] | None = None
 
 
 class RenderRead(BaseModel):
@@ -290,6 +296,9 @@ class RenderRead(BaseModel):
     error_message: str | None
     warning_message: str | None = None
     output_url: str | None = None
+    manifest_hash: str | None = None
+    cache_reused: bool = False
+    created_at: datetime | None = None
 
 
 class EditorAutoCaptionRequest(BaseModel):

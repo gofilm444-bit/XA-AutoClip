@@ -11,7 +11,7 @@ function jsonResponse(status: number, body: unknown) {
 
 describe("media helpers", () => {
   it("mediaUrl builds the editor media file url", () => {
-    expect(mediaUrl("t1", "a1")).toBe("http://localhost:8000/api/transformations/t1/media/a1");
+    expect(mediaUrl("t1", "a1")).toBe("http://localhost:8000/api/transformations/t1/media/a1/source");
   });
 
   it("uploadMedia posts file and kind and returns parsed body", async () => {

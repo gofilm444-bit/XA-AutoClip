@@ -39,6 +39,7 @@ from app.services.clipper_style import (
 from app.services.media import (
     AudioMixSource,
     assemble_media_sequence,
+    assemble_multi_source_sequence,
     extract_audio,
     extract_clip,
     extract_thumbnail,
@@ -49,7 +50,7 @@ from app.services.media import (
     render_vertical,
     validate_render_output,
 )
-from app.services.render_cache import render_fingerprint, write_render_cache_metadata
+from app.services.render_cache import render_fingerprint, render_manifest_hash, write_render_cache_metadata
 from app.services.render_plan import build_editor_render_plan, resolve_caption_render_cues
 from app.services.render_result import verify_render_file_binding
 from app.services.sports import (
@@ -378,7 +379,15 @@ def process_project(project_id: str, job_id: str, force_reprocess: bool = False)
             )
         )
         _transition(project, ProjectStatus.GENERATING_CANDIDATES)
-        _job_progress(job, 80, "Memberi skor kandidat")
+        _job_progress(
+            job,
+            75,
+            (
+                "Menganalisis momen seru dan peluang pertandingan"
+                if project.content_type == "sports"
+                else "Menganalisis percakapan dan mencari kandidat klip"
+            ),
+        )
         db.commit()
         settings = get_settings()
         max_top_clips = max(1, settings.max_saved_top_clips)
@@ -447,6 +456,12 @@ def process_project(project_id: str, job_id: str, force_reprocess: bool = False)
                 update_strategy="reuse_by_rank_delete_stale_overwrite_clip_files",
             )
         for rank, draft in enumerate(final_drafts, 1):
+            _job_progress(
+                job,
+                78 + int((rank / max(1, len(final_drafts))) * 8),
+                f"Menyiapkan judul dan hook AI ({rank}/{len(final_drafts)})",
+            )
+            db.commit()
             logger.info(
                 "candidate_quality_audit",
                 project_id=str(project.id),
@@ -540,7 +555,14 @@ def process_project(project_id: str, job_id: str, force_reprocess: bool = False)
                 .order_by(ClipCandidate.rank)
             )
         )
-        for candidate in saved_candidates[:max_top_clips]:
+        total_clips = len(saved_candidates[:max_top_clips])
+        for i, candidate in enumerate(saved_candidates[:max_top_clips]):
+            _job_progress(
+                job,
+                87 + int(((i + 1) / max(1, total_clips)) * 11),
+                f"Membuat preview dan thumbnail klip ({i + 1}/{total_clips})",
+            )
+            db.commit()
             clip_path = storage.resolve(f"{project.id}/clips/{candidate.id}.mp4")
             thumb_path = storage.resolve(f"{project.id}/thumbnails/{candidate.id}.jpg")
             extract_clip(
@@ -669,10 +691,15 @@ def render_video(render_id: str, preview: bool) -> dict | None:
         render.status = "running"
         db.commit()
         settings = get_settings()
-        width, height = (
-            (settings.preview_width, settings.preview_height)
-            if preview
-            else (settings.final_width, settings.final_height)
+        width = int(render.width) if render.width else (settings.preview_width if preview else settings.final_width)
+        height = int(render.height) if render.height else (settings.preview_height if preview else settings.final_height)
+        logger.info(
+            "render_target_size",
+            render_id=str(render.id),
+            width=width,
+            height=height,
+            resolution=f"{width}x{height}",
+            preview=preview,
         )
         folder = "previews" if preview else "exports"
         destination = LocalStorageProvider().resolve(
@@ -858,10 +885,16 @@ def render_video(render_id: str, preview: bool) -> dict | None:
         renderer_cues = cues
         caption_write_report = None
         if renderer_cues:
+            caption_style_payload = (
+                style_config.get("main_caption_style")
+                or style_config.get("caption_style")
+            )
             caption_write_report = write_ass_cues(
                 subtitle_path,
                 renderer_cues,
-                style_config.get("caption_style"),
+                caption_style_payload,
+                rich_cues=caption_selection.rich_cues,
+                style_config=style_config,
             )
             if caption_write_report.cues_written == 0:
                 with suppress(FileNotFoundError):
@@ -1004,22 +1037,83 @@ def render_video(render_id: str, preview: bool) -> dict | None:
         )
         original_source_path = source_path
         sequence_build_started_at = perf_counter()
+
+        # ── Resolve per-segment source paths ─────────────────────────────────
+        # media_sequence items carry asset_id and source_path from normalize_media_sequence.
+        # For multi-video timelines each segment may point to a different file.
+        # We resolve the actual Path for each segment now so the assembler can use them.
+        def _resolve_segment_source(item: dict) -> Path | None:
+            """Return the resolved Path for a single media_sequence segment."""
+            seg_source_path = item.get("source_path")
+            if seg_source_path and Path(str(seg_source_path)).is_file():
+                return Path(str(seg_source_path))
+            seg_asset_id = item.get("asset_id")
+            if seg_asset_id:
+                asset_rec = db.get(MediaAsset, uuid.UUID(str(seg_asset_id)))
+                if asset_rec and asset_rec.storage_path and Path(asset_rec.storage_path).is_file():
+                    return Path(asset_rec.storage_path)
+            return None
+
+        resolved_segment_sources = [_resolve_segment_source(item) for item in media_sequence]
+
+        # Determine if any segment uses a different file than the candidate source
+        is_multi_source = any(
+            p is not None and p != original_source_path
+            for p in resolved_segment_sources
+        )
+
+        logger.info(
+            "[render_video_segment_input]",
+            render_id=render_id,
+            candidate_source_path=str(original_source_path),
+            is_multi_source=is_multi_source,
+            segments=[
+                {
+                    "index": i,
+                    "asset_id": item.get("asset_id"),
+                    "resolved_source_path": str(resolved_segment_sources[i]) if resolved_segment_sources[i] else None,
+                    "source_start": item.get("source_start"),
+                    "source_end": item.get("source_end"),
+                }
+                for i, item in enumerate(media_sequence)
+            ],
+        )
+
         if len(media_sequence) > 1:
             sequence_source_path = destination.with_name(
                 f"{destination.stem}.sequence{destination.suffix}"
             )
-            sequence_ranges = [
-                (
-                    float(item["source_start"])
-                    if uses_short_source
-                    else candidate.start_seconds + float(item["source_start"]),
-                    float(item["source_end"])
-                    if uses_short_source
-                    else candidate.start_seconds + float(item["source_end"]),
+            if is_multi_source:
+                # Multi-source: each segment may come from a different file.
+                # source_start/source_end are already 0-based per-asset (no candidate offset needed).
+                multi_source_segments = [
+                    {
+                        "source_path": str(resolved_segment_sources[i]) if resolved_segment_sources[i] else str(original_source_path),
+                        "source_start": float(item["source_start"]),
+                        "source_end": float(item["source_end"]),
+                        "asset_id": item.get("asset_id"),
+                    }
+                    for i, item in enumerate(media_sequence)
+                ]
+                assemble_multi_source_sequence(
+                    multi_source_segments,
+                    sequence_source_path,
+                    fallback_source=original_source_path,
                 )
-                for item in media_sequence
-            ]
-            assemble_media_sequence(source_path, sequence_source_path, sequence_ranges)
+            else:
+                # Single-source (legacy): trim from the same source file, apply candidate offset.
+                sequence_ranges = [
+                    (
+                        float(item["source_start"])
+                        if uses_short_source
+                        else candidate.start_seconds + float(item["source_start"]),
+                        float(item["source_end"])
+                        if uses_short_source
+                        else candidate.start_seconds + float(item["source_end"]),
+                    )
+                    for item in media_sequence
+                ]
+                assemble_media_sequence(source_path, sequence_source_path, sequence_ranges)
             source_path = sequence_source_path
             render_start = 0.0
         else:
@@ -1415,7 +1509,7 @@ def render_video(render_id: str, preview: bool) -> dict | None:
         final_validation_duration = perf_counter() - final_validation_started_at
         output_validation_duration += final_validation_duration
         metadata_write_started_at = perf_counter()
-        output_fingerprint = audit_fingerprint or render_fingerprint(
+        output_fingerprint = audit_fingerprint or render_manifest_hash(
             requested_style_config,
             preset=render.preset,
             subtitle_language=render.subtitle_language,
@@ -1423,11 +1517,28 @@ def render_video(render_id: str, preview: bool) -> dict | None:
             height=height,
             frame_rate=render.frame_rate,
             preview=preview,
+            audio_identity=audio_identity,
         )
+        caption_style_meta = style_config.get("main_caption_style") or style_config.get("caption_style") or {}
+        template_id = str(caption_style_meta.get("preset_id") or caption_style_meta.get("style_id") or "default")
+        template_type = str(caption_style_meta.get("template_type") or "basic_subtitle")
         write_render_cache_metadata(
             destination,
+            manifest_hash=output_fingerprint,
             fingerprint=output_fingerprint,
             video_framing=style_config.get("video_framing"),
+            width=width,
+            height=height,
+            template_id=template_id,
+            template_type=template_type,
+        )
+        logger.info(
+            "render_output_written",
+            render_id=str(render.id),
+            output_path=str(destination),
+            resolution=f"{width}x{height}",
+            file_size=destination.stat().st_size,
+            manifest_hash=output_fingerprint,
         )
         logger.info(
             "render_cache_metadata_written",

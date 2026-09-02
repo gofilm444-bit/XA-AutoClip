@@ -14,6 +14,7 @@ import {
 } from "react";
 import { Link, useOutletContext, useParams } from "react-router-dom";
 import {
+  API_URL,
   api,
   candidateVideoUrl,
   downloadUrl,
@@ -33,9 +34,19 @@ import type {
 import { projectCaptionCues } from "../utils/captionProjection";
 import { sanitizeDownloadFilename } from "../utils/downloadFilename";
 import {
+  getActiveVideoSegment,
+  getNextVideoSegment,
+  getTimelineDuration,
   hasManualEditorTimelineVideo,
   initialEditorContext,
   isManualEditorTransformation,
+  normalizeMediaSequence,
+  resolveVideoSegmentSource,
+  resolveVideoSourceTime,
+  trimMediaSegmentRight,
+  effectiveMediaDuration,
+  sameMediaSource,
+  type MediaSequenceSegment,
 } from "../utils/manualEditor";
 import {
   resolveHookPreviewRenderState,
@@ -49,16 +60,27 @@ import {
   type TextStylePresetKey,
 } from "../utils/textStylePresets";
 import {
-  CAPTION_TEMPLATES,
   DEFAULT_MAIN_CAPTION_STYLE,
+  applyCaptionTemplateToCaptionItem,
+  applyCaptionTemplateToMainStyle,
+  computeKaraokeWordProgress,
+  extractHighlightedWordIndices,
   formatCaptionCase,
   normalizeMainCaptionStyle,
   resolveCaptionStyle,
   type CaptionCueItem,
-  type CaptionTemplateCategory,
+  type CaptionTemplate,
   type MainCaptionStyle,
 } from "../utils/captionTemplates";
 import { packTimelineItemsIntoLanes } from "../utils/timelinePacking";
+import { FontPicker } from "../components/FontPicker";
+import { CaptionTemplateGallery } from "../components/CaptionTemplateGallery";
+import {
+  FONT_CATALOG,
+  getFontByFamily,
+  getFontById,
+  resolveFontFamily,
+} from "../utils/fontCatalog";
 
 type Render = {
   id: string;
@@ -73,6 +95,8 @@ type Render = {
   error_message?: string;
   warning_message?: string;
   output_url?: string;
+  manifest_hash?: string;
+  cache_reused?: boolean;
   progress?: number;
   progress_percent?: number;
 };
@@ -285,11 +309,11 @@ const visualEffectsList = [
 ];
 
 const mediaDirectories = [
-  { id: "import", label: "Import", icon: "📥" },
   { id: "project_media", label: "Project Media", icon: "📁" },
   { id: "video", label: "Video", icon: "🎬" },
   { id: "audio", label: "Audio", icon: "🎵" },
   { id: "images", label: "Images", icon: "🖼️" },
+  { id: "import", label: "Import", icon: "📥" },
 ] as const;
 
 const audioDirectories = [
@@ -560,6 +584,14 @@ const editorMediaInputConfig: Record<
   },
 };
 
+
+function formatMediaDuration(seconds?: number | null): string {
+  if (!seconds || !Number.isFinite(seconds) || seconds <= 0) return "0:00";
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.floor(seconds % 60);
+  return `${mins}:${secs.toString().padStart(2, "0")}`;
+}
+
 export function EditorMediaImportControls({
   className = "flex items-center gap-1.5",
   disabled = false,
@@ -804,15 +836,6 @@ type MediaTrim = {
   end: number;
 };
 
-type MediaSequenceSegment = {
-  id: string;
-  sourceStart: number;
-  sourceEnd: number;
-  locked?: boolean;
-  visible?: boolean;
-  muted?: boolean;
-};
-
 type EditableCaptionCue = {
   id: string;
   start: number;
@@ -977,7 +1000,8 @@ type HookTextFont =
   | "modern_rounded"
   | "condensed_news"
   | "playful"
-  | "clean_sans";
+  | "clean_sans"
+  | (string & {});
 type HookTemplateDefinition = {
   value: HookTextTemplate;
   label: string;
@@ -1163,41 +1187,47 @@ const hookTextTemplates: HookTemplateDefinition[] = [
 ];
 
 const hookTextFonts: HookFontDefinition[] = [
+  ...FONT_CATALOG.map((f) => ({
+    value: f.id as HookTextFont,
+    label: f.name,
+    description: f.description || f.name,
+    fontFamily: f.family,
+  })),
   {
     value: "bold_sans",
     label: "Bold Sans",
     description: "Kuat untuk konten umum dan viral.",
-    fontFamily: '"Arial Black", Arial, Helvetica, sans-serif',
+    fontFamily: "'Anton', 'Arial Black', sans-serif",
   },
   {
     value: "elegant_serif",
     label: "Elegant Serif",
     description: "Formal, editorial, dan elegan.",
-    fontFamily: 'Georgia, "Times New Roman", serif',
+    fontFamily: "'Playfair Display', Georgia, serif",
   },
   {
     value: "modern_rounded",
     label: "Modern Rounded",
     description: "Ramah dengan bentuk huruf modern.",
-    fontFamily: '"Arial Rounded MT Bold", "Trebuchet MS", Arial, sans-serif',
+    fontFamily: "'Fredoka', 'Baloo 2', sans-serif",
   },
   {
     value: "condensed_news",
     label: "Condensed News",
     description: "Padat untuk headline dan berita.",
-    fontFamily: '"Arial Narrow", Impact, "Segoe UI", sans-serif',
+    fontFamily: "'Oswald', 'Roboto Condensed', sans-serif",
   },
   {
     value: "playful",
     label: "Playful",
     description: "Santai untuk konten kreatif.",
-    fontFamily: '"Segoe Print", "Comic Sans MS", "Trebuchet MS", cursive',
+    fontFamily: "'Caveat', 'Patrick Hand', cursive",
   },
   {
     value: "clean_sans",
     label: "Clean Sans",
     description: "Minimal dan mudah dibaca.",
-    fontFamily: '"Segoe UI", Inter, Arial, sans-serif',
+    fontFamily: "'Inter', sans-serif",
   },
 ];
 
@@ -1208,9 +1238,12 @@ function normalizeHookTextTemplate(value: unknown): HookTextTemplate {
 }
 
 function normalizeHookTextFont(value: unknown): HookTextFont {
-  return hookTextFonts.some((font) => font.value === value)
-    ? (value as HookTextFont)
-    : "clean_sans";
+  if (typeof value !== "string" || !value) return "inter";
+  const found = hookTextFonts.find((font) => font.value === value || font.fontFamily === value);
+  if (found) return found.value;
+  const match = getFontById(value) || getFontByFamily(value);
+  if (match) return match.id;
+  return value;
 }
 
 const defaultAudioSettings: AudioSettings = {
@@ -1246,26 +1279,6 @@ function normalizeMediaTrim(
     Math.max(start + 0.1, Number.isFinite(requestedEnd) ? requestedEnd : safeDuration),
   );
   return { start: Number(start.toFixed(2)), end: Number(end.toFixed(2)) };
-}
-
-function normalizeMediaSequence(value: unknown, duration: number): MediaSequenceSegment[] {
-  if (!Array.isArray(value)) return [];
-  const safeDuration = Math.max(0.1, Number(duration) || 0.1);
-  return value
-    .map((entry, index) => {
-      if (!entry || typeof entry !== "object") return null;
-      const sourceStart = Math.max(0, Number((entry as Record<string, unknown>).source_start));
-      const sourceEnd = Math.min(safeDuration, Number((entry as Record<string, unknown>).source_end));
-      if (!Number.isFinite(sourceStart) || !Number.isFinite(sourceEnd) || sourceEnd - sourceStart < 0.1) {
-        return null;
-      }
-      return {
-        id: String((entry as Record<string, unknown>).id || `media-${index}`),
-        sourceStart: Number(sourceStart.toFixed(3)),
-        sourceEnd: Number(sourceEnd.toFixed(3)),
-      };
-    })
-    .filter((segment): segment is MediaSequenceSegment => Boolean(segment));
 }
 
 const renderPresetValues = presetOptions.map((item) => item.value);
@@ -1570,11 +1583,11 @@ function formatTimePrecise(value: number) {
 }
 
 function eventLeft(start: number, duration: number) {
-  return `${Math.min(100, Math.max(0, (start / Math.max(1, duration)) * 100))}%`;
+  return `${Math.min(100, Math.max(0, (start / Math.max(0.1, duration)) * 100))}%`;
 }
 
 function eventWidth(start: number, end: number, duration: number) {
-  return `${Math.max(0.7, Math.min(100, ((end - start) / Math.max(1, duration)) * 100))}%`;
+  return `${Math.max(0.7, Math.min(100, ((end - start) / Math.max(0.1, duration)) * 100))}%`;
 }
 
 function editableEventId(event: EffectTimelineEvent, index: number) {
@@ -1696,10 +1709,30 @@ function uniqueCaptionPartId(baseId: string, partNumber: number, usedIds: Set<st
   return candidate;
 }
 
+function chunkWordsBalanced<T>(items: T[], minWords = 3, maxWords = 6): T[][] {
+  const n = items.length;
+  if (n === 0) return [];
+  if (n <= maxWords) return [items];
+  let c = Math.ceil(n / maxWords);
+  while (c > 1 && Math.floor(n / c) < minWords) {
+    c--;
+  }
+  const b = Math.floor(n / c);
+  const r = n % c;
+  const chunks: T[][] = [];
+  let offset = 0;
+  for (let i = 0; i < c; i++) {
+    const size = i < r ? b + 1 : b;
+    chunks.push(items.slice(offset, offset + size));
+    offset += size;
+  }
+  return chunks;
+}
+
 function reflowCaptionCue(
   cue: EditableCaptionCue,
   usedIds: Set<string>,
-  maxWords = DEFAULT_CAPTION_TARGET_WORDS,
+  maxWords = 6,
 ) {
   const words = captionWords(cue.text);
   if (words.length <= maxWords) {
@@ -1707,10 +1740,7 @@ function reflowCaptionCue(
     return [{ ...cue }];
   }
 
-  const chunks: string[][] = [];
-  for (let index = 0; index < words.length; index += maxWords) {
-    chunks.push(words.slice(index, index + maxWords));
-  }
+  const chunks = chunkWordsBalanced(words, 3, maxWords);
   const duration = Math.max(0, cue.end - cue.start);
   let consumedWords = 0;
   return chunks.map((chunk, index) => {
@@ -1968,6 +1998,7 @@ function AccordionSection({
 }
 
 function TimelineTrack({
+  laneId,
   trackKey = "text",
   locked = false,
   onToggleLock,
@@ -1977,6 +2008,7 @@ function TimelineTrack({
   onToggleMute,
   muteDisabled = false,
   muteTooltip,
+  label = "Track",
   items,
   duration,
   playheadPercent,
@@ -1993,6 +2025,9 @@ function TimelineTrack({
   onItemResizePointerDown,
   onItemResizePointerMove,
   onItemResizePointerUp,
+  onSelectLane,
+  onOpenLaneMenu,
+  isLaneSelected = false,
   resizable = false,
   selectedItemId,
   selected = false,
@@ -2001,6 +2036,7 @@ function TimelineTrack({
   transitions,
   onTransitionClick,
 }: {
+  laneId?: string;
   trackKey?: "text" | "overlay" | "video" | "audio";
   locked?: boolean;
   onToggleLock?: () => void;
@@ -2043,6 +2079,9 @@ function TimelineTrack({
   ) => void;
   onItemResizePointerMove?: (event: ReactPointerEvent<HTMLSpanElement>) => void;
   onItemResizePointerUp?: (event: ReactPointerEvent<HTMLSpanElement>) => void;
+  onSelectLane?: () => void;
+  onOpenLaneMenu?: (event: ReactMouseEvent<HTMLButtonElement>) => void;
+  isLaneSelected?: boolean;
   resizable?: boolean;
   selectedItemId?: string | null;
   selected?: boolean;
@@ -2073,18 +2112,24 @@ function TimelineTrack({
 
   return (
     <div
-      className="grid grid-cols-[104px_minmax(0,1fr)] items-center gap-2"
+      className="grid grid-cols-[130px_minmax(0,1fr)] items-center gap-2"
+      data-lane-id={laneId}
       style={typeof order === "number" ? { order } : undefined}
     >
       {/* COMPACT ICON-ONLY LANE HEADER */}
-      <div className={`flex items-center gap-1 px-1 py-0.5 rounded-lg select-none ${
-        selected ? "bg-cyan-950/40 border border-cyan-800/40" : "bg-transparent"
-      }`}>
+      <div
+        className={`flex items-center gap-1 px-1 py-0.5 rounded-lg select-none cursor-pointer transition ${
+          isLaneSelected || selected
+            ? "bg-cyan-950/40 border border-cyan-800/40 ring-1 ring-cyan-400/30"
+            : "bg-transparent border border-transparent hover:bg-zinc-800/40"
+        }`}
+        onClick={() => onSelectLane?.()}
+      >
         {/* 1. Category Icon Badge */}
         {isText && (
           <span
             className="flex size-6 shrink-0 items-center justify-center rounded bg-cyan-950/80 border border-cyan-800/60 text-cyan-300 shadow-sm"
-            title="Track Text & Caption"
+            title={`${label} (Klik untuk pilih track)`}
           >
             <svg className="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
               <polyline points="4 7 4 4 20 4 20 7" />
@@ -2096,7 +2141,7 @@ function TimelineTrack({
         {isOverlay && (
           <span
             className="flex size-6 shrink-0 items-center justify-center rounded bg-fuchsia-950/80 border border-fuchsia-800/60 text-fuchsia-300 shadow-sm"
-            title="Track Overlay & Sticker"
+            title={`${label} (Klik untuk pilih track)`}
           >
             <svg className="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
               <polygon points="12 2 2 7 12 12 22 7 12 2" />
@@ -2108,7 +2153,7 @@ function TimelineTrack({
         {isVideo && (
           <span
             className="flex size-6 shrink-0 items-center justify-center rounded bg-blue-950/80 border border-blue-800/60 text-blue-300 shadow-sm"
-            title="Track Video"
+            title={`${label} (Klik untuk pilih track)`}
           >
             <svg className="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
               <polygon points="23 7 16 12 23 17 23 7" />
@@ -2119,7 +2164,7 @@ function TimelineTrack({
         {isAudio && (
           <span
             className="flex size-6 shrink-0 items-center justify-center rounded bg-emerald-950/80 border border-emerald-800/60 text-emerald-300 shadow-sm"
-            title="Track Audio"
+            title={`${label} (Klik untuk pilih track)`}
           >
             <svg className="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M9 18V5l12-2v13" />
@@ -2232,6 +2277,24 @@ function TimelineTrack({
             )}
           </button>
         )}
+
+        {/* 5. Track Level Actions Menu (...) Button */}
+        <button
+          type="button"
+          aria-label="Menu opsi track"
+          onClick={(event) => {
+            event.stopPropagation();
+            onOpenLaneMenu?.(event);
+          }}
+          title="Opsi & Hapus isi track"
+          className="flex size-6 shrink-0 items-center justify-center rounded text-zinc-400 hover:bg-zinc-800 hover:text-cyan-300 transition"
+        >
+          <svg className="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="12" r="1" />
+            <circle cx="19" cy="12" r="1" />
+            <circle cx="5" cy="12" r="1" />
+          </svg>
+        </button>
       </div>
 
       {/* TRACK LANE BODY */}
@@ -2396,9 +2459,12 @@ function PresetVideo({
   videoRef,
   onPlay,
   onPause,
+  onEnded,
   onTimeUpdate,
   onLoadedMetadata,
+  onCanPlay,
   onSeeked,
+  onError,
 }: {
   src: string;
   preset: "blurred_background" | "center_crop" | "fit_background" | "picture_in_picture" | "clean_podcast" | RenderPreset | string;
@@ -2412,15 +2478,35 @@ function PresetVideo({
   videoRef?: Ref<HTMLVideoElement>;
   onPlay?: () => void;
   onPause?: () => void;
+  onEnded?: () => void;
   onTimeUpdate?: (currentTime: number) => void;
-  onLoadedMetadata?: (currentTime: number) => void;
+  onLoadedMetadata?: (currentTime: number, element: HTMLVideoElement) => void;
+  onCanPlay?: (element: HTMLVideoElement) => void;
   onSeeked?: (currentTime: number) => void;
+  onError?: (element: HTMLVideoElement) => void;
 }) {
   const safeFraming = normalizeVideoFraming(framing);
   const safeAdjustments = normalizeVideoAdjustments(adjustments);
   const clampedSpeed = Math.max(0.25, Math.min(4.0, Number(speed) || 1.0));
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const bgVideoRef = useRef<HTMLVideoElement | null>(null);
+
+  useEffect(() => {
+    if (import.meta.env.DEV) {
+      console.log("[preview_video_component_mount]", {
+        src,
+        preset,
+      });
+    }
+    return () => {
+      if (import.meta.env.DEV) {
+        console.log("[preview_video_component_unmount]", {
+          src,
+          preset,
+        });
+      }
+    };
+  }, [src, preset]);
 
   useEffect(() => {
     const el = localVideoRef.current;
@@ -2604,6 +2690,12 @@ function PresetVideo({
       }
       onPause?.();
     },
+    onEnded: () => {
+      if (bgVideoRef.current) {
+        bgVideoRef.current.pause();
+      }
+      onEnded?.();
+    },
     onLoadedMetadata: (event: SyntheticEvent<HTMLVideoElement>) => {
       event.currentTarget.volume = Math.min(1, Math.max(0, audioVolume));
       event.currentTarget.playbackRate = clampedSpeed;
@@ -2611,7 +2703,10 @@ function PresetVideo({
         bgVideoRef.current.playbackRate = clampedSpeed;
         bgVideoRef.current.currentTime = event.currentTarget.currentTime;
       }
-      onLoadedMetadata?.(event.currentTarget.currentTime);
+      onLoadedMetadata?.(event.currentTarget.currentTime, event.currentTarget);
+    },
+    onCanPlay: (event: SyntheticEvent<HTMLVideoElement>) => {
+      onCanPlay?.(event.currentTarget);
     },
     onTimeUpdate: (event: SyntheticEvent<HTMLVideoElement>) => {
       syncBgVideo();
@@ -2622,6 +2717,9 @@ function PresetVideo({
         bgVideoRef.current.currentTime = event.currentTarget.currentTime;
       }
       onSeeked?.(event.currentTarget.currentTime);
+    },
+    onError: (event: SyntheticEvent<HTMLVideoElement>) => {
+      onError?.(event.currentTarget);
     },
   };
 
@@ -2647,7 +2745,9 @@ function PresetVideo({
           className="h-full w-full object-cover"
           controls={controls}
           muted={!controls || audioMuted}
-          preload="metadata"
+          preload="auto"
+          playsInline
+          crossOrigin="anonymous"
           ref={setCombinedRef}
           src={src}
           style={centerCropFramingStyle}
@@ -2658,7 +2758,9 @@ function PresetVideo({
           className="h-full w-full object-cover"
           controls={controls}
           muted={!controls || audioMuted}
-          preload="metadata"
+          preload="auto"
+          playsInline
+          crossOrigin="anonymous"
           ref={setCombinedRef}
           src={src}
           style={cleanPodcastFramingStyle}
@@ -2669,7 +2771,9 @@ function PresetVideo({
           className="h-full w-full object-cover"
           controls={controls}
           muted={!controls || audioMuted}
-          preload="metadata"
+          preload="auto"
+          playsInline
+          crossOrigin="anonymous"
           ref={setCombinedRef}
           src={src}
           style={talkingHeadFramingStyle}
@@ -2680,7 +2784,9 @@ function PresetVideo({
           className="h-full w-full object-contain"
           controls={controls}
           muted={!controls || audioMuted}
-          preload="metadata"
+          preload="auto"
+          playsInline
+          crossOrigin="anonymous"
           ref={setCombinedRef}
           src={src}
           style={studioPodcastFramingStyle}
@@ -2691,7 +2797,9 @@ function PresetVideo({
           className="h-full w-full object-contain"
           controls={controls}
           muted={!controls || audioMuted}
-          preload="metadata"
+          preload="auto"
+          playsInline
+          crossOrigin="anonymous"
           ref={setCombinedRef}
           src={src}
           style={fitFramingStyle}
@@ -2706,7 +2814,9 @@ function PresetVideo({
           }
           controls={controls}
           muted={!controls || audioMuted}
-          preload="metadata"
+          preload="auto"
+          playsInline
+          crossOrigin="anonymous"
           ref={setCombinedRef}
           src={src}
           style={containedForegroundFramingStyle}
@@ -3339,6 +3449,15 @@ export function TransformationPage() {
   const [renderDirty, setRenderDirty] = useState(false);
   const [previewTime, setPreviewTime] = useState(0);
   const [previewPlaying, setPreviewPlaying] = useState(false);
+  const [previewVideoError, setPreviewVideoError] = useState<{
+    source: string;
+    assetId?: string;
+    segmentId?: string;
+    message: string;
+    code?: number;
+    timestamp: number;
+  } | null>(null);
+  const prevLoggedVideoSourceRef = useRef<string | null>(null);
   const [timelineHover, setTimelineHover] = useState<{
     percent: number;
     time: number;
@@ -3390,7 +3509,9 @@ export function TransformationPage() {
   const [selectedCaptionId, setSelectedCaptionId] = useState<string | null>(null);
   const [selectedMediaSegmentId, setSelectedMediaSegmentId] = useState<string | null>(null);
   const [selectedAdditionalAudioTrackId, setSelectedAdditionalAudioTrackId] = useState<string | null>(null);
-  const [mediaDirectory, setMediaDirectory] = useState<"import" | "project_media" | "video" | "audio" | "images">("import");
+  const [mediaDirectory, setMediaDirectory] = useState<"project_media" | "video" | "audio" | "images" | "import">("project_media");
+  const [mediaSearch, setMediaSearch] = useState<string>("");
+  const [selectedMediaAssetId, setSelectedMediaAssetId] = useState<string | null>(null);
   const [audioDirectory, setAudioDirectory] = useState<"music" | "sfx" | "yours" | "import" | "copyright">("music");
   const [textDirectory, setTextDirectory] = useState<"add_text" | "yours" | "text_effects" | "text_template" | "auto_captions" | "local_captions">("add_text");
   const [stickerDirectory, setStickerDirectory] = useState<string>("trending");
@@ -3407,9 +3528,8 @@ export function TransformationPage() {
   const [audioInspectorTab, setAudioInspectorTab] = useState<"audio" | "fade" | "speed" | "timing">("audio");
   const [textInspectorTab, setTextInspectorTab] = useState<"text" | "animation" | "tracking" | "tts">("text");
   const [captionInspectorTab, setCaptionInspectorTab] = useState<"captions" | "text" | "animation" | "tracking" | "tts">("captions");
-  const [captionTextSubTab, setCaptionTextSubTab] = useState<"basic" | "templates" | "effects">("basic");
+  const [captionTextSubTab, setCaptionTextSubTab] = useState<"basic" | "templates" | "bubble" | "effects">("basic");
   const [captionAnimationSubTab, setCaptionAnimationSubTab] = useState<"in" | "out" | "loop" | "captions">("captions");
-  const [captionTemplateCategory, setCaptionTemplateCategory] = useState<CaptionTemplateCategory>("All");
   const [captionCueSearch, setCaptionCueSearch] = useState<string>("");
   const [effectInspectorTab, setEffectInspectorTab] = useState<"effect" | "timing">("effect");
   const [activeNavTab, setActiveNavTab] = useState<EditorNavTab>("media");
@@ -3421,6 +3541,8 @@ export function TransformationPage() {
     name: string;
   } | null>(null);
   const [demoTransitionProgress, setDemoTransitionProgress] = useState<number>(0);
+  const [hoveredFontPreview, setHoveredFontPreview] = useState<string | null>(null);
+  const [hoveredCaptionTemplate, setHoveredCaptionTemplate] = useState<CaptionTemplate | null>(null);
 
   const triggerTransitionDemo = (item: (typeof transitionItems)[number]) => {
     setPreviewingTransitionId(item.id);
@@ -3493,6 +3615,206 @@ export function TransformationPage() {
   const [exportTechnicalOpen, setExportTechnicalOpen] = useState(false);
   const [copiedMediaSegment, setCopiedMediaSegment] = useState<MediaSequenceSegment | null>(null);
   const [copiedTimedItem, setCopiedTimedItem] = useState<CopiedTimedItem | null>(null);
+  const [selectedTimelineLaneId, setSelectedTimelineLaneId] = useState<string | null>(null);
+  const [trackDeleteConfirm, setTrackDeleteConfirm] = useState<{
+    laneId: string;
+    trackKey: "text" | "overlay" | "video" | "audio";
+    label: string;
+    itemCount: number;
+    items: TimelineItem[];
+  } | null>(null);
+  const [laneContextMenu, setLaneContextMenu] = useState<{
+    x: number;
+    y: number;
+    laneId: string;
+    trackKey: "text" | "overlay" | "video" | "audio";
+    label: string;
+    items: TimelineItem[];
+    locked: boolean;
+  } | null>(null);
+
+  const requestDeleteLaneContents = (
+    laneId: string,
+    trackKey: "text" | "overlay" | "video" | "audio",
+    label: string,
+    items: TimelineItem[],
+    locked: boolean,
+  ) => {
+    if (locked) {
+      setTimelineError("Track sedang dikunci. Buka kunci sebelum menghapus.");
+      setMessage("Track terkunci. Buka kunci sebelum menghapus.");
+      return;
+    }
+    if (!items || items.length === 0) {
+      setMessage("Track sudah kosong.");
+      return;
+    }
+    setTrackDeleteConfirm({
+      laneId,
+      trackKey,
+      label,
+      itemCount: items.length,
+      items,
+    });
+  };
+
+  const selectAllLaneItems = (
+    trackKey: "text" | "overlay" | "video" | "audio",
+    items: TimelineItem[],
+  ) => {
+    if (items.length === 0) return;
+    const firstItem = items[0];
+    if (trackKey === "video") {
+      setSelectedMediaSegmentId(firstItem.id);
+      setSelectedEditorContext("video");
+    } else if (trackKey === "audio") {
+      if (firstItem.type === "audio") {
+        setSelectedMediaSegmentId(firstItem.id);
+        setSelectedEditorContext("audio");
+      } else {
+        setSelectedAdditionalAudioTrackId(firstItem.id);
+        setSelectedEditorContext("audio");
+      }
+    } else if (trackKey === "text") {
+      if (firstItem.type === "caption") {
+        setSelectedCaptionId(firstItem.id);
+        setSelectedEditorContext("caption");
+      } else {
+        setSelectedEventId(firstItem.eventId || firstItem.id);
+        setSelectedEditorContext("hook");
+      }
+    } else if (trackKey === "overlay") {
+      setSelectedEventId(firstItem.eventId || firstItem.id);
+      setSelectedEditorContext("effect");
+    }
+  };
+
+  const deleteTimelineLaneContents = (
+    trackKey: "text" | "overlay" | "video" | "audio",
+    items: TimelineItem[],
+  ) => {
+    recordEditorHistory(draft, `delete-track-${trackKey}`, true);
+    setTimelineError("");
+    setEditorDirty(true);
+    setTimelineDirty(true);
+    setRenderDirty(true);
+    setRender(undefined);
+
+    if (trackKey === "text") {
+      const deletedCueIds = new Set(
+        items.filter((i) => i.type === "caption").map((i) => i.id || i.eventId || ""),
+      );
+      const deletedEventIds = new Set(
+        items.filter((i) => i.type !== "caption").map((i) => i.eventId || i.id || ""),
+      );
+
+      const nextCaptionCues = editableCaptionCues.filter(
+        (cue) => !deletedCueIds.has(cue.id),
+      );
+      const nextEffectEvents = configuredEffectTimeline.filter(
+        (event) => !deletedEventIds.has(event.id || ""),
+      );
+
+      if (selectedCaptionId && deletedCueIds.has(selectedCaptionId)) {
+        setSelectedCaptionId(null);
+      }
+      if (selectedEventId && deletedEventIds.has(selectedEventId)) {
+        setSelectedEventId(null);
+      }
+
+      setDraft((current) => {
+        if (!current) return current;
+        return {
+          ...current,
+          clipper_style_config: {
+            ...styleDefaults.clean_podcast,
+            ...(current.clipper_style_config || {}),
+            caption_timeline_initialized: true,
+            caption_timeline: nextCaptionCues.map((cue) => ({
+              ...cue,
+              style_id: cue.style_id || null,
+              style_override: cue.style_override || null,
+            })),
+            effect_timeline: nextEffectEvents,
+          },
+        };
+      });
+
+      setAutosaveWakeRevision((r) => r + 1);
+      setMessage(`${items.length} item pada track Text berhasil dihapus.`);
+    } else if (trackKey === "overlay") {
+      const deletedEventIds = new Set(
+        items.map((i) => i.eventId || i.id || ""),
+      );
+      const nextEffectEvents = configuredEffectTimeline.filter(
+        (event) => !deletedEventIds.has(event.id || ""),
+      );
+
+      if (selectedEventId && deletedEventIds.has(selectedEventId)) {
+        setSelectedEventId(null);
+      }
+
+      setDraft((current) => {
+        if (!current) return current;
+        return {
+          ...current,
+          clipper_style_config: {
+            ...styleDefaults.clean_podcast,
+            ...(current.clipper_style_config || {}),
+            effect_timeline: nextEffectEvents,
+          },
+        };
+      });
+
+      setAutosaveWakeRevision((r) => r + 1);
+      setMessage(`${items.length} item pada track Overlay berhasil dihapus.`);
+    } else if (trackKey === "video") {
+      const deletedSegIds = new Set(items.map((i) => i.id));
+      const nextSequence = videoSequence.filter((seg) => !deletedSegIds.has(seg.id));
+
+      if (selectedMediaSegmentId && deletedSegIds.has(selectedMediaSegmentId)) {
+        setSelectedMediaSegmentId(null);
+      }
+
+      commitMediaSequence(nextSequence, configuredEffectTimeline, "video");
+      if (nextSequence.length === 0) {
+        setPreviewTime(0);
+      }
+      setMessage("Seluruh isi track Video berhasil dihapus.");
+    } else if (trackKey === "audio") {
+      const deletedAudioSegIds = new Set(
+        items.filter((i) => i.type === "audio").map((i) => i.id),
+      );
+      const deletedAdditionalIds = new Set(
+        items.filter((i) => i.type === "additional_audio").map((i) => i.id),
+      );
+
+      if (deletedAudioSegIds.size > 0) {
+        const nextAudioSeq = audioSequence.filter((seg) => !deletedAudioSegIds.has(seg.id));
+        commitMediaSequence(nextAudioSeq, configuredEffectTimeline, "audio");
+      }
+
+      if (deletedAdditionalIds.size > 0) {
+        const nextAdditional = additionalAudioTracks.filter(
+          (track) => !deletedAdditionalIds.has(track.id),
+        );
+        updateAdditionalAudioLibrary(additionalAudioAssets, nextAdditional);
+      }
+
+      if (selectedMediaSegmentId && deletedAudioSegIds.has(selectedMediaSegmentId)) {
+        setSelectedMediaSegmentId(null);
+      }
+      if (
+        selectedAdditionalAudioTrackId &&
+        deletedAdditionalIds.has(selectedAdditionalAudioTrackId)
+      ) {
+        setSelectedAdditionalAudioTrackId(null);
+      }
+
+      setMessage("Seluruh isi track Audio berhasil dihapus.");
+    }
+  };
+
   const [trackContextMenu, setTrackContextMenu] = useState<{
     x: number;
     y: number;
@@ -3520,6 +3842,8 @@ export function TransformationPage() {
   const previewClockFrameRef = useRef<number | null>(null);
   const previewClockLastUpdateRef = useRef(0);
   const timelineDraggingRef = useRef(false);
+  const previewPlayingRef = useRef(false);
+  const prevActiveSegmentIdRef = useRef<string | null>(null);
   previewTimeRef.current = previewTime;
   const timelineResizeRef = useRef<{
     pointerId: number;
@@ -3752,10 +4076,18 @@ export function TransformationPage() {
     window.localStorage.setItem("autoclip-timeline-height", String(Math.round(timelineHeight)));
   }, [timelineHeight]);
   useEffect(() => {
-    if (!trackContextMenu) return;
-    const closeContextMenu = () => setTrackContextMenu(null);
+    if (!trackContextMenu && !laneContextMenu) return;
+    const closeContextMenu = (event: Event) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest?.('[role="menu"]')) return;
+      setTrackContextMenu(null);
+      setLaneContextMenu(null);
+    };
     const closeContextMenuWithKeyboard = (event: KeyboardEvent) => {
-      if (event.key === "Escape") closeContextMenu();
+      if (event.key === "Escape") {
+        setTrackContextMenu(null);
+        setLaneContextMenu(null);
+      }
     };
     window.addEventListener("pointerdown", closeContextMenu);
     window.addEventListener("scroll", closeContextMenu, true);
@@ -3765,7 +4097,7 @@ export function TransformationPage() {
       window.removeEventListener("scroll", closeContextMenu, true);
       window.removeEventListener("keydown", closeContextMenuWithKeyboard);
     };
-  }, [trackContextMenu]);
+  }, [trackContextMenu, laneContextMenu]);
   useEffect(() => {
     const titleDirty = Boolean(
       context.data && uploadTitle.trim() !== context.data.candidate_title,
@@ -3808,8 +4140,76 @@ export function TransformationPage() {
         redoEditor();
       }
     };
+    const handleTimelineDeleteShortcut = (event: KeyboardEvent) => {
+      if (event.key !== "Delete" && event.key !== "Backspace") return;
+      const target = event.target as HTMLElement | null;
+      if (
+        target?.isContentEditable ||
+        target?.tagName === "INPUT" ||
+        target?.tagName === "TEXTAREA" ||
+        target?.tagName === "SELECT"
+      ) {
+        return;
+      }
+
+      if (anyTrackSelected) {
+        event.preventDefault();
+        deleteSelectedTrackItem();
+        return;
+      }
+
+      if (selectedTimelineLaneId) {
+        const allTimelineLanes: Array<{
+          laneId: string;
+          trackKey: "text" | "overlay" | "video" | "audio";
+          label: string;
+          items: TimelineItem[];
+          locked: boolean;
+        }> = [
+          ...textLanes.map((items, idx) => ({
+            laneId: `text-lane-${idx}`,
+            trackKey: "text" as const,
+            label: `Track Text ${idx + 1}`,
+            items,
+            locked: items.length > 0 && items.every((i) => Boolean(i.locked)),
+          })),
+          ...overlayLanes.map((items, idx) => ({
+            laneId: `overlay-lane-${idx}`,
+            trackKey: "overlay" as const,
+            label: `Track Overlay ${idx + 1}`,
+            items,
+            locked: items.length > 0 && items.every((i) => Boolean(i.locked)),
+          })),
+          ...videoLanes.map((items, idx) => ({
+            laneId: `video-lane-${idx}`,
+            trackKey: "video" as const,
+            label: `Track Video ${idx + 1}`,
+            items,
+            locked: items.length > 0 && items.every((i) => Boolean(i.locked)),
+          })),
+          ...audioLanes.map((items, idx) => ({
+            laneId: `audio-lane-${idx}`,
+            trackKey: "audio" as const,
+            label: `Track Audio ${idx + 1}`,
+            items,
+            locked: items.length > 0 && items.every((i) => Boolean(i.locked)),
+          })),
+        ];
+
+        const lane = allTimelineLanes.find((l) => l.laneId === selectedTimelineLaneId);
+        if (lane) {
+          event.preventDefault();
+          requestDeleteLaneContents(lane.laneId, lane.trackKey, lane.label, lane.items, lane.locked);
+        }
+      }
+    };
+
     window.addEventListener("keydown", handleHistoryShortcut);
-    return () => window.removeEventListener("keydown", handleHistoryShortcut);
+    window.addEventListener("keydown", handleTimelineDeleteShortcut);
+    return () => {
+      window.removeEventListener("keydown", handleHistoryShortcut);
+      window.removeEventListener("keydown", handleTimelineDeleteShortcut);
+    };
   });
 
   function buildEditorStateSnapshot() {
@@ -3827,6 +4227,17 @@ export function TransformationPage() {
         id: String(segment.id),
         source_start: roundTime(segment.sourceStart),
         source_end: roundTime(segment.sourceEnd),
+        start: segment.start == null ? undefined : roundTime(segment.start),
+        end: segment.end == null ? undefined : roundTime(segment.end),
+        duration: roundTime(segment.duration ?? effectiveMediaDuration(segment)),
+        speed: roundTime(segment.speed ?? 1, 1),
+        asset_id: segment.asset_id || undefined,
+        name: segment.name || undefined,
+        source_url: segment.source_url || (segment as Record<string, unknown>).sourceUrl || undefined,
+        source_path: segment.source_path || (segment as Record<string, unknown>).sourcePath || undefined,
+        locked: segment.locked || undefined,
+        visible: segment.visible !== undefined ? segment.visible : undefined,
+        muted: segment.muted || undefined,
       }));
     const serializedVideoSequence = serializeSequence(videoSequence);
     const serializedAudioSequence = audioExtracted ? serializeSequence(audioSequence) : [];
@@ -4092,6 +4503,15 @@ export function TransformationPage() {
         setTimelineError("");
         setEditorDirty(true);
         setTimelineDirty(true);
+        console.log('[caption_chunking_audit]', {
+          total_cues: res.cues.length,
+          sample: res.cues.slice(0, 3).map((c) => ({
+            text: c.text,
+            word_count: c.text.trim().split(/\s+/).length,
+            start: c.start,
+            end: c.end,
+          })),
+        });
         setRenderDirty(true);
         setRender(undefined);
         setDraft((current) =>
@@ -4186,11 +4606,14 @@ export function TransformationPage() {
     mutationFn: async (preview: boolean) => {
       setExportRenderId(null);
       setExportValidatedRenderId(null);
+      const targetResolution = preview ? "540" : exportResolution;
       console.info("[XA AutoClip] export_ui_request", {
         transformationId,
         preview,
         preset,
-        resolution: preview ? "540x960" : "1080x1920",
+        resolution: targetResolution === "540" ? "540x960" : targetResolution === "720" ? "720x1280" : "1080x1920",
+        quality: exportQuality,
+        force: true,
       });
       setExportSubmissionStage("saving");
       await persistDraft();
@@ -4203,6 +4626,10 @@ export function TransformationPage() {
           body: JSON.stringify({
             preset,
             subtitle_language: subtitleLanguage,
+            resolution: targetResolution,
+            quality: exportQuality,
+            frame_rate: exportFrameRate === "source" ? 30 : Number(exportFrameRate),
+            force: true,
           }),
         },
       );
@@ -4272,7 +4699,8 @@ export function TransformationPage() {
         queueRender.mutate(false);
         return;
       }
-      const matchesRequestedResolution = exportResolution === "540" || current.width >= 1000;
+      const expectedWidth = exportResolution === "540" ? 540 : exportResolution === "720" ? 720 : 1080;
+      const matchesRequestedResolution = Math.abs((current.width || 0) - expectedWidth) < 50;
       if (!matchesRequestedResolution || exportValidatedRenderId === current.id) {
         if (exportValidatedRenderId === current.id) setMessage("File siap diunduh.");
         return;
@@ -4308,14 +4736,6 @@ export function TransformationPage() {
   const toolbarTranscriptionReady = context.data
     ? toolbarManualEditorMode || !context.data.transcription_is_demo
     : false;
-  const toolbarRenderedPreviewAvailable =
-    !renderDirty &&
-    toolbarActiveRender?.status === "completed" &&
-    toolbarActiveRender.preset === preset &&
-    Boolean(
-      toolbarActiveRender.file_size_bytes === undefined ||
-        toolbarActiveRender.file_size_bytes > 20_000,
-    );
   const toolbarRed = report?.overall_status === "transformation_required";
   const canStartExport = Boolean(
     draft &&
@@ -4604,6 +5024,93 @@ export function TransformationPage() {
     }
   };
 
+  const handleTemplateHover = (tpl: CaptionTemplate) => {
+    setHoveredCaptionTemplate(tpl);
+    const targetId = selectedCaptionId || currentCaptionCue?.id || (editableCaptionCues[0]?.id ?? "all");
+    console.debug("[caption_template_preview]", {
+      template_id: tpl.id,
+      template_type: tpl.template_type,
+      target_caption_ids: captionApplyToAll ? "all" : [targetId],
+      apply_to_all: captionApplyToAll,
+      preview_time: previewTime,
+    });
+  };
+
+  const handleTemplateLeave = () => {
+    setHoveredCaptionTemplate(null);
+  };
+
+  const applyCaptionTemplate = (tpl: CaptionTemplate) => {
+    recordEditorHistory(draft, `caption-template:${tpl.id}`);
+    setEditorDirty(true);
+    setTimelineDirty(true);
+    setRenderDirty(true);
+    setRender(undefined);
+    setHoveredCaptionTemplate(null);
+
+    console.debug("[caption_template_apply]", {
+      template_id: tpl.id,
+      template_type: tpl.template_type,
+      affected_caption_count: captionApplyToAll ? editableCaptionCues.length : 1,
+      layout: tpl.layout,
+      behavior: tpl.behavior,
+      animation: tpl.animation,
+    });
+
+    setDraft((current) => {
+      if (!current) return current;
+      const currentMain = normalizeMainCaptionStyle(
+        current.clipper_style_config?.main_caption_style as Partial<MainCaptionStyle> | undefined,
+      );
+      const nextMain = applyCaptionTemplateToMainStyle(currentMain, tpl);
+
+      const cues = Array.isArray(current.clipper_style_config?.caption_timeline) && (current.clipper_style_config?.caption_timeline || []).length > 0
+        ? [...current.clipper_style_config.caption_timeline]
+        : [...editableCaptionCues];
+
+      if (captionApplyToAll) {
+        const nextCues = cues.map((cue) => ({
+          ...cue,
+          style_id: tpl.id,
+          style_override: null,
+        }));
+        return {
+          ...current,
+          clipper_style_config: {
+            ...styleDefaults.clean_podcast,
+            ...(current.clipper_style_config || {}),
+            main_caption_style: nextMain,
+            caption_timeline: nextCues,
+          },
+        };
+      } else {
+        const targetId =
+          selectedCaptionId ||
+          currentCaptionCue?.id ||
+          (cues.length > 0 ? cues[0].id : null);
+
+        const nextCues = cues.map((cue) => {
+          if (targetId && cue.id === targetId) {
+            return applyCaptionTemplateToCaptionItem(cue, tpl);
+          }
+          return cue;
+        });
+
+        return {
+          ...current,
+          clipper_style_config: {
+            ...styleDefaults.clean_podcast,
+            ...(current.clipper_style_config || {}),
+            main_caption_style: nextMain,
+            caption_timeline: nextCues,
+          },
+        };
+      }
+    });
+
+    setMessage(`Template "${tpl.name}" diterapkan.`);
+  };
+
   const setCaptionApplyToAll = (val: boolean) => {
     recordEditorHistory(draft, "caption-apply-to-all");
     setEditorDirty(true);
@@ -4886,7 +5393,7 @@ export function TransformationPage() {
     )
     .sort((left, right) => left - right);
   const legacyBoundaries = [savedMediaTrim.start, ...savedSplitPoints, savedMediaTrim.end];
-  const legacySequence = legacyBoundaries.slice(0, -1).map((sourceStart, index) => ({
+  const legacySequence: MediaSequenceSegment[] = legacyBoundaries.slice(0, -1).map((sourceStart, index) => ({
     id: `media-${index}`,
     sourceStart,
     sourceEnd: legacyBoundaries[index + 1],
@@ -4930,21 +5437,23 @@ export function TransformationPage() {
         ? configuredAudioSequence
         : (configuredAudioSequence.length ? configuredAudioSequence : videoSequence);
   const layoutSequence = (sequence: MediaSequenceSegment[], speed: number = 1.0) => {
-    const s = Math.max(0.25, Math.min(4.0, Number.isFinite(speed) && speed > 0 ? speed : 1.0));
+    const fallbackSpeed = Math.max(0.25, Math.min(4.0, Number.isFinite(speed) && speed > 0 ? speed : 1.0));
     let offset = 0;
     const segments = sequence.map((segment, index) => {
       const start = offset;
+      const segmentSpeed = Math.max(0.25, Math.min(4.0, Number(segment.speed) || fallbackSpeed));
       const baseDuration = Math.max(0, segment.sourceEnd - segment.sourceStart);
-      const effectiveDuration = baseDuration / s;
+      const effectiveDuration = baseDuration / segmentSpeed;
       const end = start + effectiveDuration;
       offset = end;
       return {
         ...segment,
         start,
         end,
+        duration: effectiveDuration,
         baseDuration,
         effectiveDuration,
-        speed: s,
+        speed: segmentSpeed,
         number: index + 1,
       };
     });
@@ -4982,21 +5491,189 @@ export function TransformationPage() {
   const activeMediaTrack = audioExtracted && selectedEditorContext === "audio" ? "audio" : "video";
   const mediaSequence = activeMediaTrack === "audio" ? audioSequence : videoSequence;
   const mediaSegments = activeMediaTrack === "audio" ? audioSegments : videoSegments;
-  const remainingMediaDuration = Math.max(videoLayout.duration, audioLayout.duration);
-  const clipDuration = remainingMediaDuration > 0.05
-    ? remainingMediaDuration
-    : originalClipDuration;
-  const timelineScaleDuration = Math.max(originalClipDuration, clipDuration);
-  const timelineContentScale =
-    timelineZoom * (timelineScaleDuration / Math.max(0.1, originalClipDuration));
+  const clipDuration = getTimelineDuration(
+    videoSequence,
+    audioSequence,
+    additionalAudioTracks,
+    styleConfig.caption_timeline,
+    styleConfig.effect_timeline,
+    manualEditorMode ? 0.0 : originalClipDuration,
+  );
+  const timelineScaleDuration = Math.max(
+    0.1,
+    (manualEditorMode || videoSequence.length > 0)
+      ? (clipDuration > 0.05 ? clipDuration : (manualEditorMode ? 0.1 : originalClipDuration))
+      : (clipDuration || originalClipDuration),
+  );
+  const timelineContentScale = Math.max(0.25, Math.min(4.0, timelineZoom));
+
+  if (import.meta.env.DEV) {
+    videoSegments.forEach((segment) => {
+      console.log("[timeline_segment_regression_audit]", {
+        segment_id: segment.id,
+        asset_id: segment.asset_id,
+        name: segment.name,
+        start: segment.start,
+        end: segment.end,
+        duration: segment.duration,
+        source_start: segment.sourceStart,
+        source_end: segment.sourceEnd,
+        speed: segment.speed,
+        effective_duration: segment.effectiveDuration,
+      });
+    });
+
+    console.log("[timeline_layout_regression_audit]", {
+      clipDuration,
+      timelineDuration: timelineScaleDuration,
+      visibleTimelineDuration: timelineScaleDuration,
+      timelineZoom,
+      pixelsPerSecond: (1000 * timelineZoom) / Math.max(1, timelineScaleDuration),
+      segments: videoSegments.map((s) => ({
+        segment_id: s.id,
+        segmentStart: s.start,
+        segmentEnd: s.end,
+        segmentDuration: s.duration,
+        calculatedLeft: eventLeft(s.start, timelineScaleDuration),
+        calculatedWidth: eventWidth(s.start, s.end, timelineScaleDuration),
+      })),
+    });
+  }
   const sourceMediaUrl = candidateVideoUrl(draft.candidate_id);
-  const latestImportedVideo = [...(editorMediaQuery.data || [])]
-    .reverse()
-    .find((asset) => asset.kind === "video");
+  const timelineFirstVideoAssetId = videoSequence.find((seg) => seg.asset_id)?.asset_id;
+  const firstTimelineVideo = timelineFirstVideoAssetId
+    ? (editorMediaQuery.data || []).find((asset) => asset.asset_id === timelineFirstVideoAssetId)
+    : (editorMediaQuery.data || []).find((asset) => asset.kind === "video");
   const sourceClipUrl =
-    manualEditorMode && latestImportedVideo
-      ? mediaUrl(transformationId, latestImportedVideo.asset_id)
+    manualEditorMode && firstTimelineVideo
+      ? mediaUrl(transformationId, firstTimelineVideo.asset_id)
       : sourceMediaUrl;
+
+  const activeVideoSegment = getActiveVideoSegment(videoSegments, previewTime);
+
+  const activeMediaAsset = activeVideoSegment?.asset_id
+    ? (editorMediaQuery.data || []).find((asset) => asset.asset_id === activeVideoSegment.asset_id)
+    : null;
+
+  const resolvedSourceInfo = resolveVideoSegmentSource(
+    activeVideoSegment,
+    editorMediaQuery.data,
+    sourceClipUrl,
+    transformationId,
+    API_URL,
+  );
+  const activeVideoSource = resolvedSourceInfo.resolvedSource;
+
+  // Clear error state when active segment switches
+  if (activeVideoSegment && prevActiveSegmentIdRef.current && prevActiveSegmentIdRef.current !== activeVideoSegment.id) {
+    if (previewVideoError) {
+      if (import.meta.env.DEV) {
+        console.log("[preview_video_error_state]", {
+          action: "reset_on_segment_switch",
+          active_source: activeVideoSource,
+          active_asset_id: activeVideoSegment.asset_id,
+          active_segment_id: activeVideoSegment.id,
+          cleared_error: previewVideoError,
+        });
+      }
+      setPreviewVideoError(null);
+    }
+  }
+
+  // Log source change only when activeVideoSource actually changes
+  if (activeVideoSource !== prevLoggedVideoSourceRef.current) {
+    if (import.meta.env.DEV) {
+      console.log("[preview_video_source_change]", {
+        from_source: prevLoggedVideoSourceRef.current,
+        to_source: activeVideoSource,
+        active_segment_id: activeVideoSegment?.id,
+        active_asset_id: activeVideoSegment?.asset_id,
+        preview_time: previewTime,
+      });
+    }
+    prevLoggedVideoSourceRef.current = activeVideoSource;
+  }
+
+  const activeSourceHasError = Boolean(
+    previewVideoError &&
+    activeVideoSource &&
+    (sameMediaSource(previewVideoError.source, activeVideoSource) ||
+     (activeVideoSegment?.asset_id && previewVideoError.assetId === activeVideoSegment.asset_id))
+  );
+
+  if (import.meta.env.DEV) {
+    console.log("[video_sequence_debug]", videoSegments.map((segment, index) => ({
+      index,
+      segment_id: segment.id,
+      asset_id: segment.asset_id,
+      name: segment.name,
+      source_url: segment.source_url,
+      source_path: segment.source_path,
+      start: segment.start,
+      end: segment.end,
+      duration: segment.duration,
+      source_start: segment.sourceStart,
+      source_end: segment.sourceEnd,
+      speed: segment.speed,
+    })));
+  }
+
+  const activeSourceTime = activeVideoSegment
+    ? resolveVideoSourceTime(activeVideoSegment, previewTime)
+    : 0;
+
+  if (import.meta.env.DEV) {
+    console.log("[resolve_video_segment_source]", {
+      preview_time: previewTime,
+      segment_id: activeVideoSegment?.id,
+      asset_id: activeVideoSegment?.asset_id,
+      segment_source_url: activeVideoSegment?.source_url || (activeVideoSegment as unknown as Record<string, unknown>)?.sourceUrl,
+      asset_source_url: (activeMediaAsset as unknown as Record<string, unknown>)?.source_url,
+      fallback_used: resolvedSourceInfo.fallbackUsed,
+      resolved_source: activeVideoSource,
+    });
+  }
+
+  // Track active segment transitions for DEV logging (inline, no hook)
+  if (activeVideoSegment && prevActiveSegmentIdRef.current && prevActiveSegmentIdRef.current !== activeVideoSegment.id) {
+    if (import.meta.env.DEV) {
+      const activeIdx = videoSegments.findIndex((s) => s.id === activeVideoSegment.id);
+      console.log("[timeline_segment_switch]", {
+        active_index: activeIdx,
+        active_segment_asset_id: activeVideoSegment.asset_id,
+        active_segment_url: activeVideoSource,
+        currentTime: previewTime,
+      });
+      console.log("[active_video_segment_switch]", {
+        fromSegmentId: prevActiveSegmentIdRef.current,
+        toSegmentId: activeVideoSegment.id,
+        fromAssetId: videoSegments.find((s) => s.id === prevActiveSegmentIdRef.current)?.asset_id,
+        toAssetId: activeVideoSegment.asset_id,
+        previewTime,
+        sourceUrl: activeVideoSource,
+      });
+    }
+  }
+  if (activeVideoSegment) {
+    prevActiveSegmentIdRef.current = activeVideoSegment.id;
+  }
+
+  if (import.meta.env.DEV) {
+    console.log("[timeline_duration_computed]", {
+      video_sequence_count: videoSequence.length,
+      video_sequence_ends: videoSegments.map((s) => s.end),
+      timeline_duration: clipDuration,
+    });
+    console.log("[active_video_source]", {
+      preview_time: previewTime,
+      active_segment_id: activeVideoSegment?.id,
+      asset_id: activeVideoSegment?.asset_id,
+      source_url: activeVideoSource,
+      source_time: activeSourceTime,
+      segment_start: activeVideoSegment?.start,
+      segment_end: activeVideoSegment?.end,
+    });
+  }
   const renderedPreviewAvailable =
     !renderDirty &&
     activeRender?.status === "completed" &&
@@ -5004,7 +5681,7 @@ export function TransformationPage() {
     Boolean(activeRender.file_size_bytes === undefined || activeRender.file_size_bytes > 20_000);
   const renderedPreviewUrl =
     renderedPreviewAvailable && activeRender
-      ? `${downloadUrl(activeRender.id)}?v=${activeRender.id}-${activeRender.status}-${activeRender.width}x${activeRender.height}-${activeRender.file_size_bytes || 0}`
+      ? `${downloadUrl(activeRender.id)}?render_id=${activeRender.id}&v=${activeRender.manifest_hash || activeRender.id}-${activeRender.status}-${activeRender.width}x${activeRender.height}-${activeRender.file_size_bytes || 0}&t=${Date.now()}`
       : null;
   const updateAdditionalAudioLibrary = (
     assets: AdditionalAudioAsset[],
@@ -5028,20 +5705,101 @@ export function TransformationPage() {
     );
   };
   const addEditorMediaToTimeline = async (asset: EditorMediaAsset) => {
-    if (asset.kind === "audio") {
-      const exists = (styleConfig.additional_audio_assets || []).some(
-        (item) => item.id === asset.asset_id,
-      );
-      if (exists) return;
+    if (import.meta.env.DEV) {
+      console.log("[media_add_to_timeline_request]", {
+        requested_asset_id: asset.asset_id,
+        requested_filename: asset.name,
+        requested_duration: asset.duration_seconds,
+      });
     }
-    const saved = await api<Transformation>(
-      `/api/transformations/${transformationId}/media/${asset.asset_id}/add-to-timeline`,
-      { method: "POST" },
-    );
-    setDraft(saved);
-    setEditorDirty(true);
-    setTimelineDirty(true);
-    editorMediaQuery.refetch();
+    if (asset.kind === "video") {
+      const duration = Math.max(0.1, Number(asset.duration_seconds || 5.0));
+      const start = Number(videoLayout.duration.toFixed(3));
+      const newSegment: MediaSequenceSegment = {
+        id: `media-${asset.asset_id.slice(0, 8)}-${Date.now()}`,
+        sourceStart: 0.0,
+        sourceEnd: duration,
+        start,
+        end: Number((start + duration).toFixed(3)),
+        duration: Number(duration.toFixed(3)),
+        speed: 1,
+        asset_id: asset.asset_id,
+        name: asset.name,
+        source_url: asset.source_url || mediaUrl(transformationId, asset.asset_id),
+      };
+      const nextSequence = [...videoSequence, newSegment];
+      commitMediaSequence(nextSequence, effectTimeline, "video");
+      setMessage(`${asset.name} ditambahkan ke timeline.`);
+      try {
+        const saved = await api<Transformation>(
+          `/api/transformations/${transformationId}/media/${asset.asset_id}/add-to-timeline`,
+          { method: "POST" },
+        );
+        setDraft(saved);
+        if (import.meta.env.DEV) {
+          const savedSeq = (saved.clipper_style_config?.video_sequence || []) as Array<Record<string, unknown>>;
+          const addedSeg = savedSeq.find((s) => s.asset_id === asset.asset_id || String(s.id).includes(asset.asset_id));
+          console.log("[media_add_to_timeline_response]", {
+            new_segment_asset_id: addedSeg?.asset_id || asset.asset_id,
+            new_segment_name: addedSeg?.name || asset.name,
+            new_segment_duration: addedSeg?.duration || (addedSeg ? (Number(addedSeg.source_end) - Number(addedSeg.source_start)) : duration),
+            all_segment_asset_ids: savedSeq.map((s) => s.asset_id),
+            all_segment_names: savedSeq.map((s) => s.name),
+          });
+        }
+      } catch (err) {
+        console.warn("Failed to sync add-to-timeline with backend:", err);
+      }
+    } else if (asset.kind === "audio") {
+      const audioDuration = Math.max(0.1, Number(asset.duration_seconds || 5.0));
+      const start = Math.min(Math.max(0, previewTime), Math.max(0, timelineScaleDuration - 0.1));
+      const end = Math.min(timelineScaleDuration, Math.max(start + 0.1, start + audioDuration));
+      const number = additionalAudioTracks.length + 1;
+      const id = `additional-audio-${newEventId()}`;
+      const track: AdditionalAudioTrack = {
+        id,
+        asset_id: asset.asset_id,
+        label: asset.name || `Audio ${number}`,
+        kind: "backsound",
+        start: Number(start.toFixed(3)),
+        end: Number(end.toFixed(3)),
+        volume: 1,
+      };
+      const newAssetItem: AdditionalAudioAsset = {
+        id: asset.asset_id,
+        name: asset.name,
+        mime_type: asset.mime_type,
+        size_bytes: asset.size_bytes,
+        duration_seconds: audioDuration,
+      };
+      updateAdditionalAudioLibrary(
+        [...additionalAudioAssets.filter((a) => a.id !== asset.asset_id), newAssetItem],
+        [...additionalAudioTracks, track],
+      );
+      setMessage(`${asset.name} ditambahkan ke track audio.`);
+      try {
+        const saved = await api<Transformation>(
+          `/api/transformations/${transformationId}/media/${asset.asset_id}/add-to-timeline`,
+          { method: "POST" },
+        );
+        setDraft(saved);
+      } catch (err) {
+        console.warn("Failed to sync add-to-timeline with backend:", err);
+      }
+    } else if (asset.kind === "image") {
+      try {
+        const saved = await api<Transformation>(
+          `/api/transformations/${transformationId}/media/${asset.asset_id}/add-to-timeline`,
+          { method: "POST" },
+        );
+        setDraft(saved);
+        setEditorDirty(true);
+        setMessage(`${asset.name} ditambahkan ke project.`);
+      } catch (err) {
+        setMessage(err instanceof Error ? err.message : "Gagal menambahkan gambar.");
+      }
+    }
+    await editorMediaQuery.refetch();
   };
 
   const importEditorMedia = async (
@@ -5057,24 +5815,23 @@ export function TransformationPage() {
         file,
         kind,
       );
-      if (kind === "video") {
-        const saved = await api<Transformation>(
-          `/api/transformations/${transformationId}/media/${asset.asset_id}/add-to-timeline`,
-          { method: "POST" },
-        );
-        setDraft(saved);
-        setEditorDirty(true);
-        setTimelineDirty(true);
-        context.refetch();
-      } else if (kind === "audio") {
-        await addEditorMediaToTimeline(asset);
+      // Library-first: refetch media assets and switch to Project Media view
+      const refreshed = await editorMediaQuery.refetch();
+      setMediaDirectory("project_media");
+      setSelectedMediaAssetId(asset.asset_id);
+      setMessage(`Media ${asset.name} berhasil ditambahkan ke library.`);
+
+      if (import.meta.env.DEV) {
+        console.log("[media_import_success]", {
+          asset_id: asset.asset_id,
+          filename: asset.name,
+          type: asset.kind,
+        });
+        console.log("[media_library_refreshed]", {
+          total_assets: (refreshed.data || []).length,
+          asset_ids: (refreshed.data || []).map((a) => a.asset_id),
+        });
       }
-      editorMediaQuery.refetch();
-      setMessage(
-        kind === "image"
-          ? `${asset.name} tersimpan di media.`
-          : `${asset.name} diimpor ke editor.`,
-      );
     } catch (importError) {
       setMessage(
         importError instanceof Error ? importError.message : "Import media gagal.",
@@ -5266,18 +6023,20 @@ export function TransformationPage() {
     ? savedCaptionTimeline
     : generatedCaptionCues;
   const currentCaptionCue = activeCaptionCue(editableCaptionCues, previewTime);
-  const resolvedCurrentCaptionStyle = resolveCaptionStyle(
+  const baseCurrentCaptionStyle = resolveCaptionStyle(
     currentCaptionCue,
     mainCaptionStyle,
     captionApplyToAll,
   );
+  const resolvedCurrentCaptionStyle = hoveredCaptionTemplate
+    ? applyCaptionTemplateToMainStyle(baseCurrentCaptionStyle, hoveredCaptionTemplate)
+    : baseCurrentCaptionStyle;
   const rawSubtitlePreview = currentCaptionCue
     ? getCaptionPreviewText(currentCaptionCue.text)
     : null;
   const subtitlePreview = rawSubtitlePreview
     ? formatCaptionCase(rawSubtitlePreview, resolvedCurrentCaptionStyle.case_mode)
     : null;
-  const karaokeWords = subtitlePreview ? captionWords(subtitlePreview) : [];
   const karaokeCueDuration = currentCaptionCue
     ? Math.max(0, currentCaptionCue.end - currentCaptionCue.start)
     : 0;
@@ -5289,11 +6048,6 @@ export function TransformationPage() {
         Math.max(0, (previewTime - currentCaptionCue.start) / Math.max(0.001, karaokeCueDuration)),
       )
     : null;
-  // Estimasi karaoke proporsional dari durasi cue
-  const karaokeActiveIndex =
-    karaokeCueProgress !== null && karaokeCueDuration >= 0.25 && karaokeWords.length > 1
-      ? Math.min(karaokeWords.length - 1, Math.floor(karaokeCueProgress * karaokeWords.length))
-      : -1;
   const editableEffectTimeline = configuredEffectTimeline.map((event, index) => ({
     ...event,
     id: editableEventId(event, index),
@@ -5812,17 +6566,28 @@ export function TransformationPage() {
       setEffectInspectorTab("effect");
     }
   };
-  const timelineVideoItems: TimelineItem[] = videoSegments.map((segment) => ({
-    ...segment,
-    selectable: true,
-    type: "video",
-    label: `${segment.number}. ${context.data.uploaded_filename || context.data.source_title || "Video sumber"}${audioExtracted ? "" : " • Audio asli"}`,
-    title: `Video bagian ${segment.number}\n${formatTimePrecise(segment.start)}-${formatTimePrecise(segment.end)}\n${audioExtracted ? "Track video" : "Video dengan audio asli tertaut"}`,
-    active: selectedMediaSegmentId === segment.id,
-    colorClass: "bg-blue-600 text-white",
-    locked: Boolean(segment.locked || styleConfig.video_locked),
-    visible: (segment.visible !== false) && (styleConfig.video_visible !== false),
-  }));
+  const timelineVideoItems: TimelineItem[] = videoSegments.map((segment) => {
+    const assetName =
+      segment.name ||
+      (segment.asset_id
+        ? (editorMediaQuery.data || []).find((a) => a.asset_id === segment.asset_id)?.name
+        : undefined) ||
+      context.data.uploaded_filename ||
+      context.data.source_title ||
+      "Video sumber";
+
+    return {
+      ...segment,
+      selectable: true,
+      type: "video",
+      label: `${segment.number}. ${assetName}${audioExtracted ? "" : " • Audio asli"}`,
+      title: `${assetName} (bagian ${segment.number})\n${formatTimePrecise(segment.start)}-${formatTimePrecise(segment.end)}\n${audioExtracted ? "Track video" : "Video dengan audio asli tertaut"}`,
+      active: selectedMediaSegmentId === segment.id,
+      colorClass: "bg-blue-600 text-white",
+      locked: Boolean(segment.locked || styleConfig.video_locked),
+      visible: segment.visible !== false && styleConfig.video_visible !== false,
+    };
+  });
   const timelineAudioItems: TimelineItem[] = audioSegments.map((segment) => ({
     ...segment,
     selectable: true,
@@ -6343,13 +7108,9 @@ export function TransformationPage() {
     const safeTime = clampClipTime(clipTime);
     if (renderedPreviewUrl) return safeTime;
     if (videoSegments.length === 0) return 0;
-    const segment = videoSegments.find(
-      (item) => safeTime >= item.start && safeTime <= item.end,
-    ) || videoSegments[videoSegments.length - 1];
+    const segment = getActiveVideoSegment(videoSegments, safeTime);
     if (!segment) return 0;
-    const relativeTime = Math.max(0, safeTime - segment.start);
-    const sourceOffset = relativeTime * videoSpeed;
-    return Math.min(segment.sourceEnd, segment.sourceStart + sourceOffset);
+    return resolveVideoSourceTime(segment, safeTime);
   };
   const audioTimeFromClipTime = (clipTime: number) => {
     const safeTime = clampClipTime(clipTime);
@@ -6525,20 +7286,23 @@ export function TransformationPage() {
       }
     });
   };
+  previewPlayingRef.current = previewPlaying;
+
   const setPreviewTimeFromVideo = (videoTime: number) => {
     if (timelineDraggingRef.current) return;
-    const clipTime = clipTimeFromVideoTime(videoTime);
-    previewTimeRef.current = clipTime;
-    setPreviewTime(clipTime);
-    const isPlaying = !previewVideoRef.current?.paused;
-    syncExtractedPreviewAudio(clipTime, isPlaying, false);
-    syncAdditionalAudioTracks(clipTime, isPlaying, false);
+    if (!previewPlayingRef.current) {
+      const clipTime = clipTimeFromVideoTime(videoTime);
+      previewTimeRef.current = clipTime;
+      setPreviewTime(clipTime);
+      syncExtractedPreviewAudio(clipTime, false, false);
+      syncAdditionalAudioTracks(clipTime, false, false);
+    }
   };
   const handleVideoSeeked = (videoTime: number) => {
     const clipTime = clipTimeFromVideoTime(videoTime);
     previewTimeRef.current = clipTime;
     setPreviewTime(clipTime);
-    const isPlaying = !previewVideoRef.current?.paused;
+    const isPlaying = previewPlayingRef.current;
     syncExtractedPreviewAudio(clipTime, isPlaying, true);
     syncAdditionalAudioTracks(clipTime, isPlaying, true);
   };
@@ -6560,7 +7324,7 @@ export function TransformationPage() {
         }
       }
     }
-    const isPlaying = Boolean(video && !video.paused);
+    const isPlaying = previewPlayingRef.current;
     syncExtractedPreviewAudio(safeTime, isPlaying, true);
     syncAdditionalAudioTracks(safeTime, isPlaying, true);
   };
@@ -6574,36 +7338,57 @@ export function TransformationPage() {
     stopPreviewClock();
     previewClockLastUpdateRef.current = performance.now();
     const updateClock = (timestamp: number) => {
-      const video = previewVideoRef.current;
-      const audio = previewAudioRef.current;
+      if (!previewPlayingRef.current) {
+        return;
+      }
 
-      const isVideoPlaying = Boolean(video && !video.paused && !video.ended);
-      const isAudioPlaying = Boolean(audio && !audio.paused && !audio.ended);
-      const hasPlayingAdditional = Array.from(activeAudioElementsRef.current.values()).some(
-        (el) => !el.paused && !el.ended,
-      );
-
-      if ((!isVideoPlaying && !isAudioPlaying && !hasPlayingAdditional) || previewTimeRef.current >= clipDuration) {
+      if (previewTimeRef.current >= clipDuration) {
         handlePreviewPause();
         return;
       }
 
-      if (timestamp - previewClockLastUpdateRef.current >= 40) {
-        const delta = (timestamp - previewClockLastUpdateRef.current) / 1000;
-        previewClockLastUpdateRef.current = timestamp;
+      const delta = (timestamp - previewClockLastUpdateRef.current) / 1000;
+      previewClockLastUpdateRef.current = timestamp;
 
-        let nextClipTime: number;
-        if (isVideoPlaying && video && previewTimeRef.current < videoLayout.duration) {
-          nextClipTime = clipTimeFromVideoTime(video.currentTime);
-        } else {
-          nextClipTime = clampClipTime(previewTimeRef.current + delta);
-        }
-
+      if (delta > 0) {
+        const nextClipTime = Math.min(clipDuration, previewTimeRef.current + delta * videoSpeed);
         previewTimeRef.current = nextClipTime;
         setPreviewTime(nextClipTime);
 
+        // Keep video element synced with global timeline time
+        if (previewVideoRef.current && !previewVideoRef.current.seeking) {
+          const targetVideoTime = videoTimeFromClipTime(nextClipTime);
+          const currentVideoTime = previewVideoRef.current.currentTime;
+          if (Math.abs(currentVideoTime - targetVideoTime) > 0.35) {
+            previewVideoRef.current.currentTime = targetVideoTime;
+          }
+          if (previewVideoRef.current.paused && nextClipTime < videoLayout.duration) {
+            void previewVideoRef.current.play().catch(() => undefined);
+          }
+        }
+
         syncExtractedPreviewAudio(nextClipTime, true, false);
         syncAdditionalAudioTracks(nextClipTime, true, false);
+
+        if (import.meta.env.DEV) {
+          const activeSeg = getActiveVideoSegment(videoSegments, nextClipTime);
+          const localCalculatedTime = videoTimeFromClipTime(nextClipTime);
+          console.log("[video_playback_state]", {
+            isPlaying: previewPlayingRef.current,
+            currentTime: Number(nextClipTime.toFixed(3)),
+            localCalculatedTime: Number(localCalculatedTime.toFixed(3)),
+            readyState: previewVideoRef.current?.readyState,
+          });
+          console.log("[multi_video_playback_tick]", {
+            previewTime: Number(nextClipTime.toFixed(3)),
+            clipDuration,
+            activeSegmentId: activeSeg?.id,
+            activeAssetId: activeSeg?.asset_id,
+            activeSegmentStart: activeSeg?.start,
+            activeSegmentEnd: activeSeg?.end,
+            isPlaying: true,
+          });
+        }
 
         if (nextClipTime >= clipDuration) {
           handlePreviewPause();
@@ -6616,13 +7401,18 @@ export function TransformationPage() {
     previewClockFrameRef.current = window.requestAnimationFrame(updateClock);
   };
   const handlePreviewPlay = () => {
+    if (clipDuration <= 0.05) return;
+    if (previewTime >= clipDuration - 0.05) {
+      seekPreviewTo(0);
+    }
     setPreviewPlaying(true);
+    previewPlayingRef.current = true;
     if (previewVideoRef.current) {
       const clamped = Math.max(0.25, Math.min(4.0, videoSpeed || 1.0));
       if (previewVideoRef.current.playbackRate !== clamped) {
         previewVideoRef.current.playbackRate = clamped;
       }
-      if (previewTime < videoLayout.duration && previewVideoRef.current.paused) {
+      if (previewVideoRef.current.paused) {
         void previewVideoRef.current.play().catch(() => undefined);
       }
     }
@@ -6631,7 +7421,16 @@ export function TransformationPage() {
     syncAdditionalAudioTracks(previewTime, true, false);
   };
   const handlePreviewPause = () => {
+    if (import.meta.env.DEV) {
+      console.log("[preview_pause_requested]", {
+        preview_time: previewTimeRef.current,
+        active_segment_id: activeVideoSegment?.id,
+        previewPlayingRef_before: previewPlayingRef.current,
+        raf_active: previewClockFrameRef.current !== null,
+      });
+    }
     setPreviewPlaying(false);
+    previewPlayingRef.current = false;
     stopPreviewClock();
     if (previewVideoRef.current && !previewVideoRef.current.paused) {
       previewVideoRef.current.pause();
@@ -6639,7 +7438,34 @@ export function TransformationPage() {
     if (previewAudioRef.current && !previewAudioRef.current.paused) {
       previewAudioRef.current.pause();
     }
-    syncAdditionalAudioTracks(previewTime, false, false);
+    syncAdditionalAudioTracks(previewTimeRef.current, false, false);
+    if (import.meta.env.DEV) {
+      console.log("[preview_pause_applied]", {
+        preview_time: previewTimeRef.current,
+        previewPlayingRef_after: previewPlayingRef.current,
+        video_paused: previewVideoRef.current?.paused,
+      });
+    }
+  };
+  const handleVideoEnded = () => {
+    const nextSeg = activeVideoSegment ? getNextVideoSegment(videoSegments, activeVideoSegment.id) : null;
+    if (import.meta.env.DEV) {
+      console.log("[video_element_ended]", {
+        segmentId: activeVideoSegment?.id,
+        assetId: activeVideoSegment?.asset_id,
+        isLastSegment: !nextSeg,
+        nextSegmentId: nextSeg?.id,
+        action: nextSeg && previewTimeRef.current < clipDuration ? "continue" : "stop",
+      });
+    }
+    if (nextSeg && previewTimeRef.current < clipDuration - 0.05) {
+      previewTimeRef.current = nextSeg.start;
+      setPreviewTime(nextSeg.start);
+      return;
+    }
+    if (previewTimeRef.current >= clipDuration - 0.05) {
+      handlePreviewPause();
+    }
   };
   const mediaTrackSelected =
     (selectedEditorContext === "video" || selectedEditorContext === "audio") &&
@@ -6651,6 +7477,16 @@ export function TransformationPage() {
     events: EffectTimelineEvent[],
     track: "video" | "audio" = activeMediaTrack,
   ) => {
+    if (import.meta.env.DEV && track === "video") {
+      console.log("[autosave_video_sequence]", sequence.map((segment) => ({
+        segment_id: segment.id,
+        start: segment.start,
+        end: segment.end,
+        source_start: segment.sourceStart,
+        source_end: segment.sourceEnd,
+        duration: segment.duration ?? effectiveMediaDuration(segment),
+      })));
+    }
     recordEditorHistory(draft, "media-sequence", true);
     setTimelineError("");
     setEditorDirty(true);
@@ -6670,6 +7506,17 @@ export function TransformationPage() {
                 id: segment.id,
                 source_start: Number(segment.sourceStart.toFixed(3)),
                 source_end: Number(segment.sourceEnd.toFixed(3)),
+                start: segment.start == null ? undefined : Number(segment.start.toFixed(3)),
+                end: segment.end == null ? undefined : Number(segment.end.toFixed(3)),
+                duration: Number((segment.duration ?? effectiveMediaDuration(segment)).toFixed(3)),
+                speed: Number((segment.speed ?? 1).toFixed(2)),
+                asset_id: segment.asset_id || undefined,
+                name: segment.name || undefined,
+                source_url: segment.source_url || (segment as Record<string, unknown>).sourceUrl || undefined,
+                source_path: segment.source_path || (segment as Record<string, unknown>).sourcePath || undefined,
+                locked: segment.locked || undefined,
+                visible: segment.visible !== undefined ? segment.visible : undefined,
+                muted: segment.muted || undefined,
               })),
               [track === "audio" ? "audio_track_deleted" : "video_track_deleted"]:
                 sequence.length === 0,
@@ -6802,29 +7649,44 @@ export function TransformationPage() {
     const ratio = resize.trackWidth
       ? (event.clientX - resize.trackLeft) / resize.trackWidth
       : 0;
-    const timelinePoint = ratio * resize.scaleDuration;
-    const minimumDuration = 0.25;
+    const timelinePoint = Math.max(0, ratio * resize.scaleDuration);
+    const minimumDuration = 0.5;
     const nextSequence = resize.sequence.map((segment) => ({ ...segment }));
-    const segment = nextSequence[resize.segmentIndex];
+    let segment = nextSequence[resize.segmentIndex];
     const timelineStart = resize.sequence
       .slice(0, resize.segmentIndex)
-      .reduce((total, item) => total + item.sourceEnd - item.sourceStart, 0);
-    const originalTimelineEnd = timelineStart + segment.sourceEnd - segment.sourceStart;
-    const sourcePoint = segment.sourceStart + (timelinePoint - timelineStart);
+      .reduce((total, item) => total + effectiveMediaDuration(item), 0);
+    const originalTimelineEnd = timelineStart + effectiveMediaDuration(segment);
+    const originalSegment = { ...segment };
+
     if (resize.edge === "left") {
-      segment.sourceStart = Math.min(
-        segment.sourceEnd - minimumDuration,
-        Math.max(0, sourcePoint),
-      );
+      const newDuration = Math.max(minimumDuration, originalTimelineEnd - timelinePoint);
+      const speed = Math.max(0.25, Number(segment.speed) || 1);
+      segment.sourceStart = Number(Math.max(0, segment.sourceEnd - newDuration * speed).toFixed(3));
     } else {
-      segment.sourceEnd = Math.max(
-        segment.sourceStart + minimumDuration,
-        Math.min(originalClipDuration, sourcePoint),
+      const assetDuration = segment.asset_id
+        ? (editorMediaQuery.data || []).find((asset) => asset.asset_id === segment.asset_id)?.duration_seconds
+        : undefined;
+      segment = trimMediaSegmentRight(
+        segment,
+        timelineStart,
+        timelinePoint,
+        assetDuration,
+        minimumDuration,
       );
+      nextSequence[resize.segmentIndex] = segment;
     }
+    let nextOffset = 0;
+    nextSequence.forEach((item) => {
+      const itemDuration = effectiveMediaDuration(item);
+      item.start = Number(nextOffset.toFixed(3));
+      item.end = Number((nextOffset + itemDuration).toFixed(3));
+      item.duration = Number(itemDuration.toFixed(3));
+      item.speed = Math.max(0.25, Number(item.speed) || 1);
+      nextOffset += itemDuration;
+    });
     const durationDelta =
-      segment.sourceEnd - segment.sourceStart -
-      (resize.sequence[resize.segmentIndex].sourceEnd - resize.sequence[resize.segmentIndex].sourceStart);
+      effectiveMediaDuration(segment) - effectiveMediaDuration(originalSegment);
     const nextDuration = resize.duration + durationDelta;
     const shiftedEvents = resize.events
       .map((timelineEvent) => ({
@@ -6844,6 +7706,16 @@ export function TransformationPage() {
       .filter((timelineEvent) => timelineEvent.end > timelineEvent.start);
     const nextEvents = resize.track === "audio" ? resize.events : shiftedEvents;
     const preview = { track: resize.track, sequence: nextSequence, events: nextEvents };
+    if (import.meta.env.DEV && resize.edge === "right") {
+      console.log("[trim_segment_update]", {
+        segment_id: segment.id,
+        old_end: originalTimelineEnd,
+        new_end: segment.end,
+        old_source_end: originalSegment.sourceEnd,
+        new_source_end: segment.sourceEnd,
+        duration: segment.duration,
+      });
+    }
     resize.preview = preview;
     setMediaResizePreview(preview);
     setTimelineError("");
@@ -6859,7 +7731,7 @@ export function TransformationPage() {
     if (resize.preview) {
       commitMediaSequence(resize.preview.sequence, resize.preview.events, resize.track);
       const nextDuration = resize.preview.sequence.reduce(
-        (total, segment) => total + segment.sourceEnd - segment.sourceStart,
+        (total, segment) => total + effectiveMediaDuration(segment),
         0,
       );
       setPreviewTime((time) => Math.min(time, nextDuration));
@@ -6909,16 +7781,24 @@ export function TransformationPage() {
       ? Math.min(1, Math.max(0, (event.clientX - resize.trackLeft) / resize.trackWidth))
       : 0;
     const targetTime = Math.min(clipDuration, ratio * timelineScaleDuration);
-    const applyBounds = <T extends { id?: string; start: number; end: number }>(item: T): T => {
-      if (item.id !== resize.id) return item;
-      return resize.edge === "left"
-        ? { ...item, start: Math.min(item.end - 0.1, Math.max(0, targetTime)) }
-        : { ...item, end: Math.max(item.start + 0.1, Math.min(clipDuration, targetTime)) };
-    };
     if (resize.kind === "caption") {
-      updateCaptionTimeline(editableCaptionCues.map(applyBounds), false);
+      updateCaptionTimeline(
+        editableCaptionCues.map((item) => (item.id !== resize.id ? item : {
+          ...item,
+          start: resize.edge === "left" ? Math.min(item.end - 0.1, Math.max(0, targetTime)) : item.start,
+          end: resize.edge === "left" ? item.end : Math.max(item.start + 0.1, Math.min(clipDuration, targetTime)),
+        })),
+        false,
+      );
     } else {
-      updateEffectTimeline(editableEffectTimeline.map(applyBounds), false);
+      updateEffectTimeline(
+        editableEffectTimeline.map((item) => (item.id !== resize.id ? item : {
+          ...item,
+          start: resize.edge === "left" ? Math.min(item.end - 0.1, Math.max(0, targetTime)) : item.start,
+          end: resize.edge === "left" ? item.end : Math.max(item.start + 0.1, Math.min(clipDuration, targetTime)),
+        })),
+        false,
+      );
     }
   };
   const finishTimedItemResize = (event: ReactPointerEvent<HTMLSpanElement>) => {
@@ -7595,10 +8475,11 @@ export function TransformationPage() {
       : "Preview sumber sebelum export.";
   const currentRenderLabel = renderLabel(activeRender, renderedPreviewAvailable);
   const exportIsHd = exportResolution !== "540";
+  const expectedExportWidth = exportResolution === "540" ? 540 : exportResolution === "720" ? 720 : 1080;
   const exportMatchesRequestedResolution = Boolean(
     exportResultRender?.status === "completed" &&
     exportResultRender.output_url &&
-    (!exportIsHd || exportResultRender.width >= 1000),
+    Math.abs((exportResultRender.width || 0) - expectedExportWidth) < 50,
   );
   const exportValidating = Boolean(
     exportMatchesRequestedResolution &&
@@ -7663,7 +8544,7 @@ export function TransformationPage() {
     context.data?.project_title,
   );
   const exportResultUrl = exportReady && exportResultRender?.output_url
-    ? `${downloadUrl(exportResultRender.id)}?v=${exportResultRender.id}-${exportResultRender.file_size_bytes || 0}&output_filename=${encodeURIComponent(exportDownloadFilename)}`
+    ? `${downloadUrl(exportResultRender.id)}?render_id=${exportResultRender.id}&v=${exportResultRender.manifest_hash || exportResultRender.id}-${exportResultRender.file_size_bytes || 0}&t=${Date.now()}&output_filename=${encodeURIComponent(exportDownloadFilename)}`
     : null;
   const startExport = () => {
     if (!canStartExport || queueRender.isPending || toolbarExportBusy) return;
@@ -7671,13 +8552,8 @@ export function TransformationPage() {
     setExportWasClosedDuringTask(false);
     setExportValidatedRenderId(null);
     setMessage(toolbarUnsaved ? "Menyimpan perubahan sebelum export..." : "Menyiapkan file...");
-    if (exportIsHd && !toolbarRenderedPreviewAvailable) {
-      setExportAwaitingHd(true);
-      queueRender.mutate(true);
-      return;
-    }
     setExportAwaitingHd(false);
-    queueRender.mutate(!exportIsHd);
+    queueRender.mutate(exportResolution === "540");
   };
   const playheadPercent = Math.min(
     100,
@@ -8137,139 +9013,327 @@ export function TransformationPage() {
             </div>
           )}
 
-          {/* TAB B: MEDIA (Input & Project Media Library) */}
+          {/* TAB B: MEDIA (CapCut-Style Media Bin & Library) */}
           {activeNavTab === "media" && (
             <LeftPanelDirectoryLayout
               directories={mediaDirectories}
               activeDirectory={mediaDirectory}
               onSelectDirectory={setMediaDirectory}
             >
-              {mediaDirectory === "import" && (
-                <div className="space-y-3">
-                  <p className="text-[11px] font-black uppercase tracking-wide text-zinc-400">
-                    Import Media Sumber
-                  </p>
-                  <EditorMediaImportControls
-                    className="flex flex-col gap-2"
-                    disabled={editorMediaUploading}
-                    onImport={importEditorMedia}
-                    uploadingKind={editorMediaUploadKind}
-                  />
-                  <div className="rounded-xl border border-zinc-800 bg-[#202226] p-2.5 text-[11px] text-zinc-400">
-                    <p className="font-bold text-zinc-300">💡 Tips Media:</p>
-                    <p className="mt-0.5">
-                      Video, audio, atau gambar yang diunggah akan otomatis disimpan di daftar asset project Anda.
-                    </p>
+              <div className="space-y-3">
+                {/* 1. TOP TOOLBAR: Import Button, Search Input, and Category Header */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <span className="text-xs">
+                        {mediaDirectory === "video"
+                          ? "🎬"
+                          : mediaDirectory === "audio"
+                          ? "🎵"
+                          : mediaDirectory === "images"
+                          ? "🖼️"
+                          : mediaDirectory === "import"
+                          ? "📥"
+                          : "📁"}
+                      </span>
+                      <span className="text-xs font-black uppercase tracking-wide text-zinc-200 truncate">
+                        {mediaDirectory === "project_media"
+                          ? "Project Media"
+                          : mediaDirectory === "video"
+                          ? "Asset Video"
+                          : mediaDirectory === "audio"
+                          ? "Asset Audio"
+                          : mediaDirectory === "images"
+                          ? "Asset Gambar"
+                          : "Import Media"}
+                      </span>
+                      <span className="text-[10px] font-bold text-zinc-500">
+                        (
+                        {(editorMediaQuery.data || []).filter((a) =>
+                          mediaDirectory === "video"
+                            ? a.kind === "video"
+                            : mediaDirectory === "audio"
+                            ? a.kind === "audio"
+                            : mediaDirectory === "images"
+                            ? a.kind === "image"
+                            : true,
+                        ).length}
+                        )
+                      </span>
+                    </div>
+
+                    {/* Universal Import Button */}
+                    <label className="shrink-0 cursor-pointer">
+                      <span
+                        className={`btn-secondary inline-flex items-center gap-1 px-2.5 py-1 text-xs font-bold bg-cyan-400/15 text-cyan-300 border-cyan-500/40 hover:bg-cyan-400/25 transition shadow-sm ${
+                          editorMediaUploading ? "opacity-50 pointer-events-none" : ""
+                        }`}
+                        title="Import Video, Audio, atau Gambar ke Media Library"
+                      >
+                        <span>📥</span>
+                        <span>{editorMediaUploading ? "Mengunggah..." : "+ Import"}</span>
+                      </span>
+                      <input
+                        type="file"
+                        multiple
+                        accept=".mp4,.mov,.webm,.mp3,.wav,.m4a,.png,.jpg,.jpeg,.webp"
+                        className="sr-only"
+                        disabled={editorMediaUploading}
+                        onChange={(e) => {
+                          const file = e.currentTarget.files?.[0];
+                          if (file) {
+                            const ext = file.name.split(".").pop()?.toLowerCase() || "";
+                            const isAudio = ["mp3", "wav", "m4a"].includes(ext) || file.type.startsWith("audio/");
+                            const isImage = ["png", "jpg", "jpeg", "webp", "gif"].includes(ext) || file.type.startsWith("image/");
+                            const kind: EditorMediaKind = isAudio ? "audio" : isImage ? "image" : "video";
+                            void importEditorMedia(kind, file);
+                          }
+                          e.currentTarget.value = "";
+                        }}
+                      />
+                    </label>
+                  </div>
+
+                  {/* Search Bar */}
+                  <div className="relative">
+                    <input
+                      type="text"
+                      placeholder="Cari media di library..."
+                      value={mediaSearch}
+                      onChange={(e) => setMediaSearch(e.target.value)}
+                      className="w-full text-xs rounded-lg bg-[#202328] border border-zinc-700/70 px-2.5 py-1.5 text-zinc-100 placeholder-zinc-500 focus:border-cyan-400 focus:outline-none"
+                    />
+                    {mediaSearch && (
+                      <button
+                        type="button"
+                        onClick={() => setMediaSearch("")}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-zinc-400 hover:text-zinc-200"
+                      >
+                        ✕
+                      </button>
+                    )}
                   </div>
                 </div>
-              )}
 
-              {mediaDirectory !== "import" && (
-                <div className="space-y-2.5">
-                  <p className="text-[11px] font-black uppercase tracking-wide text-zinc-400">
-                    {mediaDirectory === "project_media"
-                      ? "Semua Asset Project"
-                      : mediaDirectory === "video"
-                      ? "Asset Video"
+                {/* 2. DEDICATED IMPORT TAB VIEW (If user specifically clicks Import subtab) */}
+                {mediaDirectory === "import" && (
+                  <div className="space-y-3">
+                    <div className="rounded-xl border border-dashed border-cyan-500/40 bg-[#1c222b] p-3 text-center space-y-2">
+                      <p className="text-xs font-bold text-cyan-300">Pilih Jenis File Media</p>
+                      <EditorMediaImportControls
+                        className="flex flex-col gap-2"
+                        disabled={editorMediaUploading}
+                        onImport={importEditorMedia}
+                        uploadingKind={editorMediaUploadKind}
+                      />
+                    </div>
+                    <div className="rounded-xl border border-zinc-800 bg-[#1e2126] p-2.5 text-[11px] text-zinc-400 space-y-1">
+                      <p className="font-bold text-zinc-300">💡 Alur Media Library (CapCut Flow):</p>
+                      <p>
+                        Media yang diimpor otomatis masuk ke <b>Project Media</b>. Gunakan tombol <b>+</b> pada kartu thumbnail untuk memasukkan media ke timeline edit.
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {/* 3. CAPCUT-STYLE MEDIA THUMBNAIL GRID */}
+                {mediaDirectory !== "import" && (() => {
+                  const allAssets = editorMediaQuery.data || [];
+                  const categoryFiltered = allAssets.filter((a) =>
+                    mediaDirectory === "video"
+                      ? a.kind === "video"
                       : mediaDirectory === "audio"
-                      ? "Asset Audio"
-                      : "Asset Gambar"}{" "}
-                    (
-                    {(editorMediaQuery.data || []).filter((a) =>
-                      mediaDirectory === "video"
-                        ? a.kind === "video"
-                        : mediaDirectory === "audio"
-                        ? a.kind === "audio"
-                        : mediaDirectory === "images"
-                        ? a.kind === "image"
-                        : true,
-                    ).length}
-                    )
-                  </p>
+                      ? a.kind === "audio"
+                      : mediaDirectory === "images"
+                      ? a.kind === "image"
+                      : true,
+                  );
+                  const searchFiltered = mediaSearch
+                    ? categoryFiltered.filter((a) => a.name.toLowerCase().includes(mediaSearch.toLowerCase()))
+                    : categoryFiltered;
 
-                  {(() => {
-                    const assets = (editorMediaQuery.data || []).filter((a) =>
-                      mediaDirectory === "video"
-                        ? a.kind === "video"
-                        : mediaDirectory === "audio"
-                        ? a.kind === "audio"
-                        : mediaDirectory === "images"
-                        ? a.kind === "image"
-                        : true,
-                    );
+                  if (import.meta.env.DEV) {
+                    console.log("[media_grid_render]", {
+                      active_tab: mediaDirectory,
+                      visible_count: searchFiltered.length,
+                    });
+                  }
 
-                    if (editorMediaQuery.isLoading) {
-                      return <p className="text-xs font-semibold text-zinc-400">Memuat media...</p>;
-                    }
-
-                    if (assets.length === 0) {
-                      return (
-                        <div className="rounded-xl border border-dashed border-zinc-700 bg-zinc-900/40 p-4 text-center text-xs font-semibold text-zinc-400">
-                          Belum ada file {mediaDirectory === "video" ? "video" : mediaDirectory === "audio" ? "audio" : mediaDirectory === "images" ? "gambar" : "media"}. Gunakan menu Import untuk mengunggah.
-                        </div>
-                      );
-                    }
-
+                  if (editorMediaQuery.isLoading) {
                     return (
-                      <div className="space-y-2">
-                        {assets.map((asset) => (
-                          <div
-                            className="rounded-xl border border-zinc-700/80 bg-[#22252a] p-2.5 transition hover:border-zinc-500"
-                            key={asset.asset_id}
-                          >
-                            <div className="flex items-start justify-between gap-2">
-                              <div className="min-w-0">
-                                <span className="block truncate text-xs font-black text-zinc-100">
-                                  {asset.name}
-                                </span>
-                                <span className="mt-0.5 block text-[10px] text-zinc-400">
-                                  {(asset.size_bytes / 1024 / 1024).toFixed(1)} MB
-                                </span>
-                              </div>
-                              <span
-                                className={`shrink-0 rounded px-1.5 py-0.5 text-[9px] font-black uppercase ${
-                                  asset.kind === "video"
-                                    ? "bg-blue-500/20 text-blue-300"
-                                    : asset.kind === "audio"
-                                    ? "bg-emerald-500/20 text-emerald-300"
-                                    : "bg-purple-500/20 text-purple-300"
-                                }`}
-                              >
-                                {asset.kind}
-                              </span>
-                            </div>
-                            <div className="mt-2.5 flex gap-1.5">
-                              {asset.kind === "image" ? (
-                                <span className="px-1 py-1 text-[10px] font-bold text-emerald-400">
-                                  Tersimpan di project
-                                </span>
-                              ) : (
-                                <button
-                                  className="btn-secondary flex-1 py-1 text-[10px] font-bold bg-cyan-400/10 text-cyan-300 border-cyan-500/30 hover:bg-cyan-400/20"
-                                  onClick={() => addEditorMediaToTimeline(asset)}
-                                  type="button"
-                                >
-                                  + Ke Timeline
-                                </button>
-                              )}
-                              {asset.kind !== "image" && (
-                                <a
-                                  className="btn-secondary px-2 py-1 text-[10px] font-semibold"
-                                  href={mediaUrl(transformationId, asset.asset_id)}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                >
-                                  Putar
-                                </a>
-                              )}
-                            </div>
-                          </div>
-                        ))}
+                      <div className="p-4 text-center text-xs font-semibold text-zinc-400">
+                        Memuat media library...
                       </div>
                     );
-                  })()}
-                </div>
-              )}
+                  }
+
+                  if (searchFiltered.length === 0) {
+                    return (
+                      <div className="rounded-xl border border-dashed border-zinc-700 bg-zinc-900/40 p-5 text-center text-xs text-zinc-400 space-y-2.5">
+                        <span className="text-2xl block">📁</span>
+                        <p className="font-bold text-zinc-300">
+                          {mediaSearch
+                            ? "Tidak ada media yang cocok dengan pencarian."
+                            : `Belum ada ${mediaDirectory === "video" ? "video" : mediaDirectory === "audio" ? "audio" : mediaDirectory === "images" ? "gambar" : "media"} di library.`}
+                        </p>
+                        <p className="text-[11px] text-zinc-500">
+                          Import file media untuk mulai menyusun klip pada timeline.
+                        </p>
+                        <label className="inline-block cursor-pointer">
+                          <span className="btn-secondary px-3 py-1.5 text-xs font-bold text-cyan-300 border-cyan-500/40 hover:bg-cyan-400/20">
+                            + Import Media Sekarang
+                          </span>
+                          <input
+                            type="file"
+                            multiple
+                            accept=".mp4,.mov,.webm,.mp3,.wav,.m4a,.png,.jpg,.jpeg,.webp"
+                            className="sr-only"
+                            disabled={editorMediaUploading}
+                            onChange={(e) => {
+                              const file = e.currentTarget.files?.[0];
+                              if (file) {
+                                const ext = file.name.split(".").pop()?.toLowerCase() || "";
+                                const isAudio = ["mp3", "wav", "m4a"].includes(ext) || file.type.startsWith("audio/");
+                                const isImage = ["png", "jpg", "jpeg", "webp", "gif"].includes(ext) || file.type.startsWith("image/");
+                                const kind: EditorMediaKind = isAudio ? "audio" : isImage ? "image" : "video";
+                                void importEditorMedia(kind, file);
+                              }
+                              e.currentTarget.value = "";
+                            }}
+                          />
+                        </label>
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div className="grid grid-cols-2 gap-2.5">
+                      {searchFiltered.map((asset) => {
+                        const isAdded = asset.kind === "video"
+                          ? videoSequence.some((s) => s.asset_id === asset.asset_id || s.name === asset.name)
+                          : asset.kind === "audio"
+                          ? additionalAudioTracks.some((t) => t.asset_id === asset.asset_id)
+                          : (styleConfig.editor_image_assets || []).some((img: { id?: string }) => img.id === asset.asset_id);
+                        const isSelected = selectedMediaAssetId === asset.asset_id;
+
+                        return (
+                          <div
+                            key={asset.asset_id}
+                            onClick={() => setSelectedMediaAssetId(asset.asset_id)}
+                            className={`group relative flex flex-col rounded-xl overflow-hidden border transition cursor-pointer ${
+                              isSelected
+                                ? "border-cyan-400 ring-2 ring-cyan-400/30 bg-[#1e252e]"
+                                : isAdded
+                                ? "border-emerald-500/40 bg-[#1b2222] hover:border-emerald-400/60"
+                                : "border-zinc-800 bg-[#1c1f24] hover:border-zinc-600 hover:bg-[#22262d]"
+                            }`}
+                          >
+                            {/* Thumbnail / Visual Preview Box */}
+                            <div className="relative aspect-video w-full bg-black/60 overflow-hidden flex items-center justify-center">
+                              {asset.kind === "video" ? (
+                                <video
+                                  src={mediaUrl(transformationId, asset.asset_id)}
+                                  preload="metadata"
+                                  className="w-full h-full object-cover pointer-events-none"
+                                  muted
+                                />
+                              ) : asset.kind === "image" ? (
+                                <img
+                                  src={mediaUrl(transformationId, asset.asset_id)}
+                                  alt={asset.name}
+                                  className="w-full h-full object-cover"
+                                  loading="lazy"
+                                />
+                              ) : (
+                                <div className="w-full h-full bg-gradient-to-br from-emerald-950/60 via-zinc-900 to-zinc-950 flex flex-col items-center justify-center gap-1 text-emerald-400">
+                                  <span className="text-xl">🎵</span>
+                                  <div className="flex items-center gap-0.5 h-3">
+                                    <span className="w-0.5 h-2 bg-emerald-400 animate-pulse" />
+                                    <span className="w-0.5 h-3 bg-emerald-400 animate-pulse delay-75" />
+                                    <span className="w-0.5 h-1.5 bg-emerald-400 animate-pulse delay-150" />
+                                    <span className="w-0.5 h-2.5 bg-emerald-400 animate-pulse delay-100" />
+                                  </div>
+                                </div>
+                              )}
+
+                              {/* Duration Badge (Top Right) */}
+                              {asset.duration_seconds && asset.duration_seconds > 0 ? (
+                                <span className="absolute top-1.5 right-1.5 rounded bg-black/80 backdrop-blur-sm px-1.5 py-0.5 text-[9px] font-mono font-bold text-white shadow-sm">
+                                  {formatMediaDuration(asset.duration_seconds)}
+                                </span>
+                              ) : asset.kind === "image" ? (
+                                <span className="absolute top-1.5 right-1.5 rounded bg-purple-950/80 backdrop-blur-sm px-1.5 py-0.5 text-[8px] font-extrabold text-purple-200">
+                                  IMG
+                                </span>
+                              ) : null}
+
+                              {/* Added Status Badge (Top Left) */}
+                              {isAdded && (
+                                <span className="absolute top-1.5 left-1.5 rounded bg-emerald-500 px-1.5 py-0.5 text-[8px] font-black text-black shadow-sm flex items-center gap-0.5">
+                                  ✓ Added
+                                </span>
+                              )}
+
+                              {/* Hover Overlay with Quick Action Buttons */}
+                              <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-2 backdrop-blur-[1px]">
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    if (import.meta.env.DEV) {
+                                      console.log("[media_card_add_clicked]", {
+                                        clicked_asset_id: asset.asset_id,
+                                        clicked_filename: asset.name,
+                                        clicked_duration: asset.duration_seconds,
+                                        selectedMediaAssetId,
+                                      });
+                                    }
+                                    void addEditorMediaToTimeline(asset);
+                                  }}
+                                  title="Tambah ke timeline"
+                                  className="h-8 w-8 rounded-full bg-cyan-400 hover:bg-cyan-300 active:scale-95 text-black flex items-center justify-center font-extrabold text-base shadow-lg transition"
+                                >
+                                  +
+                                </button>
+                                {asset.kind !== "image" && (
+                                  <a
+                                    href={mediaUrl(transformationId, asset.asset_id)}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    onClick={(e) => e.stopPropagation()}
+                                    title="Putar preview"
+                                    className="h-8 w-8 rounded-full bg-zinc-700/90 hover:bg-zinc-600 active:scale-95 text-white flex items-center justify-center text-xs shadow-lg transition"
+                                  >
+                                    ▶
+                                  </a>
+                                )}
+                              </div>
+                            </div>
+
+                            {/* Card Footer Details (Compact without redundant button) */}
+                            <div className="p-2 flex flex-col justify-center">
+                              <div className="min-w-0">
+                                <span
+                                  className="block truncate text-[11px] font-bold text-zinc-100 group-hover:text-cyan-300 transition"
+                                  title={asset.name}
+                                >
+                                  {asset.name}
+                                </span>
+                                <div className="mt-1 flex items-center justify-between text-[9px] text-zinc-400 font-medium">
+                                  <span>{(asset.size_bytes / 1024 / 1024).toFixed(1)} MB</span>
+                                  <span className="uppercase text-[8px] font-extrabold px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-300">
+                                    {asset.kind}
+                                  </span>
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
+              </div>
             </LeftPanelDirectoryLayout>
           )}
 
@@ -9355,61 +10419,18 @@ export function TransformationPage() {
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
                     <p className="text-[11px] font-black uppercase tracking-wide text-zinc-400">
-                      Template Gaya Caption ({CAPTION_TEMPLATES.length})
+                      Template Gaya Caption
                     </p>
                     <span className="text-[10px] text-cyan-400 font-bold">CapCut Style</span>
                   </div>
-
-                  <div className="grid grid-cols-2 gap-2 max-h-96 overflow-y-auto pr-1">
-                    {CAPTION_TEMPLATES.map((tpl) => {
-                      const isActive = mainCaptionStyle.preset_id === tpl.id;
-                      return (
-                        <div
-                          key={tpl.id}
-                          onClick={() => {
-                            updateMainCaptionStyle(tpl.stylePatch);
-                            setMessage(`Template "${tpl.name}" diterapkan ke caption.`);
-                          }}
-                          className={`group cursor-pointer rounded-xl border p-2 text-left transition flex flex-col justify-between ${
-                            isActive
-                              ? "border-cyan-400 bg-cyan-500/10 text-cyan-200 shadow-sm ring-1 ring-cyan-400"
-                              : "border-zinc-700/80 bg-[#22252a] text-zinc-300 hover:border-zinc-500 hover:bg-[#282b30]"
-                          }`}
-                        >
-                          <div className="flex items-center justify-between mb-1">
-                            <span className="text-[11px] font-black truncate">{tpl.name}</span>
-                            {tpl.badge && (
-                              <span className="rounded bg-cyan-400/20 px-1 py-0.2 text-[8px] font-black uppercase text-cyan-300">
-                                {tpl.badge}
-                              </span>
-                            )}
-                          </div>
-                          <div className="h-9 rounded-md bg-zinc-950/80 flex items-center justify-center p-1 text-center overflow-hidden">
-                            <span
-                              style={{
-                                color: tpl.stylePatch.color || "#FFFFFF",
-                                fontFamily: tpl.stylePatch.font_family,
-                                fontWeight: tpl.stylePatch.font_weight || "800",
-                                fontStyle: tpl.stylePatch.italic ? "italic" : "normal",
-                                textTransform: tpl.stylePatch.case_mode === "uppercase" ? "uppercase" : "none",
-                                WebkitTextStroke: tpl.stylePatch.stroke_enabled
-                                  ? `${tpl.stylePatch.stroke_width || 1}px ${tpl.stylePatch.stroke_color || "#000"}`
-                                  : undefined,
-                                textShadow: tpl.stylePatch.shadow_enabled
-                                  ? `0 1px 3px ${tpl.stylePatch.shadow_color || "rgba(0,0,0,0.8)"}`
-                                  : undefined,
-                                fontSize: 10,
-                                lineHeight: 1.1,
-                              }}
-                              className="line-clamp-1"
-                            >
-                              {tpl.previewText}
-                            </span>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
+                  <CaptionTemplateGallery
+                    activeGroup="templates"
+                    currentPresetId={mainCaptionStyle.preset_id}
+                    previewTemplateId={hoveredCaptionTemplate?.id}
+                    onSelectTemplate={applyCaptionTemplate}
+                    onTemplateHover={handleTemplateHover}
+                    onTemplateLeave={handleTemplateLeave}
+                  />
                 </div>
               )}
 
@@ -9528,6 +10549,25 @@ export function TransformationPage() {
               ref={previewCanvasContainerRef}
               className="relative aspect-[9/16] h-[clamp(300px,42vh,500px)] max-h-full max-w-full overflow-hidden rounded-lg bg-black shadow-2xl shadow-black/50 ring-1 ring-white/10 select-none"
             >
+              {/* Diagnostics logging */}
+              {(() => {
+                if (import.meta.env.DEV) {
+                  const videoElement = previewVideoRef.current;
+                  console.log("[active_video_debug]", {
+                    preview_time: previewTime,
+                    active_segment_id: activeVideoSegment?.id,
+                    active_asset_id: activeVideoSegment?.asset_id,
+                    active_source_url: activeVideoSegment?.source_url,
+                    resolved_source: activeVideoSource,
+                    source_error: (activeSourceHasError ? previewVideoError?.message : "") || resolvedSourceInfo.error,
+                    video_element_src: videoElement?.currentSrc || videoElement?.src,
+                    video_ready_state: videoElement?.readyState,
+                    video_network_state: videoElement?.networkState,
+                    video_error: videoElement?.error?.message,
+                  });
+                }
+                return null;
+              })()}
               {renderedPreviewUrl ? (
                 <video
                   className="h-full w-full object-cover"
@@ -9535,7 +10575,7 @@ export function TransformationPage() {
                     ...transitionTransformStyle,
                     filter: transitionFilterStyle ? transitionFilterStyle : undefined,
                   }}
-                  controls
+                  controls={false}
                   muted={audioSettings.muted}
                   onLoadedMetadata={(event) => {
                     event.currentTarget.volume = Math.min(1, audioSettings.volume);
@@ -9568,21 +10608,111 @@ export function TransformationPage() {
                   }}
                 >
                   <PresetVideo
+                    key={`${activeVideoSegment?.id || "legacy"}:${activeVideoSegment?.asset_id || "source"}:${activeVideoSource}`}
                     audioMuted={videoTrackDeleted || audioExtracted || videoMuted || audioSettings.muted}
                     audioVolume={audioSettings.volume}
-                    src={sourceClipUrl}
+                    src={activeVideoSource}
                     preset={effectiveFramingPreset}
                     framing={videoFraming}
                     adjustments={videoAdjustments}
                     speed={videoSpeed}
-                    controls
-                    onLoadedMetadata={setPreviewTimeFromVideo}
-                    onPause={handlePreviewPause}
+                    controls={false}
+                    onCanPlay={(element) => {
+                      if (import.meta.env.DEV) {
+                        console.log("[preview_video_canplay]", {
+                          src: element?.currentSrc || element?.src,
+                          active_source: activeVideoSource,
+                          ready_state: element?.readyState,
+                        });
+                      }
+                      if (previewVideoError && sameMediaSource(element?.currentSrc || element?.src, activeVideoSource)) {
+                        setPreviewVideoError(null);
+                      }
+                      if (previewVideoRef.current && previewPlayingRef.current && previewVideoRef.current.paused) {
+                        void previewVideoRef.current.play().catch(() => undefined);
+                      }
+                    }}
+                    onLoadedMetadata={(videoTime, element) => {
+                      if (import.meta.env.DEV) {
+                        console.log("[preview_video_loadedmetadata]", {
+                          src: element.currentSrc || element.src,
+                          active_source: activeVideoSource,
+                          duration: element.duration,
+                          videoWidth: element.videoWidth,
+                          videoHeight: element.videoHeight,
+                        });
+                      }
+                      if (previewVideoError && sameMediaSource(element.currentSrc || element.src, activeVideoSource)) {
+                        setPreviewVideoError(null);
+                      }
+                      if (previewVideoRef.current) {
+                        const target = videoTimeFromClipTime(previewTimeRef.current);
+                        if (Math.abs(previewVideoRef.current.currentTime - target) > 0.05) {
+                          previewVideoRef.current.currentTime = target;
+                        }
+                        if (previewPlayingRef.current && previewVideoRef.current.paused) {
+                          void previewVideoRef.current.play().catch(() => undefined);
+                        }
+                      }
+                      setPreviewTimeFromVideo(videoTime);
+                    }}
+                    onError={(element) => {
+                      const eventSrc = element.currentSrc || element.src || "";
+                      const isCurrent = sameMediaSource(eventSrc, activeVideoSource);
+                      const errorMessage = element.error?.message || "Source video gagal dimuat.";
+
+                      if (import.meta.env.DEV) {
+                        console.log("[preview_video_error_event]", {
+                          event_src: eventSrc,
+                          active_source: activeVideoSource,
+                          active_asset_id: activeVideoSegment?.asset_id,
+                          is_current_source: isCurrent,
+                          action: isCurrent ? "set_error" : "ignore_stale",
+                        });
+                      }
+
+                      if (!isCurrent) {
+                        // Ignore stale error from previous/aborted source
+                        return;
+                      }
+
+                      if (import.meta.env.DEV) {
+                        console.error("[preview_video_media_error]", {
+                          current_src: eventSrc,
+                          active_source: activeVideoSource,
+                          error_code: element.error?.code,
+                          error_message: errorMessage,
+                          ready_state: element.readyState,
+                          network_state: element.networkState,
+                        });
+                      }
+
+                      setPreviewVideoError({
+                        source: activeVideoSource,
+                        assetId: activeVideoSegment?.asset_id,
+                        segmentId: activeVideoSegment?.id,
+                        message: errorMessage,
+                        code: element.error?.code,
+                        timestamp: Date.now(),
+                      });
+                    }}
+                    onPause={() => {
+                      if (!previewPlayingRef.current || previewTimeRef.current >= clipDuration - 0.05) {
+                        handlePreviewPause();
+                      }
+                    }}
                     onPlay={handlePreviewPlay}
+                    onEnded={handleVideoEnded}
                     onSeeked={handleVideoSeeked}
                     onTimeUpdate={setPreviewTimeFromVideo}
                     videoRef={previewVideoRef}
                   />
+                </div>
+              )}
+
+              {!renderedPreviewUrl && (!activeVideoSource || activeSourceHasError) && videoSequence.length > 0 && (
+                <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center bg-black/75 p-5 text-center text-sm font-semibold text-white">
+                  Source video tidak ditemukan
                 </div>
               )}
 
@@ -9643,9 +10773,11 @@ export function TransformationPage() {
                   (liveHookEvent.preset as TextStylePresetKey) || styleConfig.hook_text_style_preset || "clean_white"
                 );
                 const eventStyle = resolveTextOverlayStyle(eventPreset);
-                const eventFont = liveHookEvent.font_family
-                  ? hookTextFonts.find((f) => f.value === liveHookEvent.font_family || f.fontFamily === liveHookEvent.font_family)?.fontFamily || liveHookEvent.font_family
-                  : activeHookFont.fontFamily;
+                const isSelected = selectedEventId === liveHookEvent.id || selectedEditorContext === "hook";
+                const baseFont = liveHookEvent.font_family
+                  ? resolveFontFamily(liveHookEvent.font_family)
+                  : resolveFontFamily(activeHookFont.fontFamily);
+                const eventFont = (hoveredFontPreview && isSelected) ? hoveredFontPreview : baseFont;
                 const defaultHookPosY =
                   liveHookEvent.position === "bottom"
                     ? 84
@@ -9659,7 +10791,6 @@ export function TransformationPage() {
                 const posX = liveHookEvent.position_x_percent ?? 50;
                 const posY = liveHookEvent.position_y_percent ?? defaultHookPosY;
                 const scale = liveHookEvent.scale ?? 1.0;
-                const isSelected = selectedEventId === liveHookEvent.id || selectedEditorContext === "hook";
                 const currentText = liveHookEvent.text ?? (styleConfig.hook_text || hookFallbackText || "");
 
                 const resolvedColor = liveHookEvent.color || eventStyle.color || "#ffffff";
@@ -9755,7 +10886,8 @@ export function TransformationPage() {
                     {/* Bounding Box Frame (Drag Borders + Resize Handles) */}
                     {isSelected && (
                       <div className="pointer-events-none absolute -inset-2 rounded border-2 border-cyan-400 shadow-[0_0_0_1px_rgba(0,0,0,0.5)]">
-                        {/* 4 Border Drag Strips */}
+
+                    {/* 4 Border Drag Strips */}
                         <div
                           className="pointer-events-auto absolute -top-2 inset-x-2 h-3.5 cursor-move"
                           title="Geser posisi teks"
@@ -10111,12 +11243,19 @@ export function TransformationPage() {
                 })()}
 
               {subtitlePreview && currentCaptionCue && currentCaptionCue.visible !== false && (() => {
-                const defaultCaptionPosY =
-                  resolvedCurrentCaptionStyle.position === "top"
-                    ? 12
-                    : resolvedCurrentCaptionStyle.position === "middle"
-                    ? 50
-                    : 84;
+                const templateType = resolvedCurrentCaptionStyle.template_type || "basic_subtitle";
+                const behavior = resolvedCurrentCaptionStyle.behavior || {};
+                const layout = resolvedCurrentCaptionStyle.layout || {};
+                const animation = resolvedCurrentCaptionStyle.animation || {};
+
+                const isLowerThird = templateType === "lower_third" || layout.position === "lower_third";
+                const defaultCaptionPosY = isLowerThird
+                  ? 88
+                  : resolvedCurrentCaptionStyle.position === "top"
+                  ? 12
+                  : resolvedCurrentCaptionStyle.position === "middle"
+                  ? 50
+                  : 84;
                 const posX = resolvedCurrentCaptionStyle.position_x_percent ?? 50;
                 const posY = resolvedCurrentCaptionStyle.position_y_percent ?? defaultCaptionPosY;
                 const isSelected =
@@ -10124,19 +11263,103 @@ export function TransformationPage() {
                   selectedEditorContext === "caption";
                 const currentText = currentCaptionCue?.text || subtitlePreview || "";
 
+                const isQuote = templateType === "quote";
+                const isTypewriter = templateType === "typewriter" || behavior.mode === "typewriter" || animation.in === "typewriter";
+                const isGlitch = templateType === "glitch" || animation.loop === "glitch" || resolvedCurrentCaptionStyle.animation_loop === "glitch" || resolvedCurrentCaptionStyle.effect === "glitch";
+                const isShake = templateType === "shake" || animation.loop === "shake" || resolvedCurrentCaptionStyle.animation_loop === "shake";
+                const isFlash = templateType === "flash" || animation.loop === "pulse" || animation.loop === "glow" || resolvedCurrentCaptionStyle.animation_loop === "pulse" || resolvedCurrentCaptionStyle.effect === "flash";
+                const isMeme = templateType === "meme";
+                const isBubble = templateType === "bubble";
+                const isEducation = templateType === "education";
+                const isDebate = templateType === "debate_marker";
+                const isSticker = templateType === "sticker_text";
+
+                // Word progress / sweep (Karaoke / progressive highlight)
+                const isWordProgress =
+                  behavior.mode === "word_progress" ||
+                  templateType === "karaoke" ||
+                  resolvedCurrentCaptionStyle.karaoke_enabled ||
+                  animation.loop === "highlight_sweep";
+
+                // Word highlight calculation
+                const isWordHighlight =
+                  !isWordProgress &&
+                  (templateType === "word_highlight" ||
+                    behavior.mode === "emphasis_word" ||
+                    behavior.mode === "keyword_highlight");
+
+                // Typewriter progressive text calculation
+                const typedLength = isTypewriter && (previewPlaying && karaokeCueProgress !== null)
+                  ? Math.max(1, Math.floor(karaokeCueProgress * (subtitlePreview?.length || 1)))
+                  : (subtitlePreview?.length || 0);
+                const displayedText = isTypewriter ? (subtitlePreview || "").slice(0, typedLength) : subtitlePreview;
+
+                const words = (displayedText || "").split(/\s+/).filter(Boolean);
+
+                const highlightIndices = isWordHighlight
+                  ? extractHighlightedWordIndices(displayedText || "", behavior.highlight_strategy || "keywords")
+                  : new Set<number>();
+
+                // Progressive active index for word_progress
+                const { activeWordIndex, progress: computedProgress } = (() => {
+                  if (words.length <= 0) return { activeWordIndex: -1, progress: 0 };
+                  if (previewPlaying && currentCaptionCue) {
+                    return computeKaraokeWordProgress(words, currentCaptionCue.start, currentCaptionCue.end, previewTime);
+                  }
+                  if (hoveredCaptionTemplate && isWordProgress) {
+                    return { activeWordIndex: Math.min(words.length - 1, Math.floor(words.length / 2)), progress: 0.5 };
+                  }
+                  if (currentCaptionCue && previewTime >= currentCaptionCue.start && previewTime <= currentCaptionCue.end) {
+                    return computeKaraokeWordProgress(words, currentCaptionCue.start, currentCaptionCue.end, previewTime);
+                  }
+                  return { activeWordIndex: 0, progress: 0 };
+                })();
+
+                if (isWordProgress && currentCaptionCue && previewPlaying) {
+                  console.debug("[karaoke_preview_model]", {
+                    caption_id: currentCaptionCue.id,
+                    words_count: words.length,
+                    active_word_index: activeWordIndex,
+                    progress: computedProgress,
+                  });
+                }
+
+                const onSelectThisCaption = (e: React.MouseEvent) => {
+                  e.stopPropagation();
+                  setSelectedCaptionId(currentCaptionCue?.id || null);
+                  setSelectedEditorContext("caption");
+                  setCaptionInspectorTab("text");
+                };
+
+                // Determine container animation class
+                const animClass = [
+                  isGlitch ? "caption-effect-glitch" : "",
+                  isShake ? "caption-effect-shake" : "",
+                  isFlash ? "caption-effect-pulse" : "",
+                  animation.in === "pop" || animation.in === "pop_in" ? "caption-anim-pop" : "",
+                  animation.in === "bounce" ? "caption-anim-bounce" : "",
+                  animation.loop === "float" ? "caption-anim-float" : "",
+                  animation.loop === "subtle_pulse" ? "caption-anim-subtle-pulse" : "",
+                  animation.loop === "badge_pulse" ? "caption-anim-badge-pulse" : "",
+                ]
+                  .filter(Boolean)
+                  .join(" ");
+
                 return (
                   <div
-                    className="pointer-events-auto absolute select-none leading-tight"
+                    className={`pointer-events-auto absolute select-none leading-tight transition-all duration-100 ${animClass}`}
                     style={{
                       zIndex: visualLayerZIndex("caption"),
                       left: `${posX}%`,
                       top: `${posY}%`,
                       transform: "translate(-50%, -50%)",
-                      width: `${resolvedCurrentCaptionStyle.max_width_percent}%`,
-                      maxWidth: "92%",
+                      width: `${Math.min(84, resolvedCurrentCaptionStyle.max_width_percent || 82)}%`,
+                      maxWidth: "84%",
                       textAlign: resolvedCurrentCaptionStyle.align,
-                      fontFamily: resolvedCurrentCaptionStyle.font_family,
-                      fontSize: `clamp(${Math.round(resolvedCurrentCaptionStyle.font_size * 0.7)}px, ${resolvedCurrentCaptionStyle.font_size * 0.12}vh, ${resolvedCurrentCaptionStyle.font_size}px)`,
+                      fontFamily: (hoveredFontPreview && (selectedEditorContext === "caption" || Boolean(selectedCaption) || activeNavTab === "caption"))
+                        ? hoveredFontPreview
+                        : resolveFontFamily(resolvedCurrentCaptionStyle.font_family),
+                      fontSize: `${resolvedCurrentCaptionStyle.font_size}px`,
                       fontWeight: resolvedCurrentCaptionStyle.font_weight,
                       fontStyle: resolvedCurrentCaptionStyle.italic ? "italic" : "normal",
                       textDecoration: resolvedCurrentCaptionStyle.underline ? "underline" : "none",
@@ -10147,11 +11370,18 @@ export function TransformationPage() {
                         ? `${resolvedCurrentCaptionStyle.stroke_width}px ${resolvedCurrentCaptionStyle.stroke_color}`
                         : undefined,
                       paintOrder: "stroke fill",
-                      textShadow: resolvedCurrentCaptionStyle.shadow_enabled
+                      textShadow: isMeme
+                        ? "3px 3px 0 #000, -3px -3px 0 #000, 3px -3px 0 #000, -3px 3px 0 #000, 0 4px 10px rgba(0,0,0,0.9)"
+                        : resolvedCurrentCaptionStyle.shadow_enabled
                         ? `${resolvedCurrentCaptionStyle.shadow_x}px ${resolvedCurrentCaptionStyle.shadow_y}px ${resolvedCurrentCaptionStyle.shadow_blur}px ${resolvedCurrentCaptionStyle.shadow_color}`
                         : undefined,
                     }}
                   >
+                    {hoveredCaptionTemplate && (
+                      <div className="pointer-events-none absolute -top-8 left-1/2 -translate-x-1/2 flex items-center gap-1 rounded-full bg-cyan-400 px-2.5 py-0.5 text-[9px] font-black uppercase tracking-wider text-zinc-950 shadow-lg shadow-cyan-500/30 backdrop-blur-sm animate-pulse z-30 whitespace-nowrap">
+                        <span>👁️ Live Preview: {hoveredCaptionTemplate.name}</span>
+                      </div>
+                    )}
                     {isSelected && (
                       <div className="pointer-events-none absolute -inset-2 rounded border-2 border-cyan-400 shadow-[0_0_0_1px_rgba(0,0,0,0.5)]">
                         {/* 4 Border Drag Strips */}
@@ -10240,6 +11470,8 @@ export function TransformationPage() {
                               resolvedCurrentCaptionStyle.font_size,
                             )
                           }
+                          onPointerMove={handleCanvasManipulationMove}
+                          onPointerUp={handleCanvasManipulationUp}
                         />
                         <div
                           aria-label="Resize Top Right"
@@ -10256,6 +11488,8 @@ export function TransformationPage() {
                               resolvedCurrentCaptionStyle.font_size,
                             )
                           }
+                          onPointerMove={handleCanvasManipulationMove}
+                          onPointerUp={handleCanvasManipulationUp}
                         />
                         <div
                           aria-label="Resize Bottom Left"
@@ -10272,6 +11506,8 @@ export function TransformationPage() {
                               resolvedCurrentCaptionStyle.font_size,
                             )
                           }
+                          onPointerMove={handleCanvasManipulationMove}
+                          onPointerUp={handleCanvasManipulationUp}
                         />
                         <div
                           aria-label="Resize Bottom Right"
@@ -10288,109 +11524,291 @@ export function TransformationPage() {
                               resolvedCurrentCaptionStyle.font_size,
                             )
                           }
+                          onPointerMove={handleCanvasManipulationMove}
+                          onPointerUp={handleCanvasManipulationUp}
                         />
                       </div>
                     )}
 
-                    <span
-                      className="inline-block max-w-full"
-                      style={{
-                        backgroundColor: resolvedCurrentCaptionStyle.background_enabled
-                          ? resolvedCurrentCaptionStyle.background_color.startsWith("#")
+                    {/* DEDICATED TEMPLATE_TYPE RENDERERS */}
+                    {isSelected ? (
+                      <WysiwygInlineTextEditor
+                        value={currentText}
+                        placeholder="Ketik caption..."
+                        className="block break-words"
+                        style={{
+                          color: resolvedCurrentCaptionStyle.color,
+                          textAlign: resolvedCurrentCaptionStyle.align,
+                        }}
+                        onChange={(nextText) => {
+                          updateSelectedCaptionText(nextText);
+                        }}
+                        onBlur={finishSelectedCaptionTextEdit}
+                      />
+                    ) : isLowerThird ? (
+                      <div
+                        onClick={onSelectThisCaption}
+                        className="cursor-text flex flex-col items-start w-full overflow-hidden shadow-2xl rounded-lg border-l-4 border-cyan-400"
+                        style={{
+                          backgroundColor: resolvedCurrentCaptionStyle.background_color.startsWith("#")
                             ? `${resolvedCurrentCaptionStyle.background_color}${Math.round(resolvedCurrentCaptionStyle.background_opacity * 255).toString(16).padStart(2, "0")}`
-                            : resolvedCurrentCaptionStyle.background_color
-                          : "transparent",
-                        borderRadius: `${resolvedCurrentCaptionStyle.background_radius}px`,
-                        padding: resolvedCurrentCaptionStyle.background_enabled ? "4px 12px" : "0px",
-                      }}
-                    >
-                      <span className="block break-words">
-                        {isSelected ? (
-                          <WysiwygInlineTextEditor
-                            value={currentText}
-                            placeholder="Ketik caption..."
-                            className="block break-words"
-                            style={{
-                              color: resolvedCurrentCaptionStyle.color,
-                              textAlign: resolvedCurrentCaptionStyle.align,
-                            }}
-                            onChange={(nextText) => {
-                              updateSelectedCaptionText(nextText);
-                            }}
-                            onBlur={finishSelectedCaptionTextEdit}
-                          />
-                        ) : resolvedCurrentCaptionStyle.karaoke_enabled ? (
-                          <span
-                            className="cursor-text"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setSelectedCaptionId(currentCaptionCue?.id || null);
-                              setSelectedEditorContext("caption");
-                              setCaptionInspectorTab("text");
-                            }}
-                          >
-                            {karaokeWords.map((word, index) => {
-                              const isActive = index === karaokeActiveIndex;
-                              if (resolvedCurrentCaptionStyle.karaoke_mode === "highlight") {
-                                return (
-                                  <span
-                                    key={`${word}-${index}`}
-                                    style={{
-                                      backgroundColor: isActive
-                                        ? resolvedCurrentCaptionStyle.karaoke_highlight_color
-                                        : "transparent",
-                                      color: isActive
-                                        ? resolvedCurrentCaptionStyle.karaoke_active_color
-                                        : resolvedCurrentCaptionStyle.karaoke_inactive_color ||
-                                          resolvedCurrentCaptionStyle.color,
-                                      borderRadius: "4px",
-                                      padding: isActive ? "2px 4px" : "0px",
-                                      transition: "all 0.1s ease",
-                                    }}
-                                  >
-                                    {word}
-                                    {index < karaokeWords.length - 1 ? " " : ""}
-                                  </span>
-                                );
-                              }
-                              return (
-                                <span
-                                  key={`${word}-${index}`}
-                                  style={{
-                                    color: isActive
-                                      ? resolvedCurrentCaptionStyle.karaoke_active_color
-                                      : resolvedCurrentCaptionStyle.karaoke_inactive_color ||
-                                        resolvedCurrentCaptionStyle.color,
-                                    transition: "color 0.1s ease",
-                                  }}
-                                >
-                                  {word}
-                                  {index < karaokeWords.length - 1 ? " " : ""}
-                                </span>
-                              );
-                            })}
+                            : resolvedCurrentCaptionStyle.background_color,
+                          backdropFilter: "blur(8px)",
+                        }}
+                      >
+                        {/* Live News / Speaker Header Badge */}
+                        <div className="flex items-center gap-1.5 px-3 py-1 bg-black/40 w-full border-b border-white/10">
+                          <span className="inline-block size-2 rounded-full bg-red-500 animate-pulse" />
+                          <span className="text-[10px] font-black uppercase tracking-wider text-cyan-300">
+                            {resolvedCurrentCaptionStyle.preset_id === "breaking_point"
+                              ? "BREAKING NEWS"
+                              : resolvedCurrentCaptionStyle.preset_id === "podcast_speaker"
+                              ? "PODCAST"
+                              : resolvedCurrentCaptionStyle.preset_id === "interview_name_bar"
+                              ? "INTERVIEW"
+                              : "BERITA UTAMA"}
                           </span>
-                        ) : (
-                          <span
-                            className="cursor-text"
-                            style={{ color: resolvedCurrentCaptionStyle.color }}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setSelectedCaptionId(currentCaptionCue?.id || null);
-                              setSelectedEditorContext("caption");
-                              setCaptionInspectorTab("text");
-                            }}
-                          >
-                            {subtitlePreview}
-                          </span>
-                        )}
+                        </div>
+                        {/* Headline Text */}
+                        <div className="px-4 py-2 text-left w-full">
+                          <span style={{ color: resolvedCurrentCaptionStyle.color }}>{displayedText}</span>
+                        </div>
+                      </div>
+                    ) : isBubble ? (
+                      <div
+                        onClick={onSelectThisCaption}
+                        className={`cursor-text inline-block shadow-2xl transition-transform ${
+                          layout.box_style === "comic" || resolvedCurrentCaptionStyle.preset_id === "comic_bubble"
+                            ? "border-3 border-black shadow-[4px_4px_0px_#000]"
+                            : layout.box_style === "glass" || resolvedCurrentCaptionStyle.preset_id === "dark_glass_bubble"
+                            ? "border border-white/20 backdrop-blur-md"
+                            : ""
+                        }`}
+                        style={{
+                          backgroundColor: resolvedCurrentCaptionStyle.background_color.startsWith("#")
+                            ? `${resolvedCurrentCaptionStyle.background_color}${Math.round(resolvedCurrentCaptionStyle.background_opacity * 255).toString(16).padStart(2, "0")}`
+                            : resolvedCurrentCaptionStyle.background_color,
+                          borderRadius: `${resolvedCurrentCaptionStyle.background_radius || 24}px`,
+                          padding: layout.box_style === "comic" ? "8px 18px" : "10px 24px",
+                          boxShadow: layout.box_style === "comic"
+                            ? "4px 4px 0px #000000"
+                            : "0 10px 25px -5px rgba(0, 0, 0, 0.6), 0 8px 10px -6px rgba(0, 0, 0, 0.4)",
+                        }}
+                      >
+                        <span style={{ color: resolvedCurrentCaptionStyle.color }}>{displayedText}</span>
+                      </div>
+                    ) : isQuote ? (
+                      <div
+                        onClick={onSelectThisCaption}
+                        className="cursor-text flex items-start gap-2.5 rounded-xl border-l-4 border-amber-400 bg-zinc-950/85 p-3.5 shadow-2xl backdrop-blur-md text-left"
+                      >
+                        <span className="text-2xl font-serif leading-none text-amber-400 select-none">“</span>
+                        <span className="flex-1 font-serif italic" style={{ color: resolvedCurrentCaptionStyle.color }}>
+                          {displayedText}
+                        </span>
+                        <span className="text-2xl font-serif leading-none text-amber-400 self-end select-none">”</span>
+                      </div>
+                    ) : isEducation || isDebate ? (
+                      <div
+                        onClick={onSelectThisCaption}
+                        className="cursor-text inline-flex flex-col items-center gap-1 rounded-xl bg-zinc-950/85 p-3 shadow-2xl border border-zinc-700/80 backdrop-blur-md"
+                      >
+                        <span
+                          className={`rounded-md px-2 py-0.5 text-[10px] font-black uppercase tracking-wider ${
+                            isDebate
+                              ? "bg-amber-500 text-zinc-950 font-black"
+                              : "bg-cyan-500 text-zinc-950 font-black"
+                          }`}
+                        >
+                          {isDebate
+                            ? resolvedCurrentCaptionStyle.preset_id === "question_pop"
+                              ? "❓ PERTANYAAN"
+                              : "🔥 DEBAT"
+                            : resolvedCurrentCaptionStyle.preset_id === "definition_box"
+                            ? "📖 DEFINISI"
+                            : "💡 FAKTA"}
+                        </span>
+                        <span style={{ color: resolvedCurrentCaptionStyle.color }}>{displayedText}</span>
+                      </div>
+                    ) : isSticker ? (
+                      <div
+                        onClick={onSelectThisCaption}
+                        className="cursor-text inline-block rounded-2xl border-4 border-white bg-amber-300 px-5 py-2.5 shadow-[0_12px_24px_rgba(0,0,0,0.6)] transform -rotate-2"
+                      >
+                        <span className="font-black text-zinc-950">{displayedText}</span>
+                      </div>
+                    ) : isWordProgress ? (
+                      <span onClick={onSelectThisCaption} className="cursor-text inline-block">
+                        {words.map((word, index) => {
+                          const isActive = index === activeWordIndex;
+                          const isPast = index < activeWordIndex;
+                          const activeColor = behavior.highlight_color || resolvedCurrentCaptionStyle.karaoke_active_color || "#FFD600";
+                          const inactiveColor = behavior.secondary_color || resolvedCurrentCaptionStyle.karaoke_inactive_color || "rgba(255,255,255,0.7)";
+                          const pastColor = resolvedCurrentCaptionStyle.color || "#FFFFFF";
+                          const isBoxHighlight = resolvedCurrentCaptionStyle.preset_id === "karaoke_box" || layout.box_style === "pill";
+
+                          if (isActive) {
+                            return (
+                              <span
+                                key={`${word}-${index}`}
+                                className={`inline-block rounded-md px-1.5 py-0.5 mx-0.5 shadow-md ${
+                                  isBoxHighlight ? "bg-cyan-600 text-white" : ""
+                                }`}
+                                style={{
+                                  backgroundColor: isBoxHighlight
+                                    ? undefined
+                                    : "transparent",
+                                  color: isBoxHighlight ? "#FFFFFF" : activeColor,
+                                  fontWeight: "900",
+                                  transform: `scale(${behavior.emphasis_scale || 1.15})`,
+                                  textShadow: isBoxHighlight
+                                    ? undefined
+                                    : `0 0 12px ${activeColor}cc, 0 2px 4px rgba(0,0,0,0.9)`,
+                                  transition: "all 0.12s ease",
+                                }}
+                              >
+                                {word}
+                                {index < words.length - 1 ? " " : ""}
+                              </span>
+                            );
+                          }
+                          return (
+                            <span
+                              key={`${word}-${index}`}
+                              style={{
+                                color: isPast ? pastColor : inactiveColor,
+                                opacity: isPast ? 0.95 : 0.65,
+                                transition: "color 0.12s ease, opacity 0.12s ease",
+                              }}
+                            >
+                              {word}
+                              {index < words.length - 1 ? " " : ""}
+                            </span>
+                          );
+                        })}
                       </span>
-                    </span>
+                    ) : isWordHighlight ? (
+                      <span onClick={onSelectThisCaption} className="cursor-text inline-block">
+                        {words.map((word, index) => {
+                          const isHighlighted = highlightIndices.has(index);
+                          const hlColor = behavior.highlight_color || "#FDE047";
+                          const secColor = behavior.secondary_color || resolvedCurrentCaptionStyle.color;
+
+                          if (isHighlighted) {
+                            return (
+                              <span
+                                key={`${word}-${index}`}
+                                className="inline-block rounded-md px-1.5 py-0.5 mx-0.5 shadow-md"
+                                style={{
+                                  backgroundColor: hlColor,
+                                  color: "#000000",
+                                  fontWeight: "900",
+                                  transform: `scale(${behavior.emphasis_scale || 1.12})`,
+                                  WebkitTextStroke: "0px transparent",
+                                  transition: "transform 0.15s ease",
+                                }}
+                              >
+                                {word}
+                                {index < words.length - 1 ? " " : ""}
+                              </span>
+                            );
+                          }
+                          return (
+                            <span
+                              key={`${word}-${index}`}
+                              style={{
+                                color: secColor,
+                              }}
+                            >
+                              {word}
+                              {index < words.length - 1 ? " " : ""}
+                            </span>
+                          );
+                        })}
+                      </span>
+                    ) : (
+                      <span
+                        onClick={onSelectThisCaption}
+                        className="cursor-text"
+                        style={{ color: resolvedCurrentCaptionStyle.color }}
+                      >
+                        {displayedText}
+                        {isTypewriter && <span className="caption-typewriter-cursor">|</span>}
+                      </span>
+                    )}
                   </div>
                 );
               })()}
             </div>
           </div>
+
+          {/* PLAYBACK CONTROL BAR (CapCut Style: Centered directly below 9:16 preview canvas) */}
+          <div className="border-t border-zinc-800/80 bg-[#16181b] px-4 py-2.5 text-xs select-none">
+            <div className="mx-auto flex max-w-[clamp(280px,36vw,460px)] items-center justify-center gap-3">
+              {/* Reset to start button */}
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  seekPreviewTo(0);
+                }}
+                title="Kembali ke Awal (00:00)"
+                aria-label="Kembali ke Awal"
+                className="flex h-8 items-center justify-center rounded-lg border border-zinc-700/80 bg-[#1f2227] px-2.5 text-xs text-zinc-400 hover:border-zinc-600 hover:text-cyan-300 active:scale-95 transition"
+              >
+                <span>⏮ Awal</span>
+              </button>
+
+              {/* Main Play / Pause Button */}
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (previewPlaying) {
+                    handlePreviewPause();
+                  } else {
+                    handlePreviewPlay();
+                  }
+                }}
+                title={previewPlaying ? "Jeda (Pause)" : "Putar (Play)"}
+                aria-label={previewPlaying ? "Jeda" : "Putar"}
+                className={`flex h-8 items-center gap-1.5 rounded-lg px-3.5 font-bold active:scale-95 transition ${
+                  previewPlaying
+                    ? "bg-amber-500/20 text-amber-300 hover:bg-amber-500/30 border border-amber-500/40"
+                    : "bg-cyan-500 text-black hover:bg-cyan-400 font-black shadow-md shadow-cyan-500/25"
+                }`}
+              >
+                <span className="text-sm">{previewPlaying ? "⏸" : "▶"}</span>
+                <span>{previewPlaying ? "Jeda" : "Putar"}</span>
+              </button>
+
+              {/* Clock Timer Indicator */}
+              <div className="flex items-center gap-1.5 rounded-lg border border-zinc-700/70 bg-[#1f2227] px-2.5 py-1 font-mono text-xs font-semibold text-zinc-300 shadow-inner">
+                <span className="text-cyan-300 font-bold">{formatTimeLabel(previewTime)}</span>
+                <span className="text-zinc-500">/</span>
+                <span className="text-zinc-400">{formatTimeLabel(clipDuration)}</span>
+              </div>
+
+              {/* Audio Mute / Unmute Button */}
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setAudioSettings({ muted: !audioSettings.muted });
+                }}
+                title={audioSettings.muted ? "Bunyikan Suara (Unmute)" : "Bisukan Suara (Mute)"}
+                aria-label={audioSettings.muted ? "Bunyikan Suara" : "Bisukan Suara"}
+                className={`flex h-8 items-center justify-center rounded-lg border px-2.5 text-xs font-semibold active:scale-95 transition ${
+                  audioSettings.muted
+                    ? "border-red-500/40 bg-red-500/10 text-red-300 hover:bg-red-500/20"
+                    : "border-zinc-700/80 bg-[#1f2227] text-zinc-300 hover:border-zinc-600 hover:text-white"
+                }`}
+              >
+                <span>{audioSettings.muted ? "🔇 Muted" : "🔊 Audio"}</span>
+              </button>
+            </div>
+          </div>
+
           {activeRender?.status === "failed" && (
             <div className="mx-4 mb-2 rounded-xl bg-red-950/70 p-2.5 text-xs font-semibold text-red-100">
               {activeRender.error_message || "Export gagal."}
@@ -10404,7 +11822,7 @@ export function TransformationPage() {
           {/* 1. PROJECT DETAILS (No Item Selected) */}
           {inspectorContext === "details" && (() => {
             const videoFileName =
-              (manualEditorMode && latestImportedVideo?.name) ||
+              (manualEditorMode && (firstTimelineVideo?.name || (editorMediaQuery.data || [])[0]?.name)) ||
               context.data?.candidate_title ||
               draft?.original_hook ||
               "source_clip.mp4";
@@ -12173,29 +13591,20 @@ export function TransformationPage() {
                               </ToolSection>
 
                               {/* 2. FONT */}
-                              <ToolSection title="Font">
+                              <ToolSection title="Font & Typography">
                                 <div className="space-y-2.5">
                                   <div>
-                                    <label
-                                      htmlFor="inspector_hook_font"
-                                      className="mb-1 block text-[11px] font-medium text-zinc-400"
-                                    >
+                                    <label className="mb-1 block text-[11px] font-medium text-zinc-400">
                                       Font Family
                                     </label>
-                                    <select
-                                      id="inspector_hook_font"
-                                      className="h-8 w-full text-xs font-medium"
+                                    <FontPicker
                                       value={currentFont}
-                                      onChange={(e) =>
-                                        updateSelectedText({ font_family: e.target.value })
-                                      }
-                                    >
-                                      {hookTextFonts.map((f) => (
-                                        <option key={f.value} value={f.value}>
-                                          {f.label}
-                                        </option>
-                                      ))}
-                                    </select>
+                                      onHoverPreview={setHoveredFontPreview}
+                                      onChange={(fontFamily, fontId) => {
+                                        updateSelectedText({ font_family: fontFamily });
+                                        setStyle("hook_text_font", fontId as HookTextFont);
+                                      }}
+                                    />
                                   </div>
 
                                   <div>
@@ -13269,6 +14678,7 @@ export function TransformationPage() {
                             [
                               { id: "basic", label: "Basic" },
                               { id: "templates", label: "Templates" },
+                              { id: "bubble", label: "Bubble" },
                               { id: "effects", label: "Effects" },
                             ] as const
                           ).map((sub) => (
@@ -13319,22 +14729,15 @@ export function TransformationPage() {
                               )}
 
                               {/* Font Family */}
-                              <div>
-                                <label htmlFor="caption_font_family">Font Family</label>
-                                <select
-                                  id="caption_font_family"
+                              <div className="space-y-1.5">
+                                <label className="text-[11px] font-medium text-zinc-400">Font Family</label>
+                                <FontPicker
                                   value={mainCaptionStyle.font_family}
-                                  onChange={(e) => updateMainCaptionStyle({ font_family: e.target.value })}
-                                >
-                                  <option value="Inter, sans-serif">Inter (Clean Modern)</option>
-                                  <option value="Montserrat, sans-serif">Montserrat (Bold Viral)</option>
-                                  <option value="Impact, Montserrat, sans-serif">Impact (Big Impact)</option>
-                                  <option value="Oswald, sans-serif">Oswald (Compact Bold)</option>
-                                  <option value="Georgia, serif">Georgia (Classic Serif)</option>
-                                  <option value="'Playfair Display', serif">Playfair Display (Elegant)</option>
-                                  <option value="'Bebas Neue', sans-serif">Bebas Neue (Headline)</option>
-                                  <option value="system-ui, sans-serif">System Sans</option>
-                                </select>
+                                  onHoverPreview={setHoveredFontPreview}
+                                  onChange={(fontFamily) =>
+                                    updateMainCaptionStyle({ font_family: fontFamily })
+                                  }
+                                />
                               </div>
 
                               {/* Font Size & Weight */}
@@ -13613,232 +15016,45 @@ export function TransformationPage() {
                           </ToolSection>
                         )}
 
-                        {/* Sub-tab 2: TEMPLATES LIBRARY */}
+                        {/* Sub-tab 2: TEMPLATES GALLERY (Trending, Classic, Hits, Word, Glow) */}
                         {captionTextSubTab === "templates" && (
-                          <ToolSection title="Template Caption Library (20+ Presets)">
-                            <div className="space-y-3">
-                              {/* Category Tabs */}
-                              <div className="flex items-center gap-1 overflow-x-auto no-scrollbar pb-1">
-                                {(
-                                  [
-                                    "All",
-                                    "Trending",
-                                    "Karaoke",
-                                    "Clean",
-                                    "News",
-                                    "Social",
-                                    "Classic",
-                                    "Effects",
-                                  ] as const
-                                ).map((cat) => (
-                                  <button
-                                    key={cat}
-                                    type="button"
-                                    onClick={() => setCaptionTemplateCategory(cat)}
-                                    className={`shrink-0 rounded-full px-2.5 py-0.5 text-[10px] font-bold transition ${
-                                      captionTemplateCategory === cat
-                                        ? "bg-cyan-400 text-zinc-950 font-black shadow-sm"
-                                        : "bg-zinc-800/80 text-zinc-400 hover:text-zinc-200"
-                                    }`}
-                                  >
-                                    {cat}
-                                  </button>
-                                ))}
-                              </div>
-
-                              {/* Templates Grid */}
-                              <div className="grid grid-cols-2 gap-2 max-h-96 overflow-y-auto pr-1">
-                                {CAPTION_TEMPLATES.filter((tpl) =>
-                                  captionTemplateCategory === "All" ? true : tpl.category === captionTemplateCategory,
-                                ).map((tpl) => {
-                                  const isSelected = mainCaptionStyle.preset_id === tpl.id;
-                                  return (
-                                    <div
-                                      key={tpl.id}
-                                      onClick={() => {
-                                        updateMainCaptionStyle(tpl.stylePatch);
-                                        setMessage(`Template "${tpl.name}" diterapkan.`);
-                                      }}
-                                      className={`group cursor-pointer rounded-xl border p-2.5 transition flex flex-col justify-between ${
-                                        isSelected
-                                          ? "border-cyan-400 bg-cyan-500/10 shadow-md ring-1 ring-cyan-400"
-                                          : "border-zinc-800 bg-[#22252a] hover:border-zinc-600 hover:bg-[#282b30]"
-                                      }`}
-                                    >
-                                      <div className="flex items-center justify-between mb-1.5">
-                                        <span className="text-[11px] font-bold text-zinc-200 truncate">
-                                          {tpl.name}
-                                        </span>
-                                        {tpl.badge && (
-                                          <span
-                                            className={`rounded px-1 py-0.2 text-[8px] font-black uppercase ${
-                                              tpl.badge === "Karaoke"
-                                                ? "bg-amber-400/20 text-amber-300"
-                                                : tpl.badge === "Viral"
-                                                ? "bg-rose-400/20 text-rose-300"
-                                                : "bg-cyan-400/20 text-cyan-300"
-                                            }`}
-                                          >
-                                            {tpl.badge}
-                                          </span>
-                                        )}
-                                      </div>
-
-                                      {/* Visual Preview Box */}
-                                      <div
-                                        className="h-12 rounded-lg bg-zinc-950/80 flex items-center justify-center p-1 text-center overflow-hidden border border-zinc-800/60"
-                                      >
-                                        <span
-                                          style={{
-                                            color: tpl.stylePatch.color || "#FFFFFF",
-                                            fontFamily: tpl.stylePatch.font_family,
-                                            fontWeight: tpl.stylePatch.font_weight || "800",
-                                            fontStyle: tpl.stylePatch.italic ? "italic" : "normal",
-                                            textTransform: tpl.stylePatch.case_mode === "uppercase" ? "uppercase" : "none",
-                                            WebkitTextStroke: tpl.stylePatch.stroke_enabled
-                                              ? `${tpl.stylePatch.stroke_width || 1}px ${tpl.stylePatch.stroke_color || "#000"}`
-                                              : undefined,
-                                            textShadow: tpl.stylePatch.shadow_enabled
-                                              ? `0 2px 4px ${tpl.stylePatch.shadow_color || "rgba(0,0,0,0.8)"}`
-                                              : undefined,
-                                            backgroundColor: tpl.stylePatch.background_enabled
-                                              ? tpl.stylePatch.background_color || "#000"
-                                              : "transparent",
-                                            borderRadius: tpl.stylePatch.background_enabled ? 4 : 0,
-                                            padding: tpl.stylePatch.background_enabled ? "2px 6px" : 0,
-                                            fontSize: 11,
-                                            lineHeight: 1.1,
-                                          }}
-                                          className="line-clamp-2"
-                                        >
-                                          {tpl.previewText}
-                                        </span>
-                                      </div>
-                                    </div>
-                                  );
-                                })}
-                              </div>
-                            </div>
+                          <ToolSection title="Template Caption Gallery">
+                            <CaptionTemplateGallery
+                              activeGroup="templates"
+                              currentPresetId={mainCaptionStyle.preset_id}
+                              previewTemplateId={hoveredCaptionTemplate?.id}
+                              onSelectTemplate={applyCaptionTemplate}
+                              onTemplateHover={handleTemplateHover}
+                              onTemplateLeave={handleTemplateLeave}
+                            />
                           </ToolSection>
                         )}
 
-                        {/* Sub-tab 3: EFFECTS */}
+                        {/* Sub-tab 3: BUBBLE & BOX PRESETS */}
+                        {captionTextSubTab === "bubble" && (
+                          <ToolSection title="Bubble & Box Templates">
+                            <CaptionTemplateGallery
+                              activeGroup="bubble"
+                              currentPresetId={mainCaptionStyle.preset_id}
+                              previewTemplateId={hoveredCaptionTemplate?.id}
+                              onSelectTemplate={applyCaptionTemplate}
+                              onTemplateHover={handleTemplateHover}
+                              onTemplateLeave={handleTemplateLeave}
+                            />
+                          </ToolSection>
+                        )}
+
+                        {/* Sub-tab 4: EFFECTS PRESETS */}
                         {captionTextSubTab === "effects" && (
-                          <ToolSection title="Efek Teks Caption">
-                            <div className="grid grid-cols-2 gap-2">
-                              {[
-                                {
-                                  id: "karaoke_highlight",
-                                  label: "Karaoke Highlight",
-                                  icon: "🎤",
-                                  patch: {
-                                    karaoke_enabled: true,
-                                    karaoke_mode: "word" as const,
-                                    color: "#FFFFFF",
-                                    karaoke_active_color: "#FACC15",
-                                    stroke_enabled: true,
-                                    stroke_color: "#000000",
-                                    stroke_width: 2.5,
-                                  },
-                                },
-                                {
-                                  id: "word_pop",
-                                  label: "Word Pop",
-                                  icon: "💥",
-                                  patch: {
-                                    effect: "word_pop",
-                                    animation_in: "pop_in",
-                                    font_weight: "900",
-                                    color: "#FEF08A",
-                                    stroke_enabled: true,
-                                    stroke_color: "#000000",
-                                    stroke_width: 3,
-                                  },
-                                },
-                                {
-                                  id: "glow_cyan",
-                                  label: "Glow Cyan",
-                                  icon: "💡",
-                                  patch: {
-                                    effect: "neon",
-                                    color: "#67E8F9",
-                                    shadow_enabled: true,
-                                    shadow_color: "#06B6D4",
-                                    shadow_blur: 14,
-                                    stroke_enabled: true,
-                                    stroke_color: "#083344",
-                                    stroke_width: 1.5,
-                                  },
-                                },
-                                {
-                                  id: "stroke_bold",
-                                  label: "Stroke Bold",
-                                  icon: "🔲",
-                                  patch: {
-                                    stroke_enabled: true,
-                                    stroke_width: 4,
-                                    stroke_color: "#000000",
-                                    font_weight: "900",
-                                  },
-                                },
-                                {
-                                  id: "box_highlight",
-                                  label: "Box Highlight",
-                                  icon: "📦",
-                                  patch: {
-                                    background_enabled: true,
-                                    background_color: "#000000",
-                                    background_opacity: 0.8,
-                                    background_radius: 8,
-                                    color: "#FFFFFF",
-                                  },
-                                },
-                                {
-                                  id: "neon_purple",
-                                  label: "Neon Purple",
-                                  icon: "⚡",
-                                  patch: {
-                                    effect: "neon",
-                                    color: "#E879F9",
-                                    shadow_enabled: true,
-                                    shadow_color: "#A855F7",
-                                    shadow_blur: 12,
-                                  },
-                                },
-                                {
-                                  id: "typewriter",
-                                  label: "Typewriter",
-                                  icon: "⌨️",
-                                  patch: {
-                                    animation_in: "typewriter",
-                                    font_family: "Inter, sans-serif",
-                                  },
-                                },
-                                {
-                                  id: "fade_in_out",
-                                  label: "Fade In / Out",
-                                  icon: "🌫️",
-                                  patch: {
-                                    animation_in: "fade_in",
-                                    animation_out: "fade_out",
-                                  },
-                                },
-                              ].map((fx) => (
-                                <div
-                                  key={fx.id}
-                                  onClick={() => {
-                                    updateMainCaptionStyle(fx.patch);
-                                    setMessage(`Efek "${fx.label}" diterapkan.`);
-                                  }}
-                                  className="cursor-pointer rounded-xl border border-zinc-800 bg-[#22252a] p-2.5 transition hover:border-cyan-500/60 hover:bg-[#282b30]"
-                                >
-                                  <div className="flex items-center gap-1.5">
-                                    <span className="text-base">{fx.icon}</span>
-                                    <p className="text-xs font-bold text-zinc-200">{fx.label}</p>
-                                  </div>
-                                </div>
-                              ))}
-                            </div>
+                          <ToolSection title="Effects & Animation Presets">
+                            <CaptionTemplateGallery
+                              activeGroup="effects"
+                              currentPresetId={mainCaptionStyle.preset_id}
+                              previewTemplateId={hoveredCaptionTemplate?.id}
+                              onSelectTemplate={applyCaptionTemplate}
+                              onTemplateHover={handleTemplateHover}
+                              onTemplateLeave={handleTemplateLeave}
+                            />
                           </ToolSection>
                         )}
                       </>
@@ -13962,12 +15178,12 @@ export function TransformationPage() {
                         )}
 
                         {captionAnimationSubTab === "captions" && (
-                          <ToolSection title="Karaoke & Caption Synchronization">
+                          <ToolSection title="Word Timing & Synchronized Highlight">
                             <div className="space-y-3.5">
                               <label className="flex items-center justify-between gap-2 cursor-pointer text-xs font-bold text-zinc-200 bg-zinc-900/90 p-2.5 rounded-xl border border-zinc-800 shadow-sm">
                                 <span className="flex items-center gap-1.5">
                                   <span className="text-amber-400">🎤</span>
-                                  <span>Karaoke Mode</span>
+                                  <span>Word-by-Word Highlight Sync</span>
                                 </span>
                                 <input
                                   type="checkbox"
@@ -14808,7 +16024,7 @@ export function TransformationPage() {
           </div>
 
           <div className="relative mt-2 flex flex-col gap-1.5">
-            <div className="grid grid-cols-[112px_minmax(0,1fr)] items-center gap-3" style={{ order: -1 }}>
+            <div className="grid grid-cols-[130px_minmax(0,1fr)] items-center gap-3" style={{ order: -1 }}>
               <div />
               <div className="relative h-5 touch-none" {...timelinePointerProps}>
                 <span
@@ -14838,19 +16054,35 @@ export function TransformationPage() {
             ) : (
               <>
                 {textLanes.map((laneItems, laneIndex) => {
+                  const laneId = `text-lane-${laneIndex}`;
                   const isLaneLocked = laneItems.length > 0 && laneItems.every((item) => Boolean(item.locked));
                   const isLaneVisible = laneItems.every((item) => item.visible !== false);
+                  const isSelectedLane = selectedTimelineLaneId === laneId;
                   return (
                     <TimelineTrack
+                      laneId={laneId}
                       trackKey="text"
                       locked={isLaneLocked}
                       onToggleLock={() => toggleLaneLock(laneItems)}
                       visible={isLaneVisible}
                       onToggleVisibility={() => toggleLaneVisibility(laneItems)}
+                      onSelectLane={() => setSelectedTimelineLaneId(laneId)}
+                      onOpenLaneMenu={(e) => {
+                        setLaneContextMenu({
+                          x: e.clientX,
+                          y: e.clientY,
+                          laneId,
+                          trackKey: "text",
+                          label: `Track Text ${laneIndex + 1}`,
+                          items: laneItems,
+                          locked: isLaneLocked,
+                        });
+                      }}
+                      isLaneSelected={isSelectedLane}
                       {...timelineTrackOrderProps("text")}
                       duration={timelineScaleDuration}
                       items={laneItems}
-                      key={`text-lane-${laneIndex}`}
+                      key={laneId}
                       label="Text"
                       {...editableMarkerProps}
                       onItemResizePointerDown={startTimedItemResize}
@@ -14875,19 +16107,35 @@ export function TransformationPage() {
                   );
                 })}
                 {overlayLanes.map((laneItems, laneIndex) => {
+                  const laneId = `overlay-lane-${laneIndex}`;
                   const isLaneLocked = laneItems.length > 0 && laneItems.every((item) => Boolean(item.locked));
                   const isLaneVisible = laneItems.every((item) => item.visible !== false);
+                  const isSelectedLane = selectedTimelineLaneId === laneId;
                   return (
                     <TimelineTrack
+                      laneId={laneId}
                       trackKey="overlay"
                       locked={isLaneLocked}
                       onToggleLock={() => toggleLaneLock(laneItems)}
                       visible={isLaneVisible}
                       onToggleVisibility={() => toggleLaneVisibility(laneItems)}
+                      onSelectLane={() => setSelectedTimelineLaneId(laneId)}
+                      onOpenLaneMenu={(e) => {
+                        setLaneContextMenu({
+                          x: e.clientX,
+                          y: e.clientY,
+                          laneId,
+                          trackKey: "overlay",
+                          label: `Track Overlay ${laneIndex + 1}`,
+                          items: laneItems,
+                          locked: isLaneLocked,
+                        });
+                      }}
+                      isLaneSelected={isSelectedLane}
                       {...timelineTrackOrderProps("overlay")}
                       duration={timelineScaleDuration}
                       items={laneItems}
-                      key={`overlay-lane-${laneIndex}`}
+                      key={laneId}
                       label="Overlay"
                       {...editableMarkerProps}
                       onItemResizePointerDown={startTimedItemResize}
@@ -14910,10 +16158,13 @@ export function TransformationPage() {
                   );
                 })}
                 {videoLanes.map((laneItems, laneIndex) => {
+                  const laneId = `video-lane-${laneIndex}`;
                   const isLaneLocked = laneItems.length > 0 && laneItems.every((item) => Boolean(item.locked));
                   const isLaneVisible = laneItems.every((item) => item.visible !== false);
+                  const isSelectedLane = selectedTimelineLaneId === laneId;
                   return (
                     <TimelineTrack
+                      laneId={laneId}
                       trackKey="video"
                       locked={isLaneLocked}
                       onToggleLock={() => toggleLaneLock(laneItems)}
@@ -14923,10 +16174,23 @@ export function TransformationPage() {
                       onToggleMute={toggleVideoMuted}
                       muteDisabled={audioExtracted}
                       muteTooltip={audioExtracted ? "Audio sudah dipisah ke track AUDIO" : undefined}
+                      onSelectLane={() => setSelectedTimelineLaneId(laneId)}
+                      onOpenLaneMenu={(e) => {
+                        setLaneContextMenu({
+                          x: e.clientX,
+                          y: e.clientY,
+                          laneId,
+                          trackKey: "video",
+                          label: `Track Video ${laneIndex + 1}`,
+                          items: laneItems,
+                          locked: isLaneLocked,
+                        });
+                      }}
+                      isLaneSelected={isSelectedLane}
                       {...timelineTrackOrderProps("video")}
                       duration={timelineScaleDuration}
                       items={laneItems}
-                      key={`video-lane-${laneIndex}`}
+                      key={laneId}
                       label="Video"
                       onItemClick={selectTimelineItem}
                       onItemContextMenu={handleTrackItemContextMenu}
@@ -14948,23 +16212,39 @@ export function TransformationPage() {
                   );
                 })}
                 {audioLanes.map((laneItems, laneIndex) => {
+                  const laneId = `audio-lane-${laneIndex}`;
                   const isExtractedAudioLane = laneItems.some((item) => item.type === "audio");
                   const isLaneLocked = laneItems.length > 0 && laneItems.every((item) => Boolean(item.locked));
                   const isLaneMuted = isExtractedAudioLane
                     ? audioSettings.muted
                     : laneItems.length > 0 && laneItems.every((item) => Boolean(item.muted));
+                  const isSelectedLane = selectedTimelineLaneId === laneId;
 
                   return (
                     <TimelineTrack
+                      laneId={laneId}
                       trackKey="audio"
                       locked={isLaneLocked}
                       onToggleLock={() => toggleLaneLock(laneItems)}
                       muted={isLaneMuted}
                       onToggleMute={() => toggleLaneMute(laneItems)}
+                      onSelectLane={() => setSelectedTimelineLaneId(laneId)}
+                      onOpenLaneMenu={(e) => {
+                        setLaneContextMenu({
+                          x: e.clientX,
+                          y: e.clientY,
+                          laneId,
+                          trackKey: "audio",
+                          label: `Track Audio ${laneIndex + 1}`,
+                          items: laneItems,
+                          locked: isLaneLocked,
+                        });
+                      }}
+                      isLaneSelected={isSelectedLane}
                       {...timelineTrackOrderProps("audio")}
                       duration={timelineScaleDuration}
                       items={laneItems}
-                      key={`audio-lane-${laneIndex}`}
+                      key={laneId}
                       label="Audio"
                       onItemClick={selectTimelineItem}
                       onItemContextMenu={handleTrackItemContextMenu}
@@ -15076,7 +16356,12 @@ export function TransformationPage() {
                             : "border-zinc-700 bg-zinc-800 text-zinc-300 hover:border-zinc-500"
                         }`}
                         key={value}
-                        onClick={() => setExportResolution(value)}
+                        onClick={() => {
+                          setExportResolution(value);
+                          setRenderDirty(true);
+                          setExportRenderId(null);
+                          setExportValidatedRenderId(null);
+                        }}
                         type="button"
                       >
                         <strong className="block">{label}</strong>
@@ -15097,7 +16382,12 @@ export function TransformationPage() {
                             : "border-zinc-700 bg-zinc-800 text-zinc-300"
                         }`}
                         key={value}
-                        onClick={() => setExportQuality(value)}
+                        onClick={() => {
+                          setExportQuality(value);
+                          setRenderDirty(true);
+                          setExportRenderId(null);
+                          setExportValidatedRenderId(null);
+                        }}
                         type="button"
                       >
                         {value === "standard" ? "Standard" : value === "high" ? "High" : "Higher"}
@@ -15133,6 +16423,12 @@ export function TransformationPage() {
                   </div>
                 </div>
 
+                {renderDirty && (
+                  <div className="rounded-xl border border-amber-400/40 bg-amber-950/40 p-3 text-xs font-bold text-amber-200 flex items-center gap-2">
+                    <span className="text-base">⚠️</span>
+                    <span>Ada perubahan, render ulang diperlukan</span>
+                  </div>
+                )}
                 <div className={`rounded-xl p-3 text-sm font-bold ${
                   exportFailed ? "bg-red-950/60 text-red-200" : exportReady ? "bg-emerald-950/60 text-emerald-200" : "bg-zinc-800 text-zinc-300"
                 }`}>
@@ -15296,6 +16592,113 @@ export function TransformationPage() {
                   {exportInProgress ? "Mengekspor..." : exportFailed ? "Coba Lagi" : "Export"}
                 </button>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* LANE CONTEXT MENU */}
+      {laneContextMenu && (
+        <div
+          aria-label="Menu opsi track"
+          className="fixed z-[100] w-56 overflow-hidden rounded-xl border border-zinc-600 bg-[#25282d] p-1.5 text-zinc-100 shadow-2xl shadow-black/60"
+          onContextMenu={(event) => event.preventDefault()}
+          onPointerDown={(event) => event.stopPropagation()}
+          role="menu"
+          style={{
+            left: Math.max(8, Math.min(laneContextMenu.x, window.innerWidth - 240)),
+            top: Math.max(8, Math.min(laneContextMenu.y, window.innerHeight - 180)),
+          }}
+        >
+          <div className="border-b border-zinc-700 px-3 py-2">
+            <p className="truncate text-xs font-black text-white">
+              {laneContextMenu.label}
+            </p>
+            <p className="mt-0.5 text-[10px] font-bold uppercase tracking-wide text-zinc-400">
+              {laneContextMenu.items.length} item • {laneContextMenu.locked ? "Terkunci" : "Aktif"}
+            </p>
+          </div>
+          <div className="py-1">
+            <button
+              className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-xs font-bold hover:bg-zinc-700 transition"
+              onClick={() => {
+                selectAllLaneItems(laneContextMenu.trackKey, laneContextMenu.items);
+                setLaneContextMenu(null);
+              }}
+              role="menuitem"
+              type="button"
+            >
+              <span>Pilih Semua Item</span>
+              <span className="text-[10px] text-zinc-400 font-normal">Track</span>
+            </button>
+            <button
+              className={`flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-xs font-bold transition ${
+                laneContextMenu.locked
+                  ? "text-zinc-500 opacity-50 cursor-not-allowed"
+                  : "text-red-400 hover:bg-red-950/60 hover:text-red-300"
+              }`}
+              onClick={() => {
+                const { laneId, trackKey, label, items, locked } = laneContextMenu;
+                setLaneContextMenu(null);
+                requestDeleteLaneContents(laneId, trackKey, label, items, locked);
+              }}
+              role="menuitem"
+              type="button"
+            >
+              <span className="flex items-center gap-1.5">
+                <svg className="size-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="3 6 5 6 21 6" />
+                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                </svg>
+                Hapus Isi Track
+              </span>
+              <span className="text-[10px] text-red-400/80 font-normal">Seluruh item</span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* TRACK DELETE CONFIRMATION MODAL */}
+      {trackDeleteConfirm && (
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+          <div className="w-full max-w-sm rounded-xl border border-zinc-700/80 bg-[#1e2126] p-5 shadow-2xl">
+            <div className="flex items-start gap-3">
+              <div className="flex size-10 shrink-0 items-center justify-center rounded-full bg-red-950/80 border border-red-800/60 text-red-400">
+                <svg className="size-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="3 6 5 6 21 6" />
+                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                  <line x1="10" y1="11" x2="10" y2="17" />
+                  <line x1="14" y1="11" x2="14" y2="17" />
+                </svg>
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-zinc-100">
+                  Hapus Seluruh Isi {trackDeleteConfirm.label}?
+                </h3>
+                <p className="mt-1 text-xs text-zinc-400 leading-relaxed">
+                  <span className="font-bold text-red-300">{trackDeleteConfirm.itemCount} item</span> pada track ini akan dihapus dari timeline secara sekaligus.
+                </p>
+              </div>
+            </div>
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setTrackDeleteConfirm(null)}
+                className="rounded-lg px-3 py-1.5 text-xs font-semibold text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 transition"
+              >
+                Batal
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const { trackKey, items } = trackDeleteConfirm;
+                  setTrackDeleteConfirm(null);
+                  deleteTimelineLaneContents(trackKey, items);
+                }}
+                className="rounded-lg bg-red-600 px-3.5 py-1.5 text-xs font-bold text-white shadow-md hover:bg-red-500 transition"
+              >
+                Hapus Track
+              </button>
             </div>
           </div>
         </div>

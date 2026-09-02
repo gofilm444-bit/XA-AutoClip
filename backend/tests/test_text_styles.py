@@ -114,3 +114,79 @@ def test_caption_style_maps_manual_and_shared_preset_fields() -> None:
         "display_mode_karaoke_uses_estimated_uniform_word_timing"
         in shared_fallbacks
     )
+
+
+def test_rich_font_catalog_resolution() -> None:
+    anton = resolve_export_text_style("modern_sans", font_override="anton")
+    assert anton.font_name == "Anton"
+
+    bangers = resolve_export_text_style("modern_sans", font_override="'Bangers', cursive")
+    assert bangers.font_name == "Bangers"
+
+    pacifico = resolve_export_text_style("modern_sans", font_override="pacifico")
+    assert pacifico.font_name == "Pacifico"
+
+    playfair = resolve_export_text_style("modern_sans", font_override="'Playfair Display', serif")
+    assert playfair.font_name == "Playfair Display"
+
+    caption_style, fallbacks = resolve_caption_export_style(
+        {"textPreset": "default", "font_family": "'Permanent Marker', cursive"}
+    )
+    assert caption_style.font_name == "Permanent Marker"
+    assert any("Permanent Marker" in fb for fb in fallbacks)
+
+
+def test_caption_style_maps_snake_case_main_caption_style() -> None:
+    style, fallbacks = resolve_caption_export_style(
+        {
+            "preset_id": "viral_yellow_punch",
+            "color": "#FACC15",
+            "font_family": "'Anton', sans-serif",
+            "font_weight": "900",
+            "stroke_enabled": True,
+            "stroke_color": "#000000",
+            "stroke_width": 4.0,
+            "shadow_enabled": True,
+            "shadow_color": "#000000",
+            "shadow_y": 3,
+            "background_enabled": True,
+            "background_color": "#18181B",
+            "background_opacity": 0.85,
+            "case_mode": "uppercase",
+            "karaoke_enabled": True,
+        }
+    )
+
+    assert style.font_name == "Anton"
+    assert style.text_color == "#FACC15"
+    assert style.outline_width == 4.0
+    assert style.shadow_offset == 3
+    assert style.background_color == "#18181B"
+    assert style.background_opacity == 0.85
+    assert style.bold is True
+    assert style.uppercase is True
+    assert any("karaoke" in fb for fb in fallbacks)
+
+
+def test_caption_style_preserves_engine_v3_template_type() -> None:
+    lower_third, lt_fallbacks = resolve_caption_export_style(
+        {
+            "template_type": "lower_third",
+            "color": "#FFFFFF",
+            "background_enabled": True,
+            "background_color": "#1E3A8A",
+            "background_opacity": 0.95,
+        }
+    )
+    assert lower_third.background_color == "#1E3A8A"
+    assert "template_layout_lower_third" in lt_fallbacks
+
+    typewriter, tw_fallbacks = resolve_caption_export_style(
+        {
+            "template_type": "typewriter",
+            "color": "#38BDF8",
+        }
+    )
+    assert typewriter.text_color == "#38BDF8"
+    assert any("animation_typewriter" in fb for fb in tw_fallbacks)
+

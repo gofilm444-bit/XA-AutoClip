@@ -126,3 +126,129 @@
   }
 }
 
+
+/* Caption Template Engine V4 High-Impact Animations */
+@keyframes captionGlitch {
+  0% {
+    text-shadow: -3px 0 #06b6d4, 3px 0 #ec4899, 0 0 8px rgba(6,182,212,0.8);
+    transform: translate(0, 0);
+  }
+  20% {
+    text-shadow: 3px 0 #06b6d4, -3px 0 #ec4899, 0 0 12px rgba(236,72,153,0.8);
+    transform: translate(-1.5px, 1px);
+  }
+  40% {
+    text-shadow: -2px 2px #06b6d4, 2px -2px #ec4899, 0 0 8px rgba(6,182,212,0.8);
+    transform: translate(1px, -1px);
+  }
+  60% {
+    text-shadow: 3px -1px #06b6d4, -3px 1px #ec4899, 0 0 12px rgba(236,72,153,0.8);
+    transform: translate(-1px, 0);
+  }
+  80% {
+    text-shadow: -3px 0 #06b6d4, 3px 0 #ec4899, 0 0 8px rgba(6,182,212,0.8);
+    transform: translate(1.5px, 1px);
+  }
+  100% {
+    text-shadow: -3px 0 #06b6d4, 3px 0 #ec4899, 0 0 8px rgba(6,182,212,0.8);
+    transform: translate(0, 0);
+  }
+}
+
+@keyframes captionShake {
+  0% { transform: translate(0, 0) rotate(0deg); }
+  15% { transform: translate(-3px, 2px) rotate(-1deg); }
+  30% { transform: translate(3px, -2px) rotate(1deg); }
+  45% { transform: translate(-2px, -2px) rotate(-0.5deg); }
+  60% { transform: translate(2px, 2px) rotate(0.5deg); }
+  75% { transform: translate(-1px, 1px) rotate(-0.5deg); }
+  100% { transform: translate(0, 0) rotate(0deg); }
+}
+
+@keyframes captionPulse {
+  0%, 100% {
+    transform: scale(1);
+    filter: drop-shadow(0 0 4px rgba(250, 204, 21, 0.4));
+  }
+  50% {
+    transform: scale(1.08);
+    filter: drop-shadow(0 0 16px rgba(250, 204, 21, 0.9));
+  }
+}
+
+@keyframes captionTypewriterBlink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+.caption-effect-glitch {
+  display: inline-block;
+  animation: captionGlitch 0.25s infinite linear;
+}
+
+.caption-effect-shake {
+  display: inline-block;
+  animation: captionShake 0.28s infinite ease-in-out;
+}
+
+.caption-effect-pulse {
+  display: inline-block;
+  animation: captionPulse 1s infinite ease-in-out;
+}
+
+.caption-typewriter-cursor {
+  display: inline-block;
+  animation: captionTypewriterBlink 0.7s infinite;
+  color: #38bdf8;
+  font-weight: 900;
+  margin-left: 2px;
+}
+
+/* Caption Template Engine V7 Animation & Behavior Keyframes */
+@keyframes captionPopIn {
+  0% { transform: scale(0.85); opacity: 0.8; }
+  60% { transform: scale(1.06); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+@keyframes captionBounceIn {
+  0% { transform: scale(0.6) translateY(-10px); opacity: 0; }
+  50% { transform: scale(1.12) translateY(3px); opacity: 1; }
+  75% { transform: scale(0.96) translateY(-2px); }
+  100% { transform: scale(1) translateY(0); opacity: 1; }
+}
+
+@keyframes captionFloat {
+  0%, 100% { transform: translateY(0px) rotate(-2deg); }
+  50% { transform: translateY(-4px) rotate(1deg); }
+}
+
+@keyframes captionSubtlePulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.03); }
+}
+
+@keyframes captionBadgePulse {
+  0%, 100% { transform: scale(1); filter: brightness(1); }
+  50% { transform: scale(1.06); filter: brightness(1.15); }
+}
+
+.caption-anim-pop {
+  animation: captionPopIn 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+.caption-anim-bounce {
+  animation: captionBounceIn 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.caption-anim-float {
+  animation: captionFloat 2.4s infinite ease-in-out;
+}
+
+.caption-anim-subtle-pulse {
+  animation: captionSubtlePulse 1.8s infinite ease-in-out;
+}
+
+.caption-anim-badge-pulse {
+  animation: captionBadgePulse 1.5s infinite ease-in-out;
+}

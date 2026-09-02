@@ -1,4 +1,4 @@
-const API_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+export const API_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
 type FastApiValidationError = {
   loc?: Array<string | number>;
@@ -105,7 +105,7 @@ export const uploadedAudioUrl = (transformationId: string, assetId: string) =>
   `${API_URL}/api/transformations/${transformationId}/audio-assets/${assetId}`;
 
 export const mediaUrl = (transformationId: string, assetId: string) =>
-  `${API_URL}/api/transformations/${transformationId}/media/${assetId}`;
+  `${API_URL}/api/transformations/${transformationId}/media/${assetId}/source`;
 
 export function uploadMedia<T>(
   path: string,

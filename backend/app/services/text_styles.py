@@ -92,6 +92,70 @@ TEXT_STYLE_EXPORT_PRESETS: dict[str, ExportTextStyle] = {
     ),
 }
 
+
+# V6 Caption Template Export Presets (42 Templates)
+CAPTION_TEMPLATE_EXPORT_PRESETS: dict[str, ExportTextStyle] = {
+    # 1. Viral Bold Captions
+    "viral_yellow_punch": ExportTextStyle("viral_yellow_punch", "Anton", "#FDE047", "#000000", 2.0, "#000000", 3, None, 0.0, True, True),
+    "viral_cyan_pulse": ExportTextStyle("viral_cyan_pulse", "Anton", "#06B6D4", "#000000", 2.0, "#000000", 3, None, 0.0, True, True),
+    "viral_green_growth": ExportTextStyle("viral_green_growth", "Anton", "#4ADE80", "#000000", 2.0, "#000000", 3, None, 0.0, True, True),
+    "viral_pink_punch": ExportTextStyle("viral_pink_punch", "Anton", "#F43F5E", "#000000", 2.0, "#000000", 3, None, 0.0, True, True),
+    "viral_orange_flame": ExportTextStyle("viral_orange_flame", "Anton", "#FB923C", "#000000", 2.0, "#000000", 3, None, 0.0, True, True),
+    "viral_lime_bold": ExportTextStyle("viral_lime_bold", "Anton", "#A3E635", "#000000", 2.0, "#000000", 3, None, 0.0, True, True),
+    "viral_purple_energy": ExportTextStyle("viral_purple_energy", "Anton", "#C084FC", "#000000", 2.0, "#000000", 3, None, 0.0, True, True),
+    "viral_white_clean": ExportTextStyle("viral_white_clean", "Anton", "#FFFFFF", "#000000", 2.0, "#000000", 3, None, 0.0, True, True),
+
+    # 2. Meme Captions
+    "meme_white_stroke": ExportTextStyle("meme_white_stroke", "Bangers", "#FFFFFF", "#000000", 2.5, "#000000", 4, None, 0.0, True, True),
+    "meme_yellow_bottom": ExportTextStyle("meme_yellow_bottom", "Bangers", "#FACC15", "#000000", 2.5, "#000000", 4, None, 0.0, True, True),
+    "meme_red_impact": ExportTextStyle("meme_red_impact", "Bangers", "#EF4444", "#000000", 2.5, "#000000", 4, None, 0.0, True, True),
+    "meme_green_rage": ExportTextStyle("meme_green_rage", "Bangers", "#22C55E", "#000000", 2.5, "#000000", 4, None, 0.0, True, True),
+
+    # 3. Bubble Captions
+    "white_rounded_bubble": ExportTextStyle("white_rounded_bubble", "DejaVu Sans", "#000000", "#FFFFFF", 0.0, None, 0, "#FFFFFF", 0.95, True, False),
+    "dark_glass_bubble": ExportTextStyle("dark_glass_bubble", "DejaVu Sans", "#FFFFFF", "#18181B", 0.0, None, 0, "#18181B", 0.85, True, False),
+    "cyan_bubble": ExportTextStyle("cyan_bubble", "DejaVu Sans", "#082F49", "#38BDF8", 0.0, None, 0, "#38BDF8", 0.95, True, False),
+    "amber_glow_bubble": ExportTextStyle("amber_glow_bubble", "DejaVu Sans", "#451A03", "#FBBF24", 0.0, None, 0, "#FBBF24", 0.95, True, False),
+    "emerald_bubble": ExportTextStyle("emerald_bubble", "DejaVu Sans", "#FFFFFF", "#059669", 0.0, None, 0, "#059669", 0.95, True, False),
+    "rose_bubble": ExportTextStyle("rose_bubble", "DejaVu Sans", "#FFFFFF", "#E11D48", 0.0, None, 0, "#E11D48", 0.95, True, False),
+    "indigo_bubble": ExportTextStyle("indigo_bubble", "DejaVu Sans", "#FFFFFF", "#4F46E5", 0.0, None, 0, "#4F46E5", 0.95, True, False),
+
+    # 4. News Lower Thirds
+    "news_lower_third": ExportTextStyle("news_lower_third", "DejaVu Sans Condensed", "#FFFFFF", "#0F172A", 0.0, None, 0, "#0F172A", 0.95, True, False),
+    "breaking_red_bar": ExportTextStyle("breaking_red_bar", "DejaVu Sans Condensed", "#FEF08A", "#7F1D1D", 0.0, None, 0, "#7F1D1D", 0.95, True, True),
+    "podcast_speaker_bar": ExportTextStyle("podcast_speaker_bar", "DejaVu Sans Condensed", "#F8FAFC", "#1E293B", 0.0, None, 0, "#1E293B", 0.95, True, False),
+    "investigasi_dark_bar": ExportTextStyle("investigasi_dark_bar", "DejaVu Sans Condensed", "#FDE047", "#18181B", 0.0, None, 0, "#18181B", 0.95, True, False),
+
+    # 5. Word Highlights / Keywords
+    "keyword_yellow_box": ExportTextStyle("keyword_yellow_box", "DejaVu Sans", "#FFFFFF", "#000000", 1.5, "#000000", 2, None, 0.0, True, False),
+    "keyword_cyan_pill": ExportTextStyle("keyword_cyan_pill", "DejaVu Sans", "#FFFFFF", "#000000", 1.5, "#000000", 2, None, 0.0, True, False),
+    "keyword_lime_pill": ExportTextStyle("keyword_lime_pill", "DejaVu Sans", "#FFFFFF", "#000000", 1.5, "#000000", 2, None, 0.0, True, False),
+    "keyword_orange_pill": ExportTextStyle("keyword_orange_pill", "DejaVu Sans", "#FFFFFF", "#000000", 1.5, "#000000", 2, None, 0.0, True, False),
+    "karaoke_yellow_fill": ExportTextStyle("karaoke_yellow_fill", "DejaVu Sans", "#FFFFFF", "#000000", 1.5, "#000000", 2, None, 0.0, True, False),
+    "karaoke_cyan_glow": ExportTextStyle("karaoke_cyan_glow", "DejaVu Sans", "#FFFFFF", "#000000", 1.5, "#000000", 2, None, 0.0, True, False),
+
+    # 6. Documentary & Serif
+    "documentary_serif_gold": ExportTextStyle("documentary_serif_gold", "DejaVu Serif", "#FEF3C7", "#292524", 0.35, "#000000", 2, None, 0.0, True, False),
+    "documentary_clean_white": ExportTextStyle("documentary_clean_white", "DejaVu Serif", "#FFFFFF", "#1C1917", 0.35, "#000000", 2, None, 0.0, True, False),
+    "documentary_historic": ExportTextStyle("documentary_historic", "DejaVu Serif", "#FDE68A", "#451A03", 0.35, "#000000", 2, None, 0.0, True, False),
+    "quote_gold_card": ExportTextStyle("quote_gold_card", "DejaVu Serif", "#FFFFFF", "#000000", 0.0, None, 0, "#18181B", 0.85, False, False),
+    "education_slate_card": ExportTextStyle("education_slate_card", "DejaVu Sans", "#F1F5F9", "#000000", 0.0, None, 0, "#1E293B", 0.90, True, False),
+    "debate_vs_card": ExportTextStyle("debate_vs_card", "DejaVu Sans", "#FFFFFF", "#000000", 0.0, None, 0, "#0F172A", 0.90, True, False),
+    "sticker_tilted_yellow": ExportTextStyle("sticker_tilted_yellow", "Anton", "#000000", "#FFFFFF", 2.0, "#000000", 3, "#FACC15", 0.95, True, True),
+
+    # 7. Animated / Effects
+    "typewriter_clean": ExportTextStyle("typewriter_clean", "DejaVu Sans", "#E0F2FE", "#000000", 1.0, "#000000", 2, None, 0.0, True, False),
+    "glitch_cyber_green": ExportTextStyle("glitch_cyber_green", "DejaVu Sans", "#4ADE80", "#000000", 1.5, "#06B6D4", 3, None, 0.0, True, True),
+    "glitch_rgb_split": ExportTextStyle("glitch_rgb_split", "DejaVu Sans", "#FFFFFF", "#000000", 1.5, "#EC4899", 3, None, 0.0, True, True),
+    "shake_emphasis": ExportTextStyle("shake_emphasis", "Anton", "#EF4444", "#000000", 2.0, "#000000", 3, None, 0.0, True, True),
+    "flash_yellow_pulse": ExportTextStyle("flash_yellow_pulse", "Anton", "#FDE047", "#000000", 2.0, "#000000", 3, None, 0.0, True, True),
+
+    # 8. Clean Subtitles
+    "clean_white_sub": ExportTextStyle("clean_white_sub", "DejaVu Sans", "#FFFFFF", "#111827", 0.35, "#000000", 1, None, 0.0, True, False),
+    "clean_yellow_sub": ExportTextStyle("clean_yellow_sub", "DejaVu Sans", "#FEF08A", "#111827", 0.35, "#000000", 1, None, 0.0, True, False),
+    "clean_black_box": ExportTextStyle("clean_black_box", "DejaVu Sans", "#FFFFFF", "#000000", 0.0, None, 0, "#000000", 0.80, True, False),
+}
+
 TEXT_STYLE_EXPORT_PRESETS.update({
     "clean_creator": ExportTextStyle("clean_creator", "DejaVu Sans", "#FFFFFF", "#0F172A", 0.4, "#000000", 3, None, 0.0, True, False),
     "red_news_bar": ExportTextStyle("red_news_bar", "DejaVu Sans Condensed", "#FFFFFF", "#7F1D1D", 0.5, "#000000", 2, "#B91C1C", 0.9, True, True),
@@ -118,6 +182,11 @@ TEXT_STYLE_EXPORT_PRESETS.update({
     "simple_top_label": ExportTextStyle("simple_top_label", "DejaVu Sans Condensed", "#E2E8F0", "#0F172A", 0.25, "#000000", 1, None, 0.0, False, True),
 })
 
+ALL_EXPORT_PRESETS: dict[str, ExportTextStyle] = {
+    **TEXT_STYLE_EXPORT_PRESETS,
+    **CAPTION_TEMPLATE_EXPORT_PRESETS,
+}
+
 FONT_OVERRIDE_MAP = {
     "bold_sans": "DejaVu Sans",
     "elegant_serif": "DejaVu Serif",
@@ -126,6 +195,107 @@ FONT_OVERRIDE_MAP = {
     "playful": "DejaVu Sans",
     "clean_sans": "DejaVu Sans",
 }
+
+RICH_FONT_MAP: dict[str, str] = {
+    # Bold / Viral
+    "anton": "Anton",
+    "bangers": "Bangers",
+    "bebas_neue": "Bebas Neue",
+    "bowlby_one_sc": "Bowlby One SC",
+    "lilita_one": "Lilita One",
+    "luckiest_guy": "Luckiest Guy",
+    "titan_one": "Titan One",
+    "archivo_black": "Archivo Black",
+    "black_ops_one": "Black Ops One",
+    "passion_one": "Passion One",
+    "fugaz_one": "Fugaz One",
+    "righteous": "Righteous",
+    "shrikhand": "Shrikhand",
+    "ultra": "Ultra",
+    # Comic / Fun
+    "bungee": "Bungee",
+    "bungee_shade": "Bungee Shade",
+    "bungee_inline": "Bungee Inline",
+    "chewy": "Chewy",
+    "fredoka": "Fredoka",
+    "baloo_2": "Baloo 2",
+    "coiny": "Coiny",
+    "boogaloo": "Boogaloo",
+    "mouse_memoirs": "Mouse Memoirs",
+    "rubik_bubbles": "Rubik Bubbles",
+    "sniglet": "Sniglet",
+    "carter_one": "Carter One",
+    # Retro
+    "pacifico": "Pacifico",
+    "lobster": "Lobster",
+    "limelight": "Limelight",
+    "monoton": "Monoton",
+    "fascinate": "Fascinate",
+    "yesteryear": "Yesteryear",
+    "rye": "Rye",
+    "special_elite": "Special Elite",
+    # Handwriting
+    "caveat": "Caveat",
+    "kalam": "Kalam",
+    "patrick_hand": "Patrick Hand",
+    "permanent_marker": "Permanent Marker",
+    "shadows_into_light": "Shadows Into Light",
+    "gloria_hallelujah": "Gloria Hallelujah",
+    "indie_flower": "Indie Flower",
+    "architects_daughter": "Architects Daughter",
+    "satisfy": "Satisfy",
+    "kaushan_script": "Kaushan Script",
+    # Elegant / Serif
+    "playfair_display": "Playfair Display",
+    "abril_fatface": "Abril Fatface",
+    "dm_serif_display": "DM Serif Display",
+    "cormorant_garamond": "Cormorant Garamond",
+    "cinzel": "Cinzel",
+    "prata": "Prata",
+    "bodoni_moda": "Bodoni Moda",
+    "yeseva_one": "Yeseva One",
+    # Condensed / News
+    "oswald": "Oswald",
+    "roboto_condensed": "Roboto Condensed",
+    "teko": "Teko",
+    "saira_condensed": "Saira Condensed",
+    "fjalla_one": "Fjalla One",
+    "league_gothic": "League Gothic",
+    "antonio": "Antonio",
+    "big_shoulders_display": "Big Shoulders Display",
+    # Modern / Clean
+    "inter": "Inter",
+    "montserrat": "Montserrat",
+    "poppins": "Poppins",
+    "plus_jakarta_sans": "Plus Jakarta Sans",
+    "outfit": "Outfit",
+    "rubik": "Rubik",
+    # Legacy aliases
+    "bold_sans": "DejaVu Sans",
+    "elegant_serif": "DejaVu Serif",
+    "modern_rounded": "DejaVu Sans",
+    "condensed_news": "DejaVu Sans Condensed",
+    "playful": "DejaVu Sans",
+    "clean_sans": "DejaVu Sans",
+}
+
+
+def resolve_backend_font_name(font_spec: Any, default_font: str = "DejaVu Sans") -> str:
+    if not font_spec:
+        return default_font
+    raw = str(font_spec).strip()
+    if raw in RICH_FONT_MAP:
+        return RICH_FONT_MAP[raw]
+    
+    primary = raw.replace('"', "").replace("'", "").split(",")[0].strip()
+    key = primary.lower().replace(" ", "_").replace("-", "_")
+    if key in RICH_FONT_MAP:
+        return RICH_FONT_MAP[key]
+    
+    if primary and primary.lower() not in {"sans_serif", "sans-serif", "serif", "cursive", "system_ui", "system-ui"}:
+        return primary
+    return default_font
+
 
 HOOK_TEMPLATE_EXPORT_PRESETS = {
     "capcut_clean": "modern_sans",
@@ -152,7 +322,9 @@ HOOK_TEMPLATE_BACKGROUNDS: dict[str, tuple[str, float]] = {
 
 def normalize_text_style_key(value: Any) -> str:
     key = str(value or "default")
-    return key if key in TEXT_STYLE_EXPORT_PRESETS else "default"
+    if key in ALL_EXPORT_PRESETS:
+        return key
+    return "default"
 
 
 def resolve_export_text_style(
@@ -160,17 +332,19 @@ def resolve_export_text_style(
     *,
     font_override: Any = None,
 ) -> ExportTextStyle:
-    style = TEXT_STYLE_EXPORT_PRESETS[normalize_text_style_key(value)]
-    override_key = str(font_override or "")
+    key = normalize_text_style_key(value)
+    style = ALL_EXPORT_PRESETS.get(key, DEFAULT_TEXT_STYLE)
+    override_key = str(font_override or "").strip()
     if not override_key:
         return style
-    font_name = FONT_OVERRIDE_MAP.get(override_key, style.font_name)
+    font_name = resolve_backend_font_name(override_key, style.font_name)
+    fallback_used = (font_name == style.font_name and override_key != style.font_name)
     logger.info(
         "text_style_font_fallback",
         requested_font=override_key,
         resolved_backend_font=font_name,
         text_style_preset=style.key,
-        fallback_used=True,
+        fallback_used=fallback_used,
     )
     return ExportTextStyle(
         **{**style.__dict__, "font_name": font_name},
@@ -283,65 +457,111 @@ def resolve_hook_export_style(
 def resolve_caption_export_style(
     caption_style: dict[str, Any] | None,
 ) -> tuple[ExportTextStyle, tuple[str, ...]]:
-    """Map the frontend caption style to the closest safe ASS style."""
+    """Map the frontend caption style (main_caption_style or caption_style) to the closest safe ASS style."""
     config = caption_style if isinstance(caption_style, dict) else {}
-    requested_preset = str(config.get("textPreset") or "default")
+    requested_preset = str(config.get("preset_id") or config.get("textPreset") or "default")
     preset_key = normalize_text_style_key(requested_preset)
     style = resolve_export_text_style(preset_key)
     fallbacks: list[str] = []
-    if requested_preset != preset_key:
+    if requested_preset != "default" and requested_preset != preset_key:
         fallbacks.append(f"unknown_text_preset:{requested_preset}->default")
 
-    if preset_key == "default":
-        text_color, invalid_text_color = _safe_hex_color(
-            config.get("textColor"),
-            style.text_color,
-        )
+    # Resolve text color
+    raw_color = config.get("color") or config.get("textColor")
+    if raw_color:
+        text_color, invalid_text_color = _safe_hex_color(raw_color, style.text_color)
         if invalid_text_color:
             fallbacks.append("invalid_text_color")
-        outline_enabled = bool(config.get("outlineEnabled", False))
-        shadow_enabled = bool(config.get("shadowEnabled", True))
-        background_enabled = bool(config.get("backgroundEnabled", False))
+        style = replace(style, text_color=text_color)
+
+    # Resolve stroke / outline
+    has_stroke = "stroke_enabled" in config or "outlineEnabled" in config
+    if has_stroke:
+        stroke_enabled = bool(config.get("stroke_enabled", config.get("outlineEnabled", False)))
+        raw_stroke_color = config.get("stroke_color") or config.get("outlineColor") or "#000000"
+        stroke_color, _ = _safe_hex_color(raw_stroke_color, "#000000")
+        raw_width = config.get("stroke_width", config.get("outlineWidth", 0.75))
         try:
-            background_opacity = max(
-                0.0,
-                min(0.85, float(config.get("backgroundOpacity", 0.55))),
-            )
+            stroke_width = float(raw_width) if stroke_enabled else 0.0
         except (TypeError, ValueError):
-            background_opacity = 0.55
-            fallbacks.append("invalid_background_opacity")
+            stroke_width = 0.75 if stroke_enabled else 0.0
         style = replace(
             style,
-            text_color=text_color,
-            outline_color="#000000",
-            outline_width=0.75 if outline_enabled else 0.0,
-            shadow_color="#000000" if shadow_enabled else None,
-            shadow_offset=2 if shadow_enabled else 0,
-            background_color="#000000" if background_enabled else None,
-            background_opacity=background_opacity if background_enabled else 0.0,
-            bold=str(config.get("fontWeight") or "semibold") != "normal",
-        )
-    elif bool(config.get("backgroundEnabled")) and not style.background_color:
-        try:
-            background_opacity = max(
-                0.0,
-                min(0.85, float(config.get("backgroundOpacity", 0.55))),
-            )
-        except (TypeError, ValueError):
-            background_opacity = 0.55
-            fallbacks.append("invalid_background_opacity")
-        style = replace(
-            style,
-            background_color="#000000",
-            background_opacity=background_opacity,
+            outline_color=stroke_color,
+            outline_width=min(4.0, max(0.0, stroke_width)),
         )
 
-    display_mode = str(config.get("displayMode") or "segment")
-    if display_mode in {"karaoke", "word_by_word"}:
+    # Resolve shadow
+    has_shadow = "shadow_enabled" in config or "shadowEnabled" in config
+    if has_shadow:
+        shadow_enabled = bool(config.get("shadow_enabled", config.get("shadowEnabled", True)))
+        raw_shadow_color = config.get("shadow_color") or config.get("shadowColor") or "#000000"
+        shadow_color, _ = _safe_hex_color(raw_shadow_color, "#000000")
+        raw_offset = config.get("shadow_y", config.get("shadow_offset", 2))
+        try:
+            shadow_offset = int(raw_offset) if shadow_enabled else 0
+        except (TypeError, ValueError):
+            shadow_offset = 2 if shadow_enabled else 0
+        style = replace(
+            style,
+            shadow_color=shadow_color if shadow_enabled else None,
+            shadow_offset=max(0, min(4, shadow_offset)),
+        )
+
+    # Resolve background / bubble
+    has_bg = "background_enabled" in config or "backgroundEnabled" in config
+    if has_bg:
+        background_enabled = bool(config.get("background_enabled", config.get("backgroundEnabled", False)))
+        raw_bg_color = config.get("background_color") or config.get("backgroundColor") or "#000000"
+        background_color, _ = _safe_hex_color(raw_bg_color, "#000000")
+        raw_opacity = config.get("background_opacity", config.get("backgroundOpacity", 0.75))
+        try:
+            background_opacity = max(0.0, min(1.0, float(raw_opacity)))
+        except (TypeError, ValueError):
+            background_opacity = 0.75
+            fallbacks.append("invalid_background_opacity")
+        style = replace(
+            style,
+            background_color=background_color if background_enabled else None,
+            background_opacity=background_opacity if background_enabled else 0.0,
+        )
+
+    # Resolve bold / font weight
+    raw_weight = config.get("font_weight") or config.get("fontWeight")
+    if raw_weight:
+        is_bold = str(raw_weight) not in {"normal", "400", "500"}
+        style = replace(style, bold=is_bold)
+
+    # Resolve uppercase / case mode
+    raw_case = config.get("case_mode") or config.get("caseMode")
+    if raw_case == "uppercase" or bool(config.get("uppercase")):
+        style = replace(style, uppercase=True)
+
+    # Resolve display mode / karaoke / behavior
+    display_mode = str(config.get("displayMode") or ("karaoke" if config.get("karaoke_enabled") else "segment"))
+    if display_mode in {"karaoke", "word_by_word"} or config.get("karaoke_enabled"):
         fallbacks.append(
             f"display_mode_{display_mode}_uses_estimated_uniform_word_timing"
         )
-    fallbacks.append(f"frontend_font_stack_mapped_to:{style.font_name}")
+
+    # Resolve template_type & animations
+    template_type = str(config.get("template_type") or "basic_subtitle")
+    if template_type in {"typewriter", "glitch", "shake", "flash"}:
+        fallbacks.append(f"animation_{template_type}_uses_clean_export_fallback")
+    elif template_type == "lower_third":
+        fallbacks.append("template_layout_lower_third")
+    elif template_type == "word_highlight":
+        fallbacks.append("template_behavior_word_highlight")
+
+    # Resolve font family
+    custom_font = config.get("font_family") or config.get("fontFamily")
+    if custom_font:
+        resolved_name = resolve_backend_font_name(custom_font, style.font_name)
+        style = replace(style, font_name=resolved_name)
+        fallbacks.append(f"frontend_font_stack_mapped_to:{resolved_name}")
+    else:
+        fallbacks.append(f"frontend_font_stack_mapped_to:{style.font_name}")
+
     return style, tuple(fallbacks)
 
 

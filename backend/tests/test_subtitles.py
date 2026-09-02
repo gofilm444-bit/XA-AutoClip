@@ -394,3 +394,216 @@ def test_same_start_caption_keeps_later_preview_winner(tmp_path):
     assert len(dialogues) == 1
     assert dialogues[0].endswith("Cue terbaru")
     assert report.skip_reasons == {"overlapped_by_later_cue": 1}
+
+
+def test_v6_viral_yellow_punch_template_export(tmp_path):
+    subtitle_path = tmp_path / "viral-punch.ass"
+    report = write_ass_cues(
+        subtitle_path,
+        [(0, 2, "standar hidup kita rusak")],
+        {"preset_id": "viral_yellow_punch", "template_type": "viral_caption", "font_size": 32},
+    )
+    content = subtitle_path.read_text(encoding="utf-8")
+    assert "Anton" in content
+    # Yellow hex #FDE047 converted to ASS color &H0047E0FD
+    assert "&H0047E0FD" in content
+    # Uppercase text
+    assert "STANDAR HIDUP KITA" in content
+    assert "RUSAK" in content
+    assert report.cues_written == 1
+
+
+def test_v6_meme_white_stroke_template_export(tmp_path):
+    subtitle_path = tmp_path / "meme-impact.ass"
+    report = write_ass_cues(
+        subtitle_path,
+        [(0, 2, "ketika coding langsung jalan")],
+        {"preset_id": "meme_white_stroke", "template_type": "meme", "font_size": 36},
+    )
+    content = subtitle_path.read_text(encoding="utf-8")
+    assert "Bangers" in content
+    assert "&H00FFFFFF" in content
+    assert "KETIKA CODING" in content
+    assert "LANGSUNG JALAN" in content
+    assert report.cues_written == 1
+
+
+def test_v6_white_rounded_bubble_template_export(tmp_path):
+    subtitle_path = tmp_path / "white-bubble.ass"
+    report = write_ass_cues(
+        subtitle_path,
+        [(0, 2, "Teks di dalam bubble putih")],
+        {"preset_id": "white_rounded_bubble", "template_type": "bubble", "background_enabled": True},
+    )
+    content = subtitle_path.read_text(encoding="utf-8")
+    # BorderStyle = 3 (opaque box)
+    assert ",3," in content
+    # Black text
+    assert "&H00000000" in content
+    assert report.cues_written == 1
+
+
+def test_v6_dark_glass_bubble_template_export(tmp_path):
+    subtitle_path = tmp_path / "dark-bubble.ass"
+    report = write_ass_cues(
+        subtitle_path,
+        [(0, 2, "Teks di dalam dark glass")],
+        {"preset_id": "dark_glass_bubble", "template_type": "bubble", "background_enabled": True},
+    )
+    content = subtitle_path.read_text(encoding="utf-8")
+    assert ",3," in content
+    # White text on dark bg
+    assert "&H00FFFFFF" in content
+    assert report.cues_written == 1
+
+
+def test_v6_news_lower_third_template_export(tmp_path):
+    subtitle_path = tmp_path / "news-lower-third.ass"
+    report = write_ass_cues(
+        subtitle_path,
+        [(0, 2, "Investigasi mengungkap fakta baru")],
+        {"preset_id": "news_lower_third", "template_type": "lower_third", "badge": "BERITA UTAMA"},
+    )
+    content = subtitle_path.read_text(encoding="utf-8")
+    assert ",3," in content
+    assert "[BERITA UTAMA]" in content
+    assert report.cues_written == 1
+
+
+def test_v6_keyword_yellow_highlight_template_export(tmp_path):
+    subtitle_path = tmp_path / "keyword-yellow.ass"
+    report = write_ass_cues(
+        subtitle_path,
+        [(0, 2, "Ternyata rahasia sukses ada disini")],
+        {
+            "preset_id": "keyword_yellow_box",
+            "template_type": "word_highlight",
+            "behavior": {"mode": "keyword_highlight", "highlight_color": "#FDE047"},
+        },
+    )
+    content = subtitle_path.read_text(encoding="utf-8")
+    # Contains inline ASS highlight tag with yellow
+    assert r"\c&H47E0FD&" in content
+    assert report.cues_written == 1
+
+
+def test_v6_documentary_serif_template_export(tmp_path):
+    subtitle_path = tmp_path / "documentary-serif.ass"
+    report = write_ass_cues(
+        subtitle_path,
+        [(0, 2, "Pada awal abad kedua puluh")],
+        {"preset_id": "documentary_serif_gold", "template_type": "documentary"},
+    )
+    content = subtitle_path.read_text(encoding="utf-8")
+    assert "DejaVu Serif" in content
+    # Gold text #FEF3C7 -> &H00C7F3FE
+    assert "&H00C7F3FE" in content
+    assert report.cues_written == 1
+
+
+def test_v6_typewriter_stepped_micro_cues_export(tmp_path):
+    subtitle_path = tmp_path / "typewriter.ass"
+    report = write_ass_cues(
+        subtitle_path,
+        [(0, 3, "Ketik pesan ini secara bertahap")],
+        {"preset_id": "typewriter_clean", "template_type": "typewriter"},
+    )
+    dialogues = _dialogue_lines(subtitle_path.read_text(encoding="utf-8"))
+    # Typewriter generates stepped progressive events
+    assert len(dialogues) >= 3
+    assert report.animation_mode == "typewriter_stepped"
+
+
+def test_v8_karaoke_yellow_sweep_time_based_export(tmp_path):
+    subtitle_path = tmp_path / "karaoke-yellow.ass"
+    sample_text = "Standar hidup kita rusak karena kompetisi"
+    report = write_ass_cues(
+        subtitle_path,
+        [(1.0, 4.0, sample_text)],
+        {
+            "preset_id": "karaoke_yellow",
+            "template_type": "word_highlight",
+            "behavior": {
+                "mode": "word_progress",
+                "highlight_strategy": "time_progress",
+                "highlight_color": "#FFD600",
+            },
+            "animation": {"loop": "highlight_sweep"},
+        },
+    )
+    content = subtitle_path.read_text(encoding="utf-8")
+    dialogues = _dialogue_lines(content)
+    words = sample_text.split()
+
+    # 1. Total micro-cues equals number of words
+    assert len(dialogues) == len(words)
+    assert report.cues_written == 6
+    assert report.animation_mode == "micro_cues"
+
+    # 2. Each micro-cue renders the FULL sentence with active word highlighted
+    for idx, d_line in enumerate(dialogues):
+        # All words are present in each event line
+        for w in words:
+            assert w in d_line
+        # Highlight color for active word is present
+        assert r"\c&H00D6FF&" in d_line
+
+    # 3. Micro-cue timings are sequential and cover from start 1.00 to end 4.00
+    first_event = dialogues[0]
+    last_event = dialogues[-1]
+    assert "0:00:01.00" in first_event
+    assert "0:00:04.00" in last_event
+
+
+def test_v8_karaoke_cyan_glow_time_based_export(tmp_path):
+    subtitle_path = tmp_path / "karaoke-cyan.ass"
+    report = write_ass_cues(
+        subtitle_path,
+        [(0.0, 3.0, "Teknologi masa depan berkembang sangat cepat")],
+        {
+            "preset_id": "karaoke_cyan",
+            "template_type": "word_highlight",
+            "behavior": {
+                "mode": "word_progress",
+                "highlight_color": "#22D3EE",
+            },
+            "animation": {"loop": "highlight_sweep"},
+        },
+    )
+    content = subtitle_path.read_text(encoding="utf-8")
+    dialogues = _dialogue_lines(content)
+    assert len(dialogues) == 6
+    # Cyan highlight #22D3EE -> &HEED322
+    assert r"\c&HEED322&" in content
+    assert report.animation_mode == "micro_cues"
+
+
+def test_v8_standard_template_does_not_force_karaoke(tmp_path):
+    subtitle_path = tmp_path / "clean-white.ass"
+    report = write_ass_cues(
+        subtitle_path,
+        [(0.0, 3.0, "Subtitle standar biasa")],
+        {"preset_id": "clean_white", "template_type": "basic_subtitle"},
+    )
+    dialogues = _dialogue_lines(subtitle_path.read_text(encoding="utf-8"))
+    assert len(dialogues) == 1
+    assert report.animation_mode == "segment_static"
+
+
+def test_v8_compute_karaoke_word_timings_weighted():
+    from app.services.subtitles import compute_karaoke_word_timings
+
+    timings = compute_karaoke_word_timings("Standar hidup kita rusak karena kompetisi", 1.0, 4.0)
+    assert len(timings) == 6
+    assert timings[0]["start"] == 1.0
+    assert timings[-1]["end"] == 4.0
+
+    # Ensure longer word gets longer duration than shorter word
+    # "kompetisi" (9 chars) vs "kita" (4 chars)
+    dur_kompetisi = timings[5]["end"] - timings[5]["start"]
+    dur_kita = timings[2]["end"] - timings[2]["start"]
+    assert dur_kompetisi > dur_kita
+
+    # Continuous without gaps
+    for i in range(len(timings) - 1):
+        assert abs(timings[i]["end"] - timings[i + 1]["start"]) < 1e-6

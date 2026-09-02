@@ -1,7 +1,9 @@
 from app.services.render_cache import (
+    build_render_manifest,
     read_render_cache_metadata,
     render_cache_metadata_path,
     render_fingerprint,
+    render_manifest_hash,
     write_render_cache_metadata,
 )
 
@@ -14,6 +16,7 @@ def fingerprint(style_config=None, **overrides):
         "height": 960,
         "frame_rate": 30,
         "preview": True,
+        "quality": "high",
         **overrides,
     }
     return render_fingerprint(style_config, **options)
@@ -165,12 +168,17 @@ def test_render_cache_metadata_round_trip(tmp_path):
         output_path,
         fingerprint=expected_fingerprint,
         video_framing={"x": 12, "y": -8, "scale": 1.3},
+        width=540,
+        height=960,
     )
 
-    assert read_render_cache_metadata(output_path) == {
-        "fingerprint": expected_fingerprint,
-        "video_framing": {"x": 12.0, "y": -8.0, "scale": 1.3},
-    }
+    meta = read_render_cache_metadata(output_path)
+    assert meta is not None
+    assert meta["fingerprint"] == expected_fingerprint
+    assert meta["manifest_hash"] == expected_fingerprint
+    assert meta["video_framing"] == {"x": 12.0, "y": -8.0, "scale": 1.3}
+    assert meta["width"] == 540
+    assert meta["height"] == 960
     assert render_cache_metadata_path(output_path).is_file()
 
 
@@ -181,3 +189,54 @@ def test_missing_or_invalid_render_cache_metadata_is_a_cache_miss(tmp_path):
 
     render_cache_metadata_path(output_path).write_text("not-json", encoding="utf-8")
     assert read_render_cache_metadata(output_path) is None
+
+
+# --- TASK FIX STALE RENDER CACHE & RESOLUTION SPECIFIC TESTS ---
+
+def test_manifest_hash_stable_for_same_inputs():
+    style = {
+        "main_caption_style": {
+            "preset_id": "viral_yellow_punch",
+            "template_type": "viral_caption",
+            "font_family": "Anton",
+            "color": "#FDE047",
+        }
+    }
+    h1 = render_manifest_hash(style, preset="center_crop", subtitle_language="id", width=1080, height=1920)
+    h2 = render_manifest_hash(style, preset="center_crop", subtitle_language="id", width=1080, height=1920)
+    assert h1 == h2
+
+
+def test_manifest_hash_changes_for_different_resolutions():
+    style = {"main_caption_style": {"preset_id": "viral_yellow_punch"}}
+    h_540 = render_manifest_hash(style, preset="center_crop", subtitle_language="id", width=540, height=960)
+    h_720 = render_manifest_hash(style, preset="center_crop", subtitle_language="id", width=720, height=1280)
+    h_1080 = render_manifest_hash(style, preset="center_crop", subtitle_language="id", width=1080, height=1920)
+
+    assert h_540 != h_720
+    assert h_720 != h_1080
+    assert h_540 != h_1080
+
+
+def test_manifest_hash_changes_for_different_caption_template_ids():
+    h_viral = render_manifest_hash(
+        {"main_caption_style": {"preset_id": "viral_yellow_punch", "template_type": "viral_caption"}},
+        preset="center_crop", subtitle_language="id", width=1080, height=1920
+    )
+    h_bubble = render_manifest_hash(
+        {"main_caption_style": {"preset_id": "white_rounded_bubble", "template_type": "bubble"}},
+        preset="center_crop", subtitle_language="id", width=1080, height=1920
+    )
+    assert h_viral != h_bubble
+
+
+def test_manifest_hash_changes_for_different_font_families():
+    h_anton = render_manifest_hash(
+        {"main_caption_style": {"font_family": "Anton", "preset_id": "custom"}},
+        preset="center_crop", subtitle_language="id", width=1080, height=1920
+    )
+    h_bangers = render_manifest_hash(
+        {"main_caption_style": {"font_family": "Bangers", "preset_id": "custom"}},
+        preset="center_crop", subtitle_language="id", width=1080, height=1920
+    )
+    assert h_anton != h_bangers

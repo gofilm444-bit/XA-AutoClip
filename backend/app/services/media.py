@@ -300,6 +300,143 @@ def assemble_media_sequence(
     _run(command, ErrorCode.RENDER_FAILED)
 
 
+def assemble_multi_source_sequence(
+    segments: list[dict],
+    destination: Path,
+    *,
+    fallback_source: Path | None = None,
+) -> None:
+    """Build one continuous A/V output from segments that may come from different source files.
+
+    Each dict in ``segments`` must contain:
+        source_path: str | None  – absolute path to the source video for this segment
+        source_start: float      – start time within that source file (seconds, 0-based)
+        source_end:   float      – end time within that source file (seconds, 0-based)
+        asset_id:     str | None – for diagnostic logging only
+
+    If a segment lacks ``source_path`` and ``fallback_source`` is provided, the
+    fallback is used (backward-compatible with single-source projects).
+    """
+    import os
+
+    if not segments:
+        raise AppError(ErrorCode.RENDER_FAILED, "Urutan media untuk render kosong.")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    logger.info(
+        "[render_video_concat_plan]",
+        segment_count=len(segments),
+        destination=str(destination),
+        segments=[
+            {
+                "index": i,
+                "source_path": seg.get("source_path"),
+                "source_start": seg.get("source_start"),
+                "source_end": seg.get("source_end"),
+                "asset_id": seg.get("asset_id"),
+            }
+            for i, seg in enumerate(segments)
+        ],
+    )
+
+    temp_dir = destination.parent
+    temp_clip_paths: list[Path] = []
+    playlist_path = temp_dir / f"{destination.stem}.concat_list.txt"
+    try:
+        for index, seg in enumerate(segments):
+            raw_source = seg.get("source_path")
+            source_path: Path | None = None
+            if raw_source and Path(str(raw_source)).is_file():
+                source_path = Path(str(raw_source))
+            elif fallback_source and fallback_source.is_file():
+                source_path = fallback_source
+            else:
+                raise AppError(
+                    ErrorCode.RENDER_FAILED,
+                    f"Source file untuk segment {index} tidak ditemukan: {raw_source!r}",
+                )
+            start = max(0.0, float(seg.get("source_start") or 0.0))
+            end = max(start + 0.05, float(seg.get("source_end") or 0.0))
+            duration = round(end - start, 6)
+            temp_path = temp_dir / f"{destination.stem}.seg{index}.tmp.mp4"
+            temp_clip_paths.append(temp_path)
+            logger.info(
+                "[render_video_segment_input]",
+                segment_index=index,
+                asset_id=seg.get("asset_id"),
+                source_path=str(source_path),
+                source_start=round(start, 3),
+                source_end=round(end, 3),
+                duration=round(duration, 3),
+                temp_path=str(temp_path),
+            )
+            extract_command = [
+                "ffmpeg",
+                "-y",
+                "-ss",
+                f"{start:.6f}",
+                "-i",
+                str(source_path),
+                "-t",
+                f"{duration:.6f}",
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "160k",
+                "-movflags",
+                "+faststart",
+                str(temp_path),
+            ]
+            _run(extract_command, ErrorCode.RENDER_FAILED)
+
+        # Build concat playlist
+        with playlist_path.open("w", encoding="utf-8") as f:
+            for clip_path in temp_clip_paths:
+                safe_path = str(clip_path).replace("\\", "/")
+                f.write(f"file '{safe_path}'\n")
+
+        concat_command = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(playlist_path),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(destination),
+        ]
+        _run(concat_command, ErrorCode.RENDER_FAILED)
+    finally:
+        if playlist_path.exists():
+            try:
+                os.remove(playlist_path)
+            except OSError:
+                pass
+        for tmp in temp_clip_paths:
+            try:
+                if tmp.exists():
+                    os.remove(tmp)
+            except OSError:
+                pass
+
+
 def extract_thumbnail(source: Path, destination: Path, at_seconds: float = 1.0) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     command = [

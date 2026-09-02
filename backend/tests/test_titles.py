@@ -400,3 +400,99 @@ def test_zone_time_with_geser_uses_domain_fallback_not_transition_topic():
     assert "Masalahnya bukan di awal cerita" not in result["hook"]
     assert "iya" not in result["description"].lower()
     assert "zona waktu" in result["description"].lower()
+
+
+def test_v2_competition_and_insecurity_title_and_hook():
+    transcript = (
+        "Bagi pola pikir orang Jakarta, sentuh tuh enak. Kurang asik dan gak asik ya. "
+        "Jadi aku sangat rekomen kalau lu lagi kerasa stressnya lebih, insecurenya parah banget, "
+        "lu matikan HP ya coba. Coba seminggu tanpa apapun, ilang masalah lu. "
+        "Penyesalanku yang terbesar adalah kenapa selama ini pas kita main ke kampung-kampung, "
+        "aku tuh nyesel banget kenapa aku gak bisa lagi kayak mereka. Standartmu rusak! "
+        "Standartmu rusak sejak lu sering kompetisi. View gede nih, subscriber-nya banyak nih. "
+        "Aku selalu hidup dengan kompetisi."
+    )
+
+    result = generate_candidate_copy("podcast", transcript, 1, use_ai=False)
+
+    assert result["title"] in {
+        "Standar Hidup Kita Rusak Karena Kompetisi",
+        "Kenapa Orang Kota Makin Gampang Insecure?",
+        "Yang Rusak Bukan Hidup Kita, Tapi Standar Kita",
+        "Hidup Sederhana Justru Bisa Lebih Tenang?",
+        "Ternyata Kompetisi yang Bikin Kita Selalu Merasa Kurang",
+    }
+    assert "Aku Kayak" not in result["title"]
+    assert "Bisa Jadi Perdebatan" not in result["title"]
+    assert "Hal yang Jarang Dibahas" not in result["title"]
+    assert 30 <= len(result["title"]) <= 85
+    assert 8 <= len(result["hook"].split()) <= 18
+    assert result["hook"].lower() != result["title"].lower()
+    assert any(w in result["hook"].lower() for w in ("standar", "kompetisi", "gelisah", "membandingkan", "kampung"))
+    assert "insecure" in result["description"].lower() or "kompetisi" in result["description"].lower()
+
+
+def test_v2_house_vs_iphone_paradox_title_and_hook():
+    transcript = (
+        "Lalu aku iseng nanya, sini ada rumah mau dijual, gak? Ada, ada Acoy di belakang. "
+        "Berapa kemarin yang ngomongin? 25 juta. 25 juta dapat rumah kayu kamarnya 2 WC-nya 1 "
+        "plus kebun kelapa ke belakang sebesar 50 meter full kelapa. 25 juta! "
+        "iPhone 17 Pro Max berapa harganya? 25 juta. Pas covid pasti akan naik dong, 50 juta."
+    )
+
+    result = generate_candidate_copy("podcast", transcript, 2, use_ai=False)
+
+    assert "25 Juta" in result["title"] or "Rumah" in result["title"] or "iPhone" in result["title"]
+    assert "Aku Indomie" not in result["title"]
+    assert "Hal yang Jarang Dibahas" not in result["title"]
+    assert 30 <= len(result["title"]) <= 85
+    assert 8 <= len(result["hook"].split()) <= 18
+    assert "iphone" in result["hook"].lower() or "25 juta" in result["hook"].lower() or "kebun" in result["hook"].lower()
+
+
+def test_v2_morotai_soldier_hiding_title_and_hook():
+    transcript = (
+        "Tapi di Pulau Morotai itu ada goa tempat ngumpet tentara Jepang. "
+        "Teru Nakamura itu, legend yang sangat luar biasa. Kisah prajurit Jepang yang "
+        "bersembunyi selama hampir 30 tahun karena percaya bahwa Perang Dunia 2 masih berlangsung. "
+        "Perintah gerilyanya bunuh semua yang bukan sekawan kita. "
+        "Kira-kira kalau warga lokal lewat itu apa kategorinya? Makanya ada pro dan kontra."
+    )
+
+    result = generate_candidate_copy("podcast", transcript, 4, use_ai=False)
+
+    assert "Prajurit Jepang" in result["title"] or "Morotai" in result["title"] or "30 Tahun" in result["title"]
+    assert "Apa Kisah" not in result["title"]
+    assert "Hal yang Jarang Dibahas" not in result["title"]
+    assert "30 tahun" in result["hook"].lower() or "hutan" in result["hook"].lower() or "gerilya" in result["hook"].lower()
+
+
+def test_v2_colonial_statue_monument_controversy():
+    transcript = (
+        "Kenapa patung penjajah dijadikan monumen? Pro dan kontra dong. "
+        "Ada beberapa warga asli sana yang curhat, dia bilang dia ini penjajah ngebunuh banyak orang. "
+        "Ngapain dihargai sebagai pahlawan? Masuk akal gak? Masuk akal. "
+        "Siapa sih orang yang nemuin dia dan berapa banyak orang yang dibunuh sebelum akhirnya dia keluar."
+    )
+
+    result = generate_candidate_copy("podcast", transcript, 5, use_ai=False)
+
+    assert "Patung Penjajah" in result["title"] or "Monumen" in result["title"]
+    assert "Masuk Pro" not in result["title"]
+    assert "Hal yang Jarang Dibahas" not in result["title"]
+    assert "patung" in result["hook"].lower() or "monumen" in result["hook"].lower() or "warga" in result["hook"].lower()
+
+
+def test_v2_ruined_museum_title_and_hook():
+    transcript = (
+        "Tadi di Morotai itu lu main ke museum yang Perang Dunia II ini gak? Ada, ada. "
+        "Tapi udah rusak. Semuanya udah dibongkar. Aku juga gak tahu, aku juga kaget. "
+        "Padahal kita pengen lihat, cuma hanya sisa-sisa sedikit."
+    )
+
+    result = generate_candidate_copy("podcast", transcript, 3, use_ai=False)
+
+    assert "Museum" in result["title"] or "Perang Dunia" in result["title"]
+    assert "Momen Utama" not in result["title"]
+    assert "dibongkar" in result["hook"].lower() or "rusak" in result["hook"].lower() or "museum" in result["hook"].lower()
+

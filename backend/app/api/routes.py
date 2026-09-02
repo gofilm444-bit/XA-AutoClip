@@ -56,7 +56,6 @@ from app.schemas.api import (
     TransformationRead,
 )
 from app.services.captions import generate_social_caption
-from app.services.editor_captions import generate_editor_auto_captions
 from app.services.clipper_style import (
     default_clipper_style,
     generate_hook_text_for_clip,
@@ -65,9 +64,13 @@ from app.services.clipper_style import (
     normalize_video_framing,
 )
 from app.services.download_filename import filename_from_path, sanitize_download_filename
-from app.services.media import layout_mode, probe_media
+from app.services.editor_captions import generate_editor_auto_captions
+from app.services.media import probe_media
 from app.services.originality import assess
-from app.services.render_cache import read_render_cache_metadata, render_fingerprint
+from app.services.render_cache import (
+    read_render_cache_metadata,
+    render_manifest_hash,
+)
 from app.services.render_plan import build_editor_render_plan
 from app.services.render_result import same_file_path, verify_render_file_binding
 from app.services.source_context import (
@@ -646,6 +649,40 @@ def reprocess_project(
     return job
 
 
+PROJECT_STAGE_LABELS: dict[str, str] = {
+    "created": "Membuat proyek",
+    "uploading": "Mengunggah video",
+    "uploaded": "Upload video selesai",
+    "upload_complete": "Upload video selesai",
+    "extracting_metadata": "Membaca informasi video",
+    "extracting_audio": "Mengekstrak audio",
+    "transcribing": "Mentranskrip audio",
+    "segmenting": "Memotong segmen transkrip",
+    "generating_candidates": "Mencari kandidat klip",
+    "candidate_generation": "Mencari kandidat klip",
+    "candidates_ready": "Kandidat klip siap",
+    "transformation_draft": "Editor siap",
+    "awaiting_commentary": "Menunggu komentar",
+    "originality_review": "Memeriksa keaslian",
+    "ready_to_render": "Siap dirender",
+    "rendering_preview": "Merender preview",
+    "preview_ready": "Preview siap",
+    "rendering_final": "Merender video final",
+    "completed": "Selesai",
+    "failed": "Proses gagal",
+    "processing": "Memproses video",
+    "unknown": "Memeriksa status proyek",
+}
+
+
+def get_project_stage_label(stage_str: str, content_type: str = "podcast") -> str:
+    if stage_str in PROJECT_STAGE_LABELS:
+        return PROJECT_STAGE_LABELS[stage_str]
+    if content_type == "sports" and stage_str == "transcribing":
+        return "Membaca komentar pertandingan"
+    return "Memproses proyek"
+
+
 @router.get("/projects/{project_id}/status")
 def project_status(project_id: uuid.UUID, db: Session = Depends(get_db)):
     project = require(Project, db, project_id)
@@ -665,12 +702,75 @@ def project_status(project_id: uuid.UUID, db: Session = Depends(get_db)):
         int(candidate_count),
         max(1, get_settings().processing_stale_timeout_minutes),
     )
+
+    status_str = str(
+        project.status.value
+        if hasattr(project.status, "value")
+        else (project.status or "unknown")
+    )
+    current_stage = status_str or "unknown"
+    current_stage_label = get_project_stage_label(
+        current_stage, getattr(project, "content_type", "podcast")
+    )
+    current_step = (
+        (job.current_step if job and job.current_step else None)
+        or current_stage_label
+    )
+
+    if current_stage in ("candidates_ready", "transformation_draft", "completed"):
+        progress = 100
+    elif current_stage == "failed":
+        progress = job.progress if job else 0
+    elif job and job.progress is not None:
+        progress = job.progress
+    else:
+        progress = 0
+
+    stage_started_at = None
+    if job and job.updated_at:
+        stage_started_at = job.updated_at.isoformat()
+    elif project.updated_at:
+        stage_started_at = project.updated_at.isoformat()
+
+    last_update_at = None
+    if job and job.updated_at:
+        last_update_at = job.updated_at.isoformat()
+    elif project.updated_at:
+        last_update_at = project.updated_at.isoformat()
+
+    elapsed_seconds = None
+    if job and job.created_at:
+        ref_time = job.completed_at or datetime.now(UTC)
+        elapsed_seconds = max(
+            0,
+            int((_as_utc(ref_time) - _as_utc(job.created_at)).total_seconds()),
+        )
+    elif project.created_at:
+        ref_time = project.updated_at or datetime.now(UTC)
+        elapsed_seconds = max(
+            0,
+            int((_as_utc(ref_time) - _as_utc(project.created_at)).total_seconds()),
+        )
+
+    processing_detail = (
+        (job.error_message if job and job.error_message else None)
+        or current_stage_label
+    )
+
     return {
         "project_id": project.id,
         "job_id": job.id if job else None,
-        "status": project.status,
-        "progress": job.progress if job else 0,
-        "current_step": job.current_step if job else "Belum diproses",
+        "status": status_str,
+        "progress": progress,
+        "current_stage": current_stage,
+        "current_stage_label": current_stage_label,
+        "current_step": current_step,
+        "total_top_clips": int(candidate_count),
+        "candidate_count": int(candidate_count),
+        "stage_started_at": stage_started_at,
+        "elapsed_seconds": elapsed_seconds,
+        "last_update_at": last_update_at,
+        "processing_detail": processing_detail,
         "error_code": job.error_code if job else None,
         "error_message": job.error_message if job else None,
         "is_stale": stale_processing,
@@ -1443,11 +1543,13 @@ def transformation_audio_asset(
 
 def _serialize_editor_asset(transformation_id: uuid.UUID, asset: MediaAsset) -> EditorMediaAssetRead:
     kind = (asset.asset_type or "video").replace("editor_", "")
+    source_url = f"/api/transformations/{transformation_id}/media/{asset.id}/source"
     return EditorMediaAssetRead(
         asset_id=str(asset.id),
         kind=kind,
         name=asset.original_filename,
         url=f"/api/transformations/{transformation_id}/media/{asset.id}",
+        source_url=source_url,
         duration_seconds=asset.duration_seconds,
         width=asset.width,
         height=asset.height,
@@ -1523,6 +1625,7 @@ async def upload_transformation_media(
 
 
 @router.get("/transformations/{transformation_id}/media/{asset_id}")
+@router.get("/transformations/{transformation_id}/media/{asset_id}/source")
 def transformation_media_asset(
     transformation_id: uuid.UUID,
     asset_id: uuid.UUID,
@@ -1531,11 +1634,22 @@ def transformation_media_asset(
     plan = require(TransformationPlan, db, transformation_id)
     asset = db.get(MediaAsset, asset_id)
     if not asset or asset.project_id != plan.project_id or not asset.asset_type.startswith("editor_"):
+        logger.error(
+            f"[media_stream_error] Asset not found: asset_id={asset_id} transformation_id={transformation_id}"
+        )
         raise HTTPException(status_code=404, detail="Aset media tidak tersedia.")
-    media_path = Path(asset.storage_path)
-    if not media_path.is_file():
+    file_path = Path(asset.storage_path or "")
+    if not file_path.is_file():
+        logger.error(f"[media_stream_error] File not found: {file_path}")
         raise HTTPException(status_code=404, detail="File media tidak tersedia.")
-    return FileResponse(media_path, media_type=asset.mime_type or "application/octet-stream")
+    import mimetypes
+    guessed_type, _ = mimetypes.guess_type(str(file_path))
+    content_type = (
+        asset.mime_type
+        if (asset.mime_type and asset.mime_type != "application/octet-stream")
+        else (guessed_type or ("video/mp4" if asset.asset_type == "editor_video" else "application/octet-stream"))
+    )
+    return FileResponse(path=file_path, media_type=content_type, headers={"Accept-Ranges": "bytes"})
 
 
 @router.post("/transformations/{transformation_id}/media/{asset_id}/add-to-timeline")
@@ -1548,66 +1662,159 @@ def add_media_to_timeline(
     asset = db.get(MediaAsset, asset_id)
     if not asset or asset.project_id != plan.project_id or not asset.asset_type.startswith("editor_"):
         raise HTTPException(status_code=404, detail="Aset media tidak tersedia.")
+    if str(asset.id) != str(asset_id):
+        raise HTTPException(status_code=400, detail="ID aset tidak cocok.")
+
+    logger.info(
+        "[add_to_timeline_payload_received]",
+        requested_asset_id=str(asset_id),
+        asset_found_name=asset.original_filename,
+        asset_found_path=asset.storage_path,
+    )
+    logger.info(
+        "[add_to_timeline_asset_lookup]",
+        requested_asset_id=str(asset_id),
+        found_asset_id=str(asset.id),
+        found_filename=asset.original_filename,
+        found_duration=float(asset.duration_seconds or 0.0),
+        found_source_path=asset.storage_path,
+    )
     kind = asset.asset_type.replace("editor_", "")
     current_config = dict(plan.clipper_style_config or {})
     current_config["manual_editor_mode"] = True
 
     if kind == "video":
         candidate = require(ClipCandidate, db, plan.candidate_id)
-        candidate.short_source_clip_path = asset.storage_path
-        duration = max(0.1, float(asset.duration_seconds or 0.1))
-        candidate.duration_seconds = duration
-        sequence = [
-            {
-                "id": "manual-video-1",
-                "source_start": 0.0,
-                "source_end": round(duration, 3),
-            }
-        ]
+        duration = float(asset.duration_seconds or 0.0)
+        probed_duration = 0.0
+        if duration <= 0.05 and asset.storage_path and Path(asset.storage_path).is_file():
+            try:
+                meta = probe_media(Path(asset.storage_path))
+                if meta and meta.duration and meta.duration > 0.05:
+                    probed_duration = float(meta.duration)
+                    duration = probed_duration
+                    asset.duration_seconds = duration
+                    db.add(asset)
+            except Exception as exc:
+                logger.warning("probe_media_fallback_failed", error=str(exc))
+
+        if duration <= 0.05:
+            raise HTTPException(
+                status_code=400,
+                detail="Durasi media tidak dapat dibaca. Coba upload ulang atau gunakan file lain.",
+            )
+
+        existing_sequence = list(current_config.get("video_sequence") or [])
+        last_video_end = 0.0
+        for existing in existing_sequence:
+            explicit_end = float(existing.get("end") or 0.0)
+            if explicit_end > last_video_end:
+                last_video_end = explicit_end
+                continue
+            source_duration = max(
+                0.0,
+                float(existing.get("source_end", 0.0))
+                - float(existing.get("source_start", 0.0)),
+            )
+            speed = max(0.25, float(existing.get("speed") or 1.0))
+            last_video_end += source_duration / speed
+        segment_start = round(last_video_end, 3)
+        segment_end = round(last_video_end + duration, 3)
+
+        new_segment = {
+            "id": f"manual-video-{asset.id}-{len(existing_sequence) + 1}",
+            "source_start": 0.0,
+            "source_end": round(duration, 3),
+            "start": segment_start,
+            "end": segment_end,
+            "duration": round(duration, 3),
+            "speed": 1.0,
+            "asset_id": str(asset.id),
+            "name": asset.original_filename,
+            "source_path": asset.storage_path,
+            "source_url": f"/api/transformations/{transformation_id}/media/{asset.id}/source",
+        }
+
+        sequence = [*existing_sequence, new_segment]
+        total_duration = round(segment_end, 3)
+
+        if not candidate.short_source_clip_path or not Path(candidate.short_source_clip_path).is_file():
+            candidate.short_source_clip_path = asset.storage_path
+        candidate.duration_seconds = total_duration
+        candidate.start_seconds = 0.0
+        candidate.end_seconds = total_duration
+        db.add(candidate)
+
         current_config.update(
             video_sequence=sequence,
             media_sequence=sequence,
-            media_trim={"start": 0.0, "end": round(duration, 3)},
+            media_trim={"start": 0.0, "end": total_duration},
             video_sequence_initialized=True,
             audio_sequence_initialized=True,
             video_track_deleted=False,
         )
+
+        logger.info(
+            "[add_to_timeline_duration]",
+            asset_id=str(asset.id),
+            asset_filename=asset.original_filename,
+            asset_duration=float(asset.duration_seconds or 0.0),
+            probed_duration=probed_duration,
+            chosen_duration=duration,
+            start=segment_start,
+            end=segment_end,
+            source_start=0.0,
+            source_end=round(duration, 3),
+        )
+        logger.info(
+            "[media_add_to_timeline_backend]",
+            clicked_asset_id=str(asset.id),
+            clicked_filename=asset.original_filename,
+            new_segment_id=new_segment["id"],
+            new_segment_asset_id=str(asset.id),
+            new_segment_source_path=asset.storage_path,
+            all_video_sequence_asset_ids=[str(s.get("asset_id")) for s in sequence if s.get("asset_id")],
+            all_video_sequence_names=[str(s.get("name")) for s in sequence if s.get("name")],
+        )
     elif kind == "audio":
         assets = list(current_config.get("additional_audio_assets") or [])
-        assets.append(
-            {
-                "id": str(asset.id),
-                "name": asset.original_filename,
-                "mime_type": asset.mime_type,
-                "size_bytes": asset.size_bytes,
-                "duration_seconds": asset.duration_seconds or 0,
-            }
-        )
+        if not any(a.get("id") == str(asset.id) for a in assets):
+            assets.append(
+                {
+                    "id": str(asset.id),
+                    "name": asset.original_filename,
+                    "mime_type": asset.mime_type,
+                    "size_bytes": asset.size_bytes,
+                    "duration_seconds": asset.duration_seconds or 0,
+                }
+            )
         current_config["additional_audio_assets"] = assets
         tracks = list(current_config.get("additional_audio_tracks") or [])
         audio_duration = max(0.1, float(asset.duration_seconds or 0.1))
+        start_time = max([float(t.get("end", 0.0)) for t in tracks], default=0.0) if tracks else 0.0
         tracks.append(
             {
-                "id": f"additional-audio-{asset.id}",
+                "id": f"additional-audio-{asset.id}-{len(tracks) + 1}",
                 "asset_id": str(asset.id),
-                "label": "Backsound",
+                "label": asset.original_filename or "Backsound",
                 "kind": "backsound",
-                "start": 0.0,
-                "end": round(audio_duration, 3),
+                "start": round(start_time, 3),
+                "end": round(start_time + audio_duration, 3),
                 "volume": 1,
             }
         )
         current_config["additional_audio_tracks"] = tracks
     else:
         assets = list(current_config.get("editor_image_assets") or [])
-        assets.append(
-            {
-                "id": str(asset.id),
-                "name": asset.original_filename,
-                "url": f"/api/transformations/{transformation_id}/media/{asset.id}",
-                "kind": "image",
-            }
-        )
+        if not any(a.get("id") == str(asset.id) for a in assets):
+            assets.append(
+                {
+                    "id": str(asset.id),
+                    "name": asset.original_filename,
+                    "url": f"/api/transformations/{transformation_id}/media/{asset.id}",
+                    "kind": "image",
+                }
+            )
         current_config["editor_image_assets"] = assets
 
     plan.clipper_style_config = current_config
@@ -2028,8 +2235,24 @@ def queue_render(
     project = require(Project, db, plan.project_id)
     candidate = require(ClipCandidate, db, plan.candidate_id)
     settings = get_settings()
-    render_width = settings.preview_width if preview else settings.final_width
-    render_height = settings.preview_height if preview else settings.final_height
+
+    # Priority resolution resolution:
+    # 1. payload.resolution ("540", "720", "1080" or "540x960", etc.)
+    # 2. preview flag (True -> 540x960, False -> 1080x1920)
+    raw_res = str(payload.resolution or "").strip().lower()
+    if raw_res in {"540", "540p", "preview"}:
+        render_width, render_height = 540, 960
+    elif raw_res in {"720", "720p", "hd"}:
+        render_width, render_height = 720, 1280
+    elif raw_res in {"1080", "1080p", "fhd", "fullhd"}:
+        render_width, render_height = 1080, 1920
+    elif preview:
+        render_width = settings.preview_width
+        render_height = settings.preview_height
+    else:
+        render_width = settings.final_width
+        render_height = settings.final_height
+
     active_render = db.scalar(
         select(Render)
         .where(
@@ -2053,52 +2276,6 @@ def queue_render(
         hook_fallback=plan.original_hook,
     )
     render_style_config = editor_render_plan.style_config
-    logger.info(
-        "export_render_plan_audit",
-        transformation_id=str(plan.id),
-        candidate_id=str(candidate.id),
-        render_id=None,
-        editor_state_found=editor_render_plan.editor_state_found,
-        video_framing=render_style_config.get("video_framing"),
-        video_sequence_count=len(editor_render_plan.video_sequence),
-        audio_sequence_count=len(editor_render_plan.audio_sequence),
-        caption_timeline_count=len(editor_render_plan.caption_timeline),
-        first_caption_text_from_editor_state=(
-            editor_render_plan.caption_timeline[0].get("text")
-            if editor_render_plan.caption_timeline
-            else None
-        ),
-        caption_initialized=editor_render_plan.caption_timeline_initialized,
-        editor_state_version=render_style_config.get("editor_state_version", 0),
-        effect_timeline_count=len(editor_render_plan.effect_timeline),
-        template=payload.preset,
-        layout=layout_mode(payload.preset),
-        style=render_style_config.get("clipper_style_preset"),
-        resolution=f"{render_width}x{render_height}",
-        output_path=None,
-    )
-    logger.info(
-        "render_element_contract_audit",
-        phase="queue_render",
-        transformation_id=str(plan.id),
-        candidate_id=str(candidate.id),
-        render_id=None,
-        template=payload.preset,
-        resolution=f"{render_width}x{render_height}",
-        **editor_render_plan.element_audit.log_fields(),
-    )
-    if editor_render_plan.element_audit.unsupported_export_elements:
-        logger.warning(
-            "render_contains_unsupported_export_elements",
-            transformation_id=str(plan.id),
-            candidate_id=str(candidate.id),
-            unsupported_export_elements=list(
-                editor_render_plan.element_audit.unsupported_export_elements
-            ),
-            unsupported_export_reasons=(
-                editor_render_plan.element_audit.unsupported_reasons
-            ),
-        )
     voiceover_assets = list(
         db.scalars(
             select(MediaAsset)
@@ -2141,17 +2318,30 @@ def queue_render(
         "additional_audio": additional_audio_identity,
     }
     cache_lookup_started_at = perf_counter()
-    expected_fingerprint = render_fingerprint(
+    expected_manifest_hash = render_manifest_hash(
         render_style_config,
         preset=payload.preset,
         subtitle_language=payload.subtitle_language,
         width=render_width,
         height=render_height,
-        frame_rate=30,
+        frame_rate=float(payload.frame_rate or 30.0),
         preview=preview,
+        quality=str(payload.quality or "high"),
         audio_identity=audio_identity,
     )
-    fingerprint_short = expected_fingerprint[:12]
+    fingerprint_short = expected_manifest_hash[:12]
+
+    logger.info(
+        "render_request_received",
+        project_id=str(project.id),
+        transformation_id=str(plan.id),
+        render_type="preview" if preview else "final",
+        resolution=f"{render_width}x{render_height}",
+        quality=str(payload.quality or "high"),
+        manifest_hash=expected_manifest_hash,
+        force=bool(payload.force),
+    )
+
     completed_renders = list(
         db.scalars(
             select(Render)
@@ -2171,69 +2361,95 @@ def queue_render(
     )
     current_framing = normalize_video_framing(render_style_config.get("video_framing"))
     cache_miss_reason = "no_completed_render"
-    for completed_render in completed_renders:
-        cached_path_value = (
-            completed_render.preview_path if preview else completed_render.output_path
+
+    if payload.force:
+        cache_miss_reason = "force_rerender_requested"
+        logger.info(
+            "render_cache_decision",
+            cache_hit=False,
+            reason="force_rerender_requested",
+            previous_hash=None,
+            new_hash=expected_manifest_hash,
+            previous_resolution=None,
+            new_resolution=f"{render_width}x{render_height}",
         )
-        cached_path = Path(cached_path_value) if cached_path_value else None
-        if not cached_path or not cached_path.is_file():
-            cache_miss_reason = "cached_output_missing"
-            continue
-        cache_metadata = read_render_cache_metadata(cached_path)
-        if cache_metadata and cache_metadata.get("fingerprint") == expected_fingerprint:
-            try:
-                verify_render_file_binding(
-                    cached_path,
-                    preview=preview,
-                    forbidden_source_paths=(candidate.short_source_clip_path,),
-                )
-            except AppError as exc:
-                logger.error(
-                    "cached_render_file_binding_invalid",
-                    render_id=str(completed_render.id),
-                    render_output_path=str(cached_path),
-                    error=exc.message,
-                )
-                cache_miss_reason = "cached_output_binding_invalid"
+    else:
+        for completed_render in completed_renders:
+            cached_path_value = (
+                completed_render.preview_path if preview else completed_render.output_path
+            )
+            cached_path = Path(cached_path_value) if cached_path_value else None
+            if not cached_path or not cached_path.is_file():
+                cache_miss_reason = "cached_output_missing"
                 continue
-            cache_lookup_duration = perf_counter() - cache_lookup_started_at
+            cache_metadata = read_render_cache_metadata(cached_path)
+            cached_hash = (cache_metadata or {}).get("manifest_hash") or (cache_metadata or {}).get("fingerprint")
+            if cached_hash == expected_manifest_hash:
+                try:
+                    verify_render_file_binding(
+                        cached_path,
+                        preview=preview,
+                        forbidden_source_paths=(candidate.short_source_clip_path,),
+                    )
+                except AppError as exc:
+                    logger.error(
+                        "cached_render_file_binding_invalid",
+                        render_id=str(completed_render.id),
+                        render_output_path=str(cached_path),
+                        error=exc.message,
+                    )
+                    cache_miss_reason = "cached_output_binding_invalid"
+                    continue
+                cache_lookup_duration = perf_counter() - cache_lookup_started_at
+                logger.info(
+                    "render_cache_decision",
+                    cache_hit=True,
+                    reason="manifest_hash_match",
+                    previous_hash=cached_hash,
+                    new_hash=expected_manifest_hash,
+                    previous_resolution=f"{completed_render.width}x{completed_render.height}",
+                    new_resolution=f"{render_width}x{render_height}",
+                )
+                logger.info(
+                    "using_cached_render",
+                    message="using cached render",
+                    render_id=str(completed_render.id),
+                    cached_render_id=str(completed_render.id),
+                    cached_output_path=str(cached_path),
+                    transformation_id=str(plan.id),
+                    preset=payload.preset,
+                    resolution=f"{render_width}x{render_height}",
+                    video_framing=current_framing,
+                    fingerprint=fingerprint_short,
+                    manifest_hash=expected_manifest_hash,
+                    cache_lookup_duration=round(cache_lookup_duration, 3),
+                )
+                return render_payload(completed_render, db, cache_reused=True, manifest_hash=expected_manifest_hash)
+
+            cache_miss_reason = "manifest_hash_mismatch"
             logger.info(
-                "using_cached_render",
-                message="using cached render",
-                render_id=str(completed_render.id),
+                "render_cache_invalidated",
+                message="render invalidated because render inputs changed",
                 cached_render_id=str(completed_render.id),
-                cached_output_path=str(cached_path),
                 transformation_id=str(plan.id),
+                cached_fingerprint=cached_hash,
+                expected_fingerprint=expected_manifest_hash,
+                cached_video_framing=(cache_metadata or {}).get("video_framing"),
+                video_framing=current_framing,
                 preset=payload.preset,
                 resolution=f"{render_width}x{render_height}",
-                video_framing=current_framing,
-                fingerprint=fingerprint_short,
-                cache_lookup_duration=round(cache_lookup_duration, 3),
             )
-            return render_payload(completed_render, db)
-        framing_changed = bool(
-            cache_metadata
-            and cache_metadata.get("video_framing") != current_framing
-        )
+
         logger.info(
-            "render_cache_invalidated",
-            message=(
-                "render invalidated because video_framing changed"
-                if framing_changed
-                else "render invalidated because render inputs changed"
-            ),
-            cached_render_id=str(completed_render.id),
-            transformation_id=str(plan.id),
-            cached_fingerprint=(cache_metadata or {}).get("fingerprint"),
-            expected_fingerprint=expected_fingerprint,
-            cached_video_framing=(cache_metadata or {}).get("video_framing"),
-            video_framing=current_framing,
-            preset=payload.preset,
-            resolution=f"{render_width}x{render_height}",
+            "render_cache_decision",
+            cache_hit=False,
+            reason=cache_miss_reason,
+            previous_hash=(cache_metadata or {}).get("manifest_hash") or (cache_metadata or {}).get("fingerprint") if completed_renders else None,
+            new_hash=expected_manifest_hash,
+            previous_resolution=f"{completed_renders[0].width}x{completed_renders[0].height}" if completed_renders else None,
+            new_resolution=f"{render_width}x{render_height}",
         )
-        cache_miss_reason = (
-            "video_framing_changed" if framing_changed else "render_inputs_changed"
-        )
+
     logger.info(
         "cache_miss",
         transformation_id=str(plan.id),
@@ -2283,7 +2499,7 @@ def queue_render(
         subtitle_language=payload.subtitle_language,
         width=render_width,
         height=render_height,
-        frame_rate=30,
+        frame_rate=float(payload.frame_rate or 30.0),
     )
     db.add(render)
     db.commit()
@@ -2300,9 +2516,11 @@ def queue_render(
         effect_timeline_count=len(editor_render_plan.effect_timeline),
         template=payload.preset,
         resolution=f"{render_width}x{render_height}",
+        quality=str(payload.quality or "high"),
+        manifest_hash=expected_manifest_hash,
     )
     render_video.delay(str(render.id), preview)
-    return render_payload(render, db)
+    return render_payload(render, db, cache_reused=False, manifest_hash=expected_manifest_hash)
 
 
 def _render_source_paths(render: Render, db: Session) -> tuple[str | None, str | None]:
@@ -2320,11 +2538,18 @@ def _render_source_paths(render: Render, db: Session) -> tuple[str | None, str |
     )
 
 
-def render_payload(render: Render, db: Session | None = None) -> dict:
+def render_payload(
+    render: Render,
+    db: Session | None = None,
+    *,
+    cache_reused: bool = False,
+    manifest_hash: str | None = None,
+) -> dict:
     path_value = render.output_path or render.preview_path
     response_status = render.status
     response_error = render.error_message if render.status == "failed" else None
     has_verified_file = False
+    resolved_manifest_hash = manifest_hash
     if render.status == "completed":
         try:
             verify_render_file_binding(
@@ -2333,6 +2558,10 @@ def render_payload(render: Render, db: Session | None = None) -> dict:
                 forbidden_source_paths=_render_source_paths(render, db) if db else (),
             )
             has_verified_file = True
+            if not resolved_manifest_hash and path_value:
+                meta = read_render_cache_metadata(Path(path_value))
+                if meta:
+                    resolved_manifest_hash = meta.get("manifest_hash") or meta.get("fingerprint")
         except AppError as exc:
             response_status = "failed"
             response_error = exc.message
@@ -2358,6 +2587,9 @@ def render_payload(render: Render, db: Session | None = None) -> dict:
         "error_message": response_error,
         "warning_message": render.error_message if response_status == "completed" else None,
         "output_url": output_url,
+        "manifest_hash": resolved_manifest_hash,
+        "cache_reused": cache_reused,
+        "created_at": render.created_at,
     }
 
 

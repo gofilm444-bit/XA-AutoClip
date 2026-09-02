@@ -25,6 +25,7 @@ class EditorRenderPlan:
 class CaptionRenderSelection:
     source: str
     cues: list[tuple[float, float, str]]
+    rich_cues: list[dict[str, Any]] = ()
 
 
 @dataclass(frozen=True)
@@ -132,19 +133,31 @@ def resolve_caption_render_cues(
 ) -> CaptionRenderSelection:
     """Select caption text without restoring transcript cues over editor state."""
     if plan.caption_timeline_initialized or plan.caption_timeline:
+        valid_items = [
+            dict(item)
+            for item in plan.caption_timeline
+            if float(item.get("start", 0)) < render_duration
+            and min(render_duration, float(item.get("end", 0))) > float(item.get("start", 0))
+        ]
         cues = [
             (
                 max(0.0, float(item["start"])),
                 min(render_duration, float(item["end"])),
-                str(item["text"]),
+                str(item.get("text", "")),
             )
-            for item in plan.caption_timeline
-            if float(item["start"]) < render_duration
-            and min(render_duration, float(item["end"])) > float(item["start"])
+            for item in valid_items
         ]
-        return CaptionRenderSelection(source="editor_state", cues=cues)
+        return CaptionRenderSelection(source="editor_state", cues=cues, rich_cues=valid_items)
 
-    return CaptionRenderSelection(source="candidate_default", cues=list(fallback_cues))
+    fallback_rich = [
+        {"id": f"cue-{i}", "start": start, "end": end, "text": text}
+        for i, (start, end, text) in enumerate(fallback_cues)
+    ]
+    return CaptionRenderSelection(
+        source="candidate_default",
+        cues=list(fallback_cues),
+        rich_cues=fallback_rich,
+    )
 
 
 def resolve_hook_render_events(
