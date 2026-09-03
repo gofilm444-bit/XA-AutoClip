@@ -574,3 +574,56 @@ export function trimSegmentRightToPlayhead(
   nextSequence[index] = updatedSeg;
   return nextSequence;
 }
+
+export function splitSegmentAtPlayhead(
+  sequence: MediaSequenceSegment[],
+  segmentId: string,
+  playhead: number,
+  newRightId?: string,
+  minDuration = 0.05,
+): { sequence: MediaSequenceSegment[]; rightId: string } | null {
+  const index = sequence.findIndex((s) => s.id === segmentId);
+  if (index === -1) return null;
+
+  const seg = sequence[index];
+  const segStart = seg.start ?? 0;
+  const segDuration = seg.duration ?? effectiveMediaDuration(seg);
+  const segEnd = seg.end ?? (segStart + segDuration);
+  const speed = seg.speed ?? 1.0;
+
+  // Playhead must be strictly inside segment (cannot be at exact boundary)
+  if (playhead <= segStart + minDuration || playhead >= segEnd - minDuration) {
+    return null;
+  }
+
+  const dtLeft = playhead - segStart;
+  const dSourceLeft = dtLeft * speed;
+
+  const leftSeg: MediaSequenceSegment = {
+    ...seg,
+    id: seg.id,
+    start: Number(segStart.toFixed(3)),
+    end: Number(playhead.toFixed(3)),
+    duration: Number(dtLeft.toFixed(3)),
+    sourceStart: seg.sourceStart,
+    sourceEnd: Number((seg.sourceStart + dSourceLeft).toFixed(3)),
+  };
+
+  const dtRight = segEnd - playhead;
+  const rightId = newRightId || `${seg.id}-split-${Date.now()}`;
+
+  const rightSeg: MediaSequenceSegment = {
+    ...seg,
+    id: rightId,
+    start: Number(playhead.toFixed(3)),
+    end: Number(segEnd.toFixed(3)),
+    duration: Number(dtRight.toFixed(3)),
+    sourceStart: Number((seg.sourceStart + dSourceLeft).toFixed(3)),
+    sourceEnd: seg.sourceEnd,
+  };
+
+  const nextSequence = [...sequence];
+  nextSequence.splice(index, 1, leftSeg, rightSeg);
+
+  return { sequence: nextSequence, rightId };
+}

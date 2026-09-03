@@ -18,6 +18,7 @@ import {
   insertMediaSegmentAtTime,
   trimSegmentLeftToPlayhead,
   trimSegmentRightToPlayhead,
+  splitSegmentAtPlayhead,
   type MediaSequenceSegment,
 } from "../utils/manualEditor";
 
@@ -1297,5 +1298,95 @@ describe("PHASE 4 — NORMALIZE TRIM LEFT / RIGHT", () => {
     expect(res![1].asset_id).toBe("asset-b");
     expect(res![1].start).toBe(8);
     expect(res![1].end).toBe(15);
+  });
+});
+
+describe("PHASE 5 — SPLIT / POTONG TENGAH AT PLAYHEAD", () => {
+  it("Split at playhead divides segment with exact playhead boundary and continuous source", () => {
+    // Selected segment: timeline 4-10, source 2-8, speed 1
+    const seq: MediaSequenceSegment[] = [
+      { id: "seg-1", asset_id: "asset-parent", name: "clip.mp4", sourceStart: 2, sourceEnd: 8, start: 4, end: 10, duration: 6, speed: 1 },
+    ];
+
+    // Playhead = 7
+    const res = splitSegmentAtPlayhead(seq, "seg-1", 7.0, "seg-1-right");
+    expect(res).not.toBeNull();
+    const result = res!.sequence;
+    expect(res!.rightId).toBe("seg-1-right");
+    expect(result.length).toBe(2);
+
+    const left = result[0];
+    const right = result[1];
+
+    // LEFT: timeline 4-7, source 2-5
+    expect(left.id).toBe("seg-1");
+    expect(left.asset_id).toBe("asset-parent");
+    expect(left.start).toBe(4);
+    expect(left.end).toBe(7);
+    expect(left.sourceStart).toBe(2);
+    expect(left.sourceEnd).toBe(5);
+    expect(left.duration).toBe(3);
+
+    // RIGHT: timeline 7-10, source 5-8
+    expect(right.id).toBe("seg-1-right");
+    expect(right.asset_id).toBe("asset-parent");
+    expect(right.start).toBe(7);
+    expect(right.end).toBe(10);
+    expect(right.sourceStart).toBe(5);
+    expect(right.sourceEnd).toBe(8);
+    expect(right.duration).toBe(3);
+
+    // Invariants:
+    expect(left.end).toBe(7.0);
+    expect(right.start).toBe(7.0);
+    expect(left.sourceEnd).toBe(right.sourceStart);
+  });
+
+  it("Split validity: boundary playhead or outside playhead returns null no-op", () => {
+    const seq: MediaSequenceSegment[] = [
+      { id: "seg-1", asset_id: "asset-1", sourceStart: 2, sourceEnd: 8, start: 4, end: 10, duration: 6, speed: 1 },
+    ];
+
+    // Exact boundary or too close to start (at 4.0 or 4.02)
+    expect(splitSegmentAtPlayhead(seq, "seg-1", 4.0)).toBeNull();
+    expect(splitSegmentAtPlayhead(seq, "seg-1", 4.03)).toBeNull();
+
+    // Exact boundary or too close to end (at 10.0 or 9.98)
+    expect(splitSegmentAtPlayhead(seq, "seg-1", 10.0)).toBeNull();
+    expect(splitSegmentAtPlayhead(seq, "seg-1", 9.97)).toBeNull();
+
+    // Completely outside
+    expect(splitSegmentAtPlayhead(seq, "seg-1", 2.0)).toBeNull();
+    expect(splitSegmentAtPlayhead(seq, "seg-1", 12.0)).toBeNull();
+  });
+
+  it("Split applies to SELECTED segment only without affecting other segments", () => {
+    const seq: MediaSequenceSegment[] = [
+      { id: "seg-a", asset_id: "asset-a", sourceStart: 0, sourceEnd: 8, start: 0, end: 8, duration: 8, speed: 1 },
+      { id: "seg-b", asset_id: "asset-b", sourceStart: 0, sourceEnd: 7, start: 8, end: 15, duration: 7, speed: 1 },
+    ];
+
+    // Split seg-b at 11
+    const res = splitSegmentAtPlayhead(seq, "seg-b", 11.0, "seg-b-right");
+    expect(res).not.toBeNull();
+    const result = res!.sequence;
+    expect(result.length).toBe(3);
+
+    // seg-a is completely untouched
+    expect(result[0].id).toBe("seg-a");
+    expect(result[0].asset_id).toBe("asset-a");
+    expect(result[0].start).toBe(0);
+    expect(result[0].end).toBe(8);
+
+    // seg-b is split into 8-11 and 11-15, both having asset-b
+    expect(result[1].id).toBe("seg-b");
+    expect(result[1].asset_id).toBe("asset-b");
+    expect(result[1].start).toBe(8);
+    expect(result[1].end).toBe(11);
+
+    expect(result[2].id).toBe("seg-b-right");
+    expect(result[2].asset_id).toBe("asset-b");
+    expect(result[2].start).toBe(11);
+    expect(result[2].end).toBe(15);
   });
 });

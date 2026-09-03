@@ -49,6 +49,7 @@ import {
   insertMediaSegmentAtTime,
   trimSegmentLeftToPlayhead,
   trimSegmentRightToPlayhead,
+  splitSegmentAtPlayhead,
   type MediaSequenceSegment,
 } from "../utils/manualEditor";
 import {
@@ -7860,35 +7861,24 @@ export function TransformationPage() {
     setAutosaveWakeRevision((revision) => revision + 1);
   };
   const splitSelectedMedia = () => {
-    if (!mediaTrackSelected) {
+    if (!mediaTrackSelected || !selectedMediaSegmentId) {
       setTimelineError("Pilih bagian video atau audio yang ingin dipotong.");
       return;
     }
-    if (previewTime <= 0.05 || previewTime >= clipDuration - 0.05) {
-      setTimelineError("Letakkan playhead di dalam bagian track, bukan pada tepinya.");
-      return;
-    }
-    const segmentIndex = mediaSegments.findIndex(
-      (segment) => previewTime > segment.start + 0.05 && previewTime < segment.end - 0.05,
-    );
-    const segment = mediaSegments[segmentIndex];
-    if (!segment || segment.id !== selectedMediaSegmentId) {
-      setTimelineError("Playhead harus berada di dalam bagian track yang dipilih.");
-      return;
-    }
-    const activeSpeed = activeMediaTrack === "audio" ? (audioSettings.speed || 1.0) : videoSpeed;
-    const sourcePoint = segment.sourceStart + (previewTime - segment.start) * activeSpeed;
     const rightId = `media-${newEventId()}`;
-    const nextSequence = mediaSequence.flatMap((item, index) =>
-      index === segmentIndex
-        ? [
-            { ...item, sourceEnd: sourcePoint },
-            { id: rightId, sourceStart: sourcePoint, sourceEnd: item.sourceEnd },
-          ]
-        : [item],
+    const result = splitSegmentAtPlayhead(
+      mediaSequence,
+      selectedMediaSegmentId,
+      previewTime,
+      rightId,
     );
-    commitMediaSequence(nextSequence, configuredEffectTimeline);
-    setSelectedMediaSegmentId(rightId);
+    if (!result) {
+      setTimelineError("Playhead harus berada di dalam bagian track yang dipilih (bukan pada tepinya).");
+      return;
+    }
+    commitMediaSequence(result.sequence, configuredEffectTimeline);
+    setSelectedMediaSegmentId(result.rightId);
+    setMessage("Item berhasil dipotong (split) pada playhead.");
   };
   const deleteMediaLeft = () => {
     if (!mediaTrackSelected || !selectedMediaSegmentId) {
