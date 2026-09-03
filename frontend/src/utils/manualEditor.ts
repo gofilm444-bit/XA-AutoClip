@@ -492,3 +492,85 @@ export function insertMediaSegmentAtTime(
 
   return result;
 }
+
+export function trimSegmentLeftToPlayhead(
+  sequence: MediaSequenceSegment[],
+  segmentId: string,
+  playhead: number,
+  minDuration = 0.25,
+): MediaSequenceSegment[] | null {
+  const index = sequence.findIndex((s) => s.id === segmentId);
+  if (index === -1) return null;
+
+  const seg = sequence[index];
+  const segStart = seg.start ?? 0;
+  const segDuration = seg.duration ?? effectiveMediaDuration(seg);
+  const segEnd = seg.end ?? (segStart + segDuration);
+  const speed = seg.speed ?? 1.0;
+
+  // Playhead must be strictly inside segment and leave at least minDuration
+  if (playhead <= segStart + 0.01 || playhead >= segEnd - minDuration) {
+    return null;
+  }
+
+  const deltaTimeline = playhead - segStart;
+  const deltaSource = deltaTimeline * speed;
+
+  const newStart = Number(playhead.toFixed(3));
+  const newEnd = Number(segEnd.toFixed(3));
+  const newSourceStart = Number((seg.sourceStart + deltaSource).toFixed(3));
+  const newDuration = Number((newEnd - newStart).toFixed(3));
+
+  const updatedSeg: MediaSequenceSegment = {
+    ...seg,
+    start: newStart,
+    end: newEnd,
+    sourceStart: newSourceStart,
+    sourceEnd: seg.sourceEnd,
+    duration: newDuration,
+  };
+
+  const nextSequence = [...sequence];
+  nextSequence[index] = updatedSeg;
+  return nextSequence;
+}
+
+export function trimSegmentRightToPlayhead(
+  sequence: MediaSequenceSegment[],
+  segmentId: string,
+  playhead: number,
+  minDuration = 0.25,
+): MediaSequenceSegment[] | null {
+  const index = sequence.findIndex((s) => s.id === segmentId);
+  if (index === -1) return null;
+
+  const seg = sequence[index];
+  const segStart = seg.start ?? 0;
+  const segDuration = seg.duration ?? effectiveMediaDuration(seg);
+  const segEnd = seg.end ?? (segStart + segDuration);
+  const speed = seg.speed ?? 1.0;
+
+  // Playhead must be strictly inside segment and preserve at least minDuration from start
+  if (playhead <= segStart + minDuration || playhead >= segEnd - 0.01) {
+    return null;
+  }
+
+  const newStart = Number(segStart.toFixed(3));
+  const newEnd = Number(playhead.toFixed(3));
+  const newDuration = Number((newEnd - newStart).toFixed(3));
+  const deltaSource = newDuration * speed;
+  const newSourceEnd = Number((seg.sourceStart + deltaSource).toFixed(3));
+
+  const updatedSeg: MediaSequenceSegment = {
+    ...seg,
+    start: newStart,
+    end: newEnd,
+    sourceStart: seg.sourceStart,
+    sourceEnd: newSourceEnd,
+    duration: newDuration,
+  };
+
+  const nextSequence = [...sequence];
+  nextSequence[index] = updatedSeg;
+  return nextSequence;
+}

@@ -16,6 +16,8 @@ import {
   effectiveMediaDuration,
   sameMediaSource,
   insertMediaSegmentAtTime,
+  trimSegmentLeftToPlayhead,
+  trimSegmentRightToPlayhead,
   type MediaSequenceSegment,
 } from "../utils/manualEditor";
 
@@ -1202,5 +1204,98 @@ describe("PHASE 3 — ADD MEDIA TO TIMELINE AT PLAYHEAD", () => {
     expect(result[0].end).toBe(5);
     expect(result[1].start).toBe(5);
     expect(result[1].end).toBe(8);
+  });
+});
+
+describe("PHASE 4 — NORMALIZE TRIM LEFT / RIGHT", () => {
+  it("Repeated Trim Left calculates incrementally without resetting to 0", () => {
+    // Original: timeline 0-10, source 0-10
+    let seq: MediaSequenceSegment[] = [
+      { id: "seg-1", asset_id: "asset-1", sourceStart: 0, sourceEnd: 10, start: 0, end: 10, duration: 10, speed: 1 },
+    ];
+
+    // Trim Left at 2
+    const res1 = trimSegmentLeftToPlayhead(seq, "seg-1", 2.0);
+    expect(res1).not.toBeNull();
+    seq = res1!;
+    expect(seq[0].start).toBe(2);
+    expect(seq[0].end).toBe(10);
+    expect(seq[0].sourceStart).toBe(2);
+    expect(seq[0].sourceEnd).toBe(10);
+    expect(seq[0].duration).toBe(8);
+
+    // Then Trim Left again at 5
+    const res2 = trimSegmentLeftToPlayhead(seq, "seg-1", 5.0);
+    expect(res2).not.toBeNull();
+    seq = res2!;
+    expect(seq[0].start).toBe(5);
+    expect(seq[0].end).toBe(10);
+    expect(seq[0].sourceStart).toBe(5);
+    expect(seq[0].sourceEnd).toBe(10);
+    expect(seq[0].duration).toBe(5);
+  });
+
+  it("Trim on split-derived segment accurately offsets source boundaries", () => {
+    // Segment: timeline 4-10, source 2-8
+    let seq: MediaSequenceSegment[] = [
+      { id: "seg-split", asset_id: "asset-split", sourceStart: 2, sourceEnd: 8, start: 4, end: 10, duration: 6, speed: 1 },
+    ];
+
+    // Trim Left at 6
+    const res1 = trimSegmentLeftToPlayhead(seq, "seg-split", 6.0);
+    expect(res1).not.toBeNull();
+    seq = res1!;
+    // Expected: timeline 6-10, source 4-8
+    expect(seq[0].start).toBe(6);
+    expect(seq[0].end).toBe(10);
+    expect(seq[0].sourceStart).toBe(4);
+    expect(seq[0].sourceEnd).toBe(8);
+    expect(seq[0].duration).toBe(4);
+
+    // Then Trim Right at 8
+    const res2 = trimSegmentRightToPlayhead(seq, "seg-split", 8.0);
+    expect(res2).not.toBeNull();
+    seq = res2!;
+    // Expected: timeline 6-8, source 4-6
+    expect(seq[0].start).toBe(6);
+    expect(seq[0].end).toBe(8);
+    expect(seq[0].sourceStart).toBe(4);
+    expect(seq[0].sourceEnd).toBe(6);
+    expect(seq[0].duration).toBe(2);
+  });
+
+  it("Trim validity: playhead outside segment or leaving < minDuration is rejected as no-op", () => {
+    const seq: MediaSequenceSegment[] = [
+      { id: "seg-1", asset_id: "asset-1", sourceStart: 0, sourceEnd: 10, start: 0, end: 10, duration: 10, speed: 1 },
+    ];
+
+    // Playhead outside (at 12)
+    expect(trimSegmentLeftToPlayhead(seq, "seg-1", 12.0)).toBeNull();
+    expect(trimSegmentRightToPlayhead(seq, "seg-1", 12.0)).toBeNull();
+
+    // Playhead too close to end for Left Trim (< 0.25s remaining)
+    expect(trimSegmentLeftToPlayhead(seq, "seg-1", 9.85)).toBeNull();
+
+    // Playhead too close to start for Right Trim (< 0.25s from start)
+    expect(trimSegmentRightToPlayhead(seq, "seg-1", 0.15)).toBeNull();
+  });
+
+  it("Trim preserves untouched segments in multi-video timeline", () => {
+    const seq: MediaSequenceSegment[] = [
+      { id: "seg-a", asset_id: "asset-a", sourceStart: 0, sourceEnd: 8, start: 0, end: 8, duration: 8, speed: 1 },
+      { id: "seg-b", asset_id: "asset-b", sourceStart: 0, sourceEnd: 7, start: 8, end: 15, duration: 7, speed: 1 },
+    ];
+
+    // Trim Right on seg-a at 5
+    const res = trimSegmentRightToPlayhead(seq, "seg-a", 5.0);
+    expect(res).not.toBeNull();
+    // seg-a trimmed to 0-5
+    expect(res![0].end).toBe(5);
+    expect(res![0].sourceEnd).toBe(5);
+    // seg-b completely untouched
+    expect(res![1].id).toBe("seg-b");
+    expect(res![1].asset_id).toBe("asset-b");
+    expect(res![1].start).toBe(8);
+    expect(res![1].end).toBe(15);
   });
 });

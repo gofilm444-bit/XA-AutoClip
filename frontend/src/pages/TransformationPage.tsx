@@ -47,6 +47,8 @@ import {
   effectiveMediaDuration,
   sameMediaSource,
   insertMediaSegmentAtTime,
+  trimSegmentLeftToPlayhead,
+  trimSegmentRightToPlayhead,
   type MediaSequenceSegment,
 } from "../utils/manualEditor";
 import {
@@ -7889,78 +7891,38 @@ export function TransformationPage() {
     setSelectedMediaSegmentId(rightId);
   };
   const deleteMediaLeft = () => {
-    if (!mediaTrackSelected) {
+    if (!mediaTrackSelected || !selectedMediaSegmentId) {
       setTimelineError("Pilih bagian video atau audio terlebih dahulu.");
       return;
     }
-    if (previewTime < 0.25 || clipDuration - previewTime < 0.25) {
-      setTimelineError("Sisakan setidaknya 0,25 detik setelah titik potong.");
+    const nextSequence = trimSegmentLeftToPlayhead(
+      mediaSequence,
+      selectedMediaSegmentId,
+      previewTime,
+    );
+    if (!nextSequence) {
+      setTimelineError("Playhead harus berada di dalam item yang dipilih (sisakan min. 0,25 detik).");
       return;
     }
-    const activeSpeed = activeMediaTrack === "audio" ? (audioSettings.speed || 1.0) : videoSpeed;
-    const nextSequence = mediaSegments.flatMap((segment) => {
-      if (segment.end <= previewTime) return [];
-      if (segment.start >= previewTime) return [{
-        id: segment.id,
-        sourceStart: segment.sourceStart,
-        sourceEnd: segment.sourceEnd,
-      }];
-      return [{
-        id: segment.id,
-        sourceStart: segment.sourceStart + (previewTime - segment.start) * activeSpeed,
-        sourceEnd: segment.sourceEnd,
-      }];
-    });
-    const nextDuration = clipDuration - previewTime;
-    const nextEvents = configuredEffectTimeline
-      .filter((event) => event.end > previewTime)
-      .map((event) => ({
-        ...event,
-        start: Math.max(0, event.start - previewTime),
-        end: Math.min(nextDuration, event.end - previewTime),
-      }))
-      .filter((event) => event.end > event.start);
-    commitMediaSequence(nextSequence, nextEvents);
-    setSelectedMediaSegmentId(null);
-    setPreviewTime(0);
-    const video = previewVideoRef.current;
-    if (video && !renderedPreviewUrl && nextSequence[0]) {
-      video.currentTime = nextSequence[0].sourceStart;
-    }
+    commitMediaSequence(nextSequence, configuredEffectTimeline);
+    setMessage("Sisi kiri item berhasil dipotong hingga playhead.");
   };
   const deleteMediaRight = () => {
-    if (!mediaTrackSelected) {
+    if (!mediaTrackSelected || !selectedMediaSegmentId) {
       setTimelineError("Pilih bagian video atau audio terlebih dahulu.");
       return;
     }
-    if (previewTime < 0.25 || clipDuration - previewTime < 0.25) {
-      setTimelineError("Sisakan setidaknya 0,25 detik sebelum titik potong.");
+    const nextSequence = trimSegmentRightToPlayhead(
+      mediaSequence,
+      selectedMediaSegmentId,
+      previewTime,
+    );
+    if (!nextSequence) {
+      setTimelineError("Playhead harus berada di dalam item yang dipilih (sisakan min. 0,25 detik).");
       return;
     }
-    const activeSpeed = activeMediaTrack === "audio" ? (audioSettings.speed || 1.0) : videoSpeed;
-    const nextSequence = mediaSegments.flatMap((segment) => {
-      if (segment.start >= previewTime) return [];
-      if (segment.end <= previewTime) return [{
-        id: segment.id,
-        sourceStart: segment.sourceStart,
-        sourceEnd: segment.sourceEnd,
-      }];
-      return [{
-        id: segment.id,
-        sourceStart: segment.sourceStart,
-        sourceEnd: segment.sourceStart + (previewTime - segment.start) * activeSpeed,
-      }];
-    });
-    const nextEvents = configuredEffectTimeline
-      .filter((event) => event.start < previewTime)
-      .map((event) => ({ ...event, end: Math.min(previewTime, event.end) }))
-      .filter((event) => event.end > event.start);
-    commitMediaSequence(nextSequence, nextEvents);
-    setSelectedMediaSegmentId(null);
-    setPreviewTime(Math.min(previewTime, nextSequence.reduce(
-      (total, segment) => total + (segment.sourceEnd - segment.sourceStart) / activeSpeed,
-      0,
-    )));
+    commitMediaSequence(nextSequence, configuredEffectTimeline);
+    setMessage("Sisi kanan item berhasil dipotong hingga playhead.");
   };
   const copySelectedMedia = () => {
     const selected = mediaSequence.find((segment) => segment.id === selectedMediaSegmentId);
