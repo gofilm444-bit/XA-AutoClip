@@ -903,3 +903,113 @@ describe("Source-Scoped Video Error State & Stale Event Protection (Section L)",
   });
 });
 
+describe("PHASE 1 — PLAYHEAD STABILITY", () => {
+  it("USER PLAYHEAD INTERACTION ALWAYS WINS: pointer down immediately pauses playback and stops RAF clock", () => {
+    let previewPlaying = true;
+    const previewPlayingRef = { current: true };
+    const timelineDraggingRef = { current: false };
+    let previewClockFrame: number | null = 1234;
+    let previewTime = 5.0;
+    const previewTimeRef = { current: 5.0 };
+
+    function handlePreviewPause() {
+      previewPlaying = false;
+      previewPlayingRef.current = false;
+      if (previewClockFrame !== null) {
+        previewClockFrame = null;
+      }
+    }
+
+    function handleTimelinePointerDown(targetTime: number) {
+      handlePreviewPause();
+      timelineDraggingRef.current = true;
+      previewTimeRef.current = targetTime;
+      previewTime = targetTime;
+    }
+
+    function updateClock(delta: number) {
+      if (timelineDraggingRef.current || !previewPlayingRef.current) {
+        return;
+      }
+      previewTimeRef.current += delta;
+      previewTime = previewTimeRef.current;
+    }
+
+    function finishTimelineDrag() {
+      timelineDraggingRef.current = false;
+    }
+
+    // 1. Currently playing at 5s
+    expect(previewPlaying).toBe(true);
+    expect(previewTime).toBe(5.0);
+
+    // 2. User touches / pointer down playhead to drag to 9s
+    handleTimelinePointerDown(9.0);
+    expect(previewPlaying).toBe(false);
+    expect(previewPlayingRef.current).toBe(false);
+    expect(previewClockFrame).toBeNull();
+    expect(previewTime).toBe(9.0);
+
+    // 3. Drag to 11s
+    previewTimeRef.current = 11.0;
+    previewTime = 11.0;
+
+    // 4. Pointer released at 11s
+    finishTimelineDrag();
+    expect(timelineDraggingRef.current).toBe(false);
+    expect(previewPlaying).toBe(false);
+    expect(previewTime).toBe(11.0);
+
+    // 5. Trigger simulated playback tick / RAF after release
+    updateClock(0.016);
+    expect(previewTime).toBe(11.0);
+    expect(previewPlaying).toBe(false);
+
+    // 6. Wait 10 simulated ticks
+    for (let i = 0; i < 10; i++) {
+      updateClock(0.1);
+    }
+    expect(previewTime).toBe(11.0);
+
+    // 7. Video onTimeUpdate while paused must not overwrite playhead
+    function setPreviewTimeFromVideo(videoTime: number) {
+      if (timelineDraggingRef.current) return;
+      if (!previewPlayingRef.current) return;
+      previewTime = videoTime;
+    }
+    setPreviewTimeFromVideo(8.2); // Stale video time
+    expect(previewTime).toBe(11.0);
+  });
+
+  it("Play resumes exactly from the last released playhead position", () => {
+    let previewPlaying = false;
+    const previewPlayingRef = { current: false };
+    let previewTime = 11.0;
+    const previewTimeRef = { current: 11.0 };
+    const clipDuration = 20.0;
+
+    function handlePreviewPlay() {
+      if (previewTime >= clipDuration - 0.05) {
+        previewTime = 0;
+        previewTimeRef.current = 0;
+      }
+      previewPlaying = true;
+      previewPlayingRef.current = true;
+    }
+
+    function updateClock(delta: number) {
+      if (!previewPlayingRef.current) return;
+      previewTimeRef.current += delta;
+      previewTime = previewTimeRef.current;
+    }
+
+    // User starts playback from 11.0s
+    handlePreviewPlay();
+    expect(previewPlaying).toBe(true);
+    expect(previewTime).toBe(11.0);
+
+    // Playback advances smoothly from 11.0s
+    updateClock(0.5);
+    expect(previewTime).toBeCloseTo(11.5);
+  });
+});

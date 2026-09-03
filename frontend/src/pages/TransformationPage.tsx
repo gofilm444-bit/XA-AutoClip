@@ -7288,23 +7288,24 @@ export function TransformationPage() {
   };
   previewPlayingRef.current = previewPlaying;
 
-  const setPreviewTimeFromVideo = (videoTime: number) => {
+  const setPreviewTimeFromVideo = (_videoTime: number) => {
     if (timelineDraggingRef.current) return;
+    // When playback is paused or scrubbing, user interaction is the sole authority on previewTime.
+    // Video timeupdate while paused must never overwrite user-positioned playhead.
     if (!previewPlayingRef.current) {
-      const clipTime = clipTimeFromVideoTime(videoTime);
-      previewTimeRef.current = clipTime;
-      setPreviewTime(clipTime);
-      syncExtractedPreviewAudio(clipTime, false, false);
-      syncAdditionalAudioTracks(clipTime, false, false);
+      return;
     }
   };
   const handleVideoSeeked = (videoTime: number) => {
+    if (timelineDraggingRef.current) return;
     const clipTime = clipTimeFromVideoTime(videoTime);
-    previewTimeRef.current = clipTime;
-    setPreviewTime(clipTime);
+    if (previewPlayingRef.current) {
+      previewTimeRef.current = clipTime;
+      setPreviewTime(clipTime);
+    }
     const isPlaying = previewPlayingRef.current;
-    syncExtractedPreviewAudio(clipTime, isPlaying, true);
-    syncAdditionalAudioTracks(clipTime, isPlaying, true);
+    syncExtractedPreviewAudio(previewTimeRef.current, isPlaying, true);
+    syncAdditionalAudioTracks(previewTimeRef.current, isPlaying, true);
   };
   const seekPreviewTo = (clipTime: number) => {
     const safeTime = clampClipTime(clipTime);
@@ -7338,7 +7339,7 @@ export function TransformationPage() {
     stopPreviewClock();
     previewClockLastUpdateRef.current = performance.now();
     const updateClock = (timestamp: number) => {
-      if (!previewPlayingRef.current) {
+      if (timelineDraggingRef.current || !previewPlayingRef.current) {
         return;
       }
 
@@ -7448,6 +7449,7 @@ export function TransformationPage() {
     }
   };
   const handleVideoEnded = () => {
+    if (timelineDraggingRef.current) return;
     const nextSeg = activeVideoSegment ? getNextVideoSegment(videoSegments, activeVideoSegment.id) : null;
     if (import.meta.env.DEV) {
       console.log("[video_element_ended]", {
@@ -8289,9 +8291,8 @@ export function TransformationPage() {
   const handleTimelinePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
-    const video = previewVideoRef.current;
+    handlePreviewPause();
     timelineDraggingRef.current = true;
-    video?.pause();
     const target = timelineTimeFromPointer(event);
     setTimelineHover(target);
     seekPreviewTo(target.time);
@@ -8300,6 +8301,9 @@ export function TransformationPage() {
     const target = timelineTimeFromPointer(event);
     setTimelineHover(target);
     if (timelineDraggingRef.current) {
+      if (previewPlayingRef.current) {
+        handlePreviewPause();
+      }
       seekPreviewTo(target.time);
     }
   };
