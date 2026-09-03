@@ -631,9 +631,12 @@ export function EditorMediaImportControls({
               aria-label={config.label}
               className="sr-only"
               disabled={disabled}
+              multiple
               onChange={(event) => {
-                const file = event.currentTarget.files?.[0];
-                if (file) void onImport(kind, file);
+                const files = Array.from(event.currentTarget.files ?? []);
+                for (const file of files) {
+                  void onImport(kind, file);
+                }
                 event.currentTarget.value = "";
               }}
               type="file"
@@ -5802,44 +5805,79 @@ export function TransformationPage() {
     await editorMediaQuery.refetch();
   };
 
+  const importEditorMediaFiles = async (
+    files: File[],
+  ) => {
+    if (!files || files.length === 0) return;
+    setEditorMediaUploading(true);
+    let successCount = 0;
+    let failCount = 0;
+    let lastSuccessfulAsset: EditorMediaAsset | null = null;
+
+    for (const file of files) {
+      const ext = file.name.split(".").pop()?.toLowerCase() || "";
+      const isAudio = ["mp3", "wav", "m4a"].includes(ext) || file.type.startsWith("audio/");
+      const isImage = ["png", "jpg", "jpeg", "webp", "gif"].includes(ext) || file.type.startsWith("image/");
+      const kind: EditorMediaKind = isAudio ? "audio" : isImage ? "image" : "video";
+      setEditorMediaUploadKind(kind);
+      try {
+        const asset = await uploadMedia<EditorMediaAsset>(
+          `/api/transformations/${transformationId}/media`,
+          file,
+          kind,
+        );
+        successCount++;
+        lastSuccessfulAsset = asset;
+        if (import.meta.env.DEV) {
+          console.log("[media_import_success]", {
+            asset_id: asset.asset_id,
+            filename: asset.name,
+            type: asset.kind,
+          });
+        }
+      } catch (importError) {
+        failCount++;
+        console.error("[media_import_error]", file.name, importError);
+      }
+    }
+
+    const refreshed = await editorMediaQuery.refetch();
+    setMediaDirectory("project_media");
+    if (lastSuccessfulAsset) {
+      setSelectedMediaAssetId(lastSuccessfulAsset.asset_id);
+    }
+
+    if (import.meta.env.DEV) {
+      console.log("[media_library_refreshed]", {
+        total_assets: (refreshed.data || []).length,
+        asset_ids: (refreshed.data || []).map((a) => a.asset_id),
+        success_count: successCount,
+        fail_count: failCount,
+      });
+    }
+
+    if (failCount === 0) {
+      setMessage(
+        successCount === 1 && lastSuccessfulAsset
+          ? `Media ${lastSuccessfulAsset.name} berhasil ditambahkan ke library.`
+          : `${successCount} media berhasil ditambahkan ke library.`
+      );
+    } else if (successCount > 0) {
+      setMessage(`${successCount} media berhasil diimport, ${failCount} gagal.`);
+    } else {
+      setMessage("Semua file media gagal diimport.");
+    }
+
+    setEditorMediaUploading(false);
+    setEditorMediaUploadKind(null);
+  };
+
   const importEditorMedia = async (
     kind: "video" | "audio" | "image",
     file?: File,
   ) => {
     if (!file) return;
-    setEditorMediaUploading(true);
-    setEditorMediaUploadKind(kind);
-    try {
-      const asset = await uploadMedia<EditorMediaAsset>(
-        `/api/transformations/${transformationId}/media`,
-        file,
-        kind,
-      );
-      // Library-first: refetch media assets and switch to Project Media view
-      const refreshed = await editorMediaQuery.refetch();
-      setMediaDirectory("project_media");
-      setSelectedMediaAssetId(asset.asset_id);
-      setMessage(`Media ${asset.name} berhasil ditambahkan ke library.`);
-
-      if (import.meta.env.DEV) {
-        console.log("[media_import_success]", {
-          asset_id: asset.asset_id,
-          filename: asset.name,
-          type: asset.kind,
-        });
-        console.log("[media_library_refreshed]", {
-          total_assets: (refreshed.data || []).length,
-          asset_ids: (refreshed.data || []).map((a) => a.asset_id),
-        });
-      }
-    } catch (importError) {
-      setMessage(
-        importError instanceof Error ? importError.message : "Import media gagal.",
-      );
-    } finally {
-      setEditorMediaUploading(false);
-      setEditorMediaUploadKind(null);
-    }
+    await importEditorMediaFiles([file]);
   };
   const handleAdditionalAudioUpload = async (file: File | undefined) => {
     if (!file) return;
@@ -9084,13 +9122,9 @@ export function TransformationPage() {
                         className="sr-only"
                         disabled={editorMediaUploading}
                         onChange={(e) => {
-                          const file = e.currentTarget.files?.[0];
-                          if (file) {
-                            const ext = file.name.split(".").pop()?.toLowerCase() || "";
-                            const isAudio = ["mp3", "wav", "m4a"].includes(ext) || file.type.startsWith("audio/");
-                            const isImage = ["png", "jpg", "jpeg", "webp", "gif"].includes(ext) || file.type.startsWith("image/");
-                            const kind: EditorMediaKind = isAudio ? "audio" : isImage ? "image" : "video";
-                            void importEditorMedia(kind, file);
+                          const files = Array.from(e.currentTarget.files ?? []);
+                          if (files.length > 0) {
+                            void importEditorMediaFiles(files);
                           }
                           e.currentTarget.value = "";
                         }}
@@ -9194,13 +9228,9 @@ export function TransformationPage() {
                             className="sr-only"
                             disabled={editorMediaUploading}
                             onChange={(e) => {
-                              const file = e.currentTarget.files?.[0];
-                              if (file) {
-                                const ext = file.name.split(".").pop()?.toLowerCase() || "";
-                                const isAudio = ["mp3", "wav", "m4a"].includes(ext) || file.type.startsWith("audio/");
-                                const isImage = ["png", "jpg", "jpeg", "webp", "gif"].includes(ext) || file.type.startsWith("image/");
-                                const kind: EditorMediaKind = isAudio ? "audio" : isImage ? "image" : "video";
-                                void importEditorMedia(kind, file);
+                              const files = Array.from(e.currentTarget.files ?? []);
+                              if (files.length > 0) {
+                                void importEditorMediaFiles(files);
                               }
                               e.currentTarget.value = "";
                             }}

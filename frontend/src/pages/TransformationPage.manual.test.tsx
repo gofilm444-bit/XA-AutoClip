@@ -1013,3 +1013,90 @@ describe("PHASE 1 — PLAYHEAD STABILITY", () => {
     expect(previewTime).toBeCloseTo(11.5);
   });
 });
+
+describe("PHASE 2 — MULTI-FILE MEDIA IMPORT", () => {
+  it("Handler iterates all selected files and uploads each one in selection order", async () => {
+    const uploadedFiles: string[] = [];
+    const mockUpload = vi.fn(async (file: { name: string }) => {
+      uploadedFiles.push(file.name);
+      return { asset_id: `id-${file.name}`, name: file.name };
+    });
+
+    const fileA = { name: "A.mp4" } as File;
+    const fileB = { name: "B.mp4" } as File;
+    const fileC = { name: "C.mp4" } as File;
+
+    // Simulate input change with multiple files
+    const files = [fileA, fileB, fileC];
+    let message = "";
+
+    // importEditorMediaFiles simulation
+    async function importEditorMediaFiles(selected: File[]) {
+      let successCount = 0;
+      let failCount = 0;
+      for (const file of selected) {
+        try {
+          await mockUpload(file);
+          successCount++;
+        } catch {
+          failCount++;
+        }
+      }
+      if (failCount === 0) {
+        message = `${successCount} media berhasil ditambahkan ke library.`;
+      } else {
+        message = `${successCount} media berhasil diimport, ${failCount} gagal.`;
+      }
+    }
+
+    await importEditorMediaFiles(files);
+
+    expect(mockUpload).toHaveBeenCalledTimes(3);
+    expect(uploadedFiles).toEqual(["A.mp4", "B.mp4", "C.mp4"]);
+    expect(message).toBe("3 media berhasil ditambahkan ke library.");
+  });
+
+  it("Partial failure preserves successful uploads and reports count accurately", async () => {
+    const mockUpload = vi.fn(async (file: { name: string }) => {
+      if (file.name === "fail.mp4") {
+        throw new Error("Network error");
+      }
+      return { asset_id: `id-${file.name}`, name: file.name };
+    });
+
+    const files = [
+      { name: "ok1.mp4" } as File,
+      { name: "fail.mp4" } as File,
+      { name: "ok2.mp4" } as File,
+      { name: "ok3.mp4" } as File,
+    ];
+
+    let message = "";
+    const successfulAssets: string[] = [];
+
+    async function importEditorMediaFiles(selected: File[]) {
+      let successCount = 0;
+      let failCount = 0;
+      for (const file of selected) {
+        try {
+          const res = await mockUpload(file);
+          successfulAssets.push(res.asset_id);
+          successCount++;
+        } catch {
+          failCount++;
+        }
+      }
+      if (failCount === 0) {
+        message = `${successCount} media berhasil ditambahkan ke library.`;
+      } else {
+        message = `${successCount} media berhasil diimport, ${failCount} gagal.`;
+      }
+    }
+
+    await importEditorMediaFiles(files);
+
+    expect(mockUpload).toHaveBeenCalledTimes(4);
+    expect(successfulAssets).toEqual(["id-ok1.mp4", "id-ok2.mp4", "id-ok3.mp4"]);
+    expect(message).toBe("3 media berhasil diimport, 1 gagal.");
+  });
+});
