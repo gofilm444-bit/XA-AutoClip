@@ -37,6 +37,7 @@ from app.schemas.api import (
     EditorAutoCaptionRequest,
     EditorAutoCaptionResponse,
     EditorMediaAssetRead,
+    AddMediaToTimelineRequest,
     HookTextRead,
     JobRead,
     ManualEditorRead,
@@ -1656,6 +1657,7 @@ def transformation_media_asset(
 def add_media_to_timeline(
     transformation_id: uuid.UUID,
     asset_id: uuid.UUID,
+    payload: AddMediaToTimelineRequest | None = None,
     db: Session = Depends(get_db),
 ):
     plan = require(TransformationPlan, db, transformation_id)
@@ -1718,15 +1720,14 @@ def add_media_to_timeline(
             )
             speed = max(0.25, float(existing.get("speed") or 1.0))
             last_video_end += source_duration / speed
-        segment_start = round(last_video_end, 3)
-        segment_end = round(last_video_end + duration, 3)
 
-        new_segment = {
-            "id": f"manual-video-{asset.id}-{len(existing_sequence) + 1}",
+        insert_at = float(payload.insert_at) if payload and payload.insert_at is not None else None
+
+        new_segment_id = f"manual-video-{asset.id}-{len(existing_sequence) + 1}"
+        new_segment_base = {
+            "id": new_segment_id,
             "source_start": 0.0,
             "source_end": round(duration, 3),
-            "start": segment_start,
-            "end": segment_end,
             "duration": round(duration, 3),
             "speed": 1.0,
             "asset_id": str(asset.id),
@@ -1735,8 +1736,71 @@ def add_media_to_timeline(
             "source_url": f"/api/transformations/{transformation_id}/media/{asset.id}/source",
         }
 
-        sequence = [*existing_sequence, new_segment]
-        total_duration = round(segment_end, 3)
+        if insert_at is None or not existing_sequence or insert_at >= last_video_end - 0.01:
+            segment_start = round(last_video_end, 3)
+            segment_end = round(last_video_end + duration, 3)
+            new_segment = {**new_segment_base, "start": segment_start, "end": segment_end}
+            sequence = [*existing_sequence, new_segment]
+            total_duration = segment_end
+        else:
+            safe_insert_at = max(0.0, insert_at)
+            new_segment = {
+                **new_segment_base,
+                "start": round(safe_insert_at, 3),
+                "end": round(safe_insert_at + duration, 3),
+            }
+            sequence = []
+            inserted = False
+            for seg in existing_sequence:
+                seg_start = float(seg.get("start") or 0.0)
+                seg_end = float(
+                    seg.get("end")
+                    or (seg_start + (float(seg.get("source_end", 0.0)) - float(seg.get("source_start", 0.0))))
+                )
+                speed = max(0.25, float(seg.get("speed") or 1.0))
+
+                if not inserted and abs(safe_insert_at - seg_start) <= 0.01:
+                    sequence.append(new_segment)
+                    inserted = True
+                    shifted_seg = dict(seg)
+                    shifted_seg["start"] = round(seg_start + duration, 3)
+                    shifted_seg["end"] = round(seg_end + duration, 3)
+                    sequence.append(shifted_seg)
+                    continue
+
+                if not inserted and (seg_start + 0.01 < safe_insert_at < seg_end - 0.01):
+                    dt_left = safe_insert_at - seg_start
+                    ds_left = dt_left * speed
+                    left_seg = dict(seg)
+                    left_seg["source_end"] = round(float(seg.get("source_start", 0.0)) + ds_left, 3)
+                    left_seg["end"] = round(safe_insert_at, 3)
+                    left_seg["duration"] = round(dt_left, 3)
+
+                    dt_right = seg_end - safe_insert_at
+                    right_seg = dict(seg)
+                    right_seg["id"] = f"{seg.get('id', 'seg')}-split-{uuid.uuid4().hex[:8]}"
+                    right_seg["source_start"] = round(float(seg.get("source_start", 0.0)) + ds_left, 3)
+                    right_seg["start"] = round(safe_insert_at + duration, 3)
+                    right_seg["end"] = round(safe_insert_at + duration + dt_right, 3)
+                    right_seg["duration"] = round(dt_right, 3)
+
+                    sequence.extend([left_seg, new_segment, right_seg])
+                    inserted = True
+                    continue
+
+                if inserted:
+                    shifted_seg = dict(seg)
+                    shifted_seg["start"] = round(seg_start + duration, 3)
+                    shifted_seg["end"] = round(seg_end + duration, 3)
+                    sequence.append(shifted_seg)
+                else:
+                    sequence.append(dict(seg))
+
+            if not inserted:
+                sequence.append(new_segment)
+            total_duration = max([float(s.get("end", 0.0)) for s in sequence], default=round(duration, 3))
+            segment_start = new_segment["start"]
+            segment_end = new_segment["end"]
 
         if not candidate.short_source_clip_path or not Path(candidate.short_source_clip_path).is_file():
             candidate.short_source_clip_path = asset.storage_path

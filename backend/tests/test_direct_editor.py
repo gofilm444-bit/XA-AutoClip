@@ -363,3 +363,63 @@ def test_normalize_media_sequence_preserves_all_metadata():
     assert item["locked"] is True
     assert item["visible"] is False
     assert item["muted"] is True
+
+
+def test_add_to_timeline_with_insert_at_playhead(monkeypatch):
+    engine, testing_session = _make_engine()
+    monkeypatch.setattr(
+        routes,
+        "probe_media",
+        lambda _path: SimpleNamespace(duration=4.0, width=1920, height=1080),
+    )
+    with _client(testing_session) as client:
+        body = client.post("/api/projects/manual-editor/blank").json()
+        transformation_id = body["transformation_id"]
+
+        # Upload Video A (4s)
+        asset_a = client.post(
+            f"/api/transformations/{transformation_id}/media",
+            files={"file": ("video_a.mp4", io.BytesIO(b"data_a"), "video/mp4")},
+            data={"kind": "video"},
+        ).json()
+        # Add A -> timeline 0-4
+        client.post(
+            f"/api/transformations/{transformation_id}/media/{asset_a['asset_id']}/add-to-timeline",
+            json={"insert_at": 0.0},
+        )
+
+        # Upload Video B (4s)
+        asset_b = client.post(
+            f"/api/transformations/{transformation_id}/media",
+            files={"file": ("video_b.mp4", io.BytesIO(b"data_b"), "video/mp4")},
+            data={"kind": "video"},
+        ).json()
+
+        # Insert B at playhead = 2.0 (inside Video A)
+        res_insert = client.post(
+            f"/api/transformations/{transformation_id}/media/{asset_b['asset_id']}/add-to-timeline",
+            json={"insert_at": 2.0},
+        ).json()
+
+        seq = res_insert["clipper_style_config"]["video_sequence"]
+        assert len(seq) == 3
+        # A-left: 0-2
+        assert seq[0]["asset_id"] == asset_a["asset_id"]
+        assert seq[0]["start"] == 0.0
+        assert seq[0]["end"] == 2.0
+        assert seq[0]["source_start"] == 0.0
+        assert seq[0]["source_end"] == 2.0
+
+        # B: 2-6
+        assert seq[1]["asset_id"] == asset_b["asset_id"]
+        assert seq[1]["start"] == 2.0
+        assert seq[1]["end"] == 6.0
+        assert seq[1]["source_start"] == 0.0
+        assert seq[1]["source_end"] == 4.0
+
+        # A-right: 6-8
+        assert seq[2]["asset_id"] == asset_a["asset_id"]
+        assert seq[2]["start"] == 6.0
+        assert seq[2]["end"] == 8.0
+        assert seq[2]["source_start"] == 2.0
+        assert seq[2]["source_end"] == 4.0

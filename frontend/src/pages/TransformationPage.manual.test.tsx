@@ -15,6 +15,8 @@ import {
   trimMediaSegmentRight,
   effectiveMediaDuration,
   sameMediaSource,
+  insertMediaSegmentAtTime,
+  type MediaSequenceSegment,
 } from "../utils/manualEditor";
 
 function transformation(manual: boolean, withVideo = false, secondVideo = false) {
@@ -1098,5 +1100,107 @@ describe("PHASE 2 — MULTI-FILE MEDIA IMPORT", () => {
     expect(mockUpload).toHaveBeenCalledTimes(4);
     expect(successfulAssets).toEqual(["id-ok1.mp4", "id-ok2.mp4", "id-ok3.mp4"]);
     expect(message).toBe("3 media berhasil diimport, 1 gagal.");
+  });
+});
+
+describe("PHASE 3 — ADD MEDIA TO TIMELINE AT PLAYHEAD", () => {
+  it("TEST A: Insert at boundary between clips shifts subsequent clips without overlap", () => {
+    // A = 0-8, B = 8-15
+    const seq: MediaSequenceSegment[] = [
+      { id: "seg-a", asset_id: "asset-a", sourceStart: 0, sourceEnd: 8, start: 0, end: 8, duration: 8, speed: 1 },
+      { id: "seg-b", asset_id: "asset-b", sourceStart: 0, sourceEnd: 7, start: 8, end: 15, duration: 7, speed: 1 },
+    ];
+
+    const segC: MediaSequenceSegment = {
+      id: "seg-c",
+      asset_id: "asset-c",
+      sourceStart: 0,
+      sourceEnd: 4,
+      duration: 4,
+      speed: 1,
+    };
+
+    // Playhead = 8
+    const result = insertMediaSegmentAtTime(seq, segC, 8.0);
+
+    expect(result.length).toBe(3);
+    // A = 0-8
+    expect(result[0].id).toBe("seg-a");
+    expect(result[0].start).toBe(0);
+    expect(result[0].end).toBe(8);
+
+    // C = 8-12
+    expect(result[1].id).toBe("seg-c");
+    expect(result[1].start).toBe(8);
+    expect(result[1].end).toBe(12);
+
+    // B = 12-19 (shifted right by duration of C)
+    expect(result[2].id).toBe("seg-b");
+    expect(result[2].start).toBe(12);
+    expect(result[2].end).toBe(19);
+  });
+
+  it("TEST B: Insert inside existing clip splits clip and preserves source continuity and asset identity", () => {
+    // A: timeline 0-8, source 0-8
+    const seq: MediaSequenceSegment[] = [
+      { id: "seg-a", asset_id: "asset-a", sourceStart: 0, sourceEnd: 8, start: 0, end: 8, duration: 8, speed: 1 },
+    ];
+
+    // B duration: 3 sec
+    const segB: MediaSequenceSegment = {
+      id: "seg-b",
+      asset_id: "asset-b",
+      sourceStart: 0,
+      sourceEnd: 3,
+      duration: 3,
+      speed: 1,
+    };
+
+    // Playhead = 4
+    const result = insertMediaSegmentAtTime(seq, segB, 4.0);
+
+    expect(result.length).toBe(3);
+
+    // A-left: timeline 0-4, source 0-4, asset_id = asset-a
+    expect(result[0].asset_id).toBe("asset-a");
+    expect(result[0].start).toBe(0);
+    expect(result[0].end).toBe(4);
+    expect(result[0].sourceStart).toBe(0);
+    expect(result[0].sourceEnd).toBe(4);
+
+    // B: timeline 4-7, source 0-3, asset_id = asset-b
+    expect(result[1].asset_id).toBe("asset-b");
+    expect(result[1].start).toBe(4);
+    expect(result[1].end).toBe(7);
+    expect(result[1].sourceStart).toBe(0);
+    expect(result[1].sourceEnd).toBe(3);
+
+    // A-right: timeline 7-11, source 4-8, asset_id = asset-a
+    expect(result[2].asset_id).toBe("asset-a");
+    expect(result[2].start).toBe(7);
+    expect(result[2].end).toBe(11);
+    expect(result[2].sourceStart).toBe(4);
+    expect(result[2].sourceEnd).toBe(8);
+  });
+
+  it("Insert beyond timeline duration appends to end seamlessly", () => {
+    const seq: MediaSequenceSegment[] = [
+      { id: "seg-a", asset_id: "asset-a", sourceStart: 0, sourceEnd: 5, start: 0, end: 5, duration: 5, speed: 1 },
+    ];
+    const segB: MediaSequenceSegment = {
+      id: "seg-b",
+      asset_id: "asset-b",
+      sourceStart: 0,
+      sourceEnd: 3,
+      duration: 3,
+      speed: 1,
+    };
+
+    const result = insertMediaSegmentAtTime(seq, segB, 10.0);
+    expect(result.length).toBe(2);
+    expect(result[0].start).toBe(0);
+    expect(result[0].end).toBe(5);
+    expect(result[1].start).toBe(5);
+    expect(result[1].end).toBe(8);
   });
 });

@@ -340,3 +340,155 @@ export function sameMediaSource(urlA?: string | null, urlB?: string | null, base
     return false;
   }
 }
+
+export function insertMediaSegmentAtTime(
+  sequence: MediaSequenceSegment[],
+  newSegment: MediaSequenceSegment,
+  insertAt?: number,
+): MediaSequenceSegment[] {
+  const normSeq = sequence.map((s) => ({ ...s }));
+  const duration = Number((newSegment.duration ?? effectiveMediaDuration(newSegment)).toFixed(3));
+  if (duration <= 0) return sequence;
+
+  // If sequence is empty, start at 0
+  if (normSeq.length === 0) {
+    return [
+      {
+        ...newSegment,
+        start: 0,
+        end: duration,
+        duration,
+      },
+    ];
+  }
+
+  // Calculate total duration of existing sequence
+  const totalDuration = getTimelineDuration(normSeq);
+
+  // If insertAt is undefined, null, negative, or >= totalDuration, append to the end
+  if (insertAt === undefined || insertAt === null || insertAt >= totalDuration - 0.01) {
+    const start = Number(totalDuration.toFixed(3));
+    const end = Number((start + duration).toFixed(3));
+    return [
+      ...normSeq,
+      {
+        ...newSegment,
+        start,
+        end,
+        duration,
+      },
+    ];
+  }
+
+  const safeInsertAt = Math.max(0, insertAt);
+
+  // Check if safeInsertAt is at the start (<= 0.01)
+  if (safeInsertAt <= 0.01) {
+    const shifted = normSeq.map((seg) => ({
+      ...seg,
+      start: Number(((seg.start ?? 0) + duration).toFixed(3)),
+      end: Number(((seg.end ?? 0) + duration).toFixed(3)),
+    }));
+    return [
+      {
+        ...newSegment,
+        start: 0,
+        end: duration,
+        duration,
+      },
+      ...shifted,
+    ];
+  }
+
+  // Check if insertAt falls on a boundary between clips or inside a clip
+  const result: MediaSequenceSegment[] = [];
+  let inserted = false;
+
+  for (let i = 0; i < normSeq.length; i++) {
+    const seg = normSeq[i];
+    const segStart = seg.start ?? 0;
+    const segEnd = seg.end ?? (segStart + effectiveMediaDuration(seg));
+    const speed = seg.speed ?? 1.0;
+
+    // Check if insertAt is before this clip (at boundary)
+    if (!inserted && Math.abs(safeInsertAt - segStart) <= 0.01) {
+      result.push({
+        ...newSegment,
+        start: Number(safeInsertAt.toFixed(3)),
+        end: Number((safeInsertAt + duration).toFixed(3)),
+        duration,
+      });
+      inserted = true;
+      result.push({
+        ...seg,
+        start: Number((segStart + duration).toFixed(3)),
+        end: Number((segEnd + duration).toFixed(3)),
+      });
+      continue;
+    }
+
+    // Check if insertAt is inside this clip (strictly between segStart and segEnd)
+    if (!inserted && safeInsertAt > segStart + 0.01 && safeInsertAt < segEnd - 0.01) {
+      const dtLeft = safeInsertAt - segStart;
+      const dSourceLeft = dtLeft * speed;
+
+      // Left split
+      const leftSeg: MediaSequenceSegment = {
+        ...seg,
+        id: seg.id,
+        sourceStart: Number(seg.sourceStart.toFixed(3)),
+        sourceEnd: Number((seg.sourceStart + dSourceLeft).toFixed(3)),
+        start: Number(segStart.toFixed(3)),
+        end: Number(safeInsertAt.toFixed(3)),
+        duration: Number(dtLeft.toFixed(3)),
+      };
+
+      // New inserted clip
+      const midSeg: MediaSequenceSegment = {
+        ...newSegment,
+        start: Number(safeInsertAt.toFixed(3)),
+        end: Number((safeInsertAt + duration).toFixed(3)),
+        duration,
+      };
+
+      // Right split
+      const dtRight = segEnd - safeInsertAt;
+      const rightSeg: MediaSequenceSegment = {
+        ...seg,
+        id: `${seg.id}-split-${Date.now()}`,
+        sourceStart: Number((seg.sourceStart + dSourceLeft).toFixed(3)),
+        sourceEnd: Number(seg.sourceEnd.toFixed(3)),
+        start: Number((safeInsertAt + duration).toFixed(3)),
+        end: Number((safeInsertAt + duration + dtRight).toFixed(3)),
+        duration: Number(dtRight.toFixed(3)),
+      };
+
+      result.push(leftSeg, midSeg, rightSeg);
+      inserted = true;
+      continue;
+    }
+
+    if (inserted) {
+      result.push({
+        ...seg,
+        start: Number((segStart + duration).toFixed(3)),
+        end: Number((segEnd + duration).toFixed(3)),
+      });
+    } else {
+      result.push(seg);
+    }
+  }
+
+  if (!inserted) {
+    const lastSeg = result[result.length - 1];
+    const start = lastSeg ? (lastSeg.end ?? 0) : 0;
+    result.push({
+      ...newSegment,
+      start: Number(start.toFixed(3)),
+      end: Number((start + duration).toFixed(3)),
+      duration,
+    });
+  }
+
+  return result;
+}

@@ -46,6 +46,7 @@ import {
   trimMediaSegmentRight,
   effectiveMediaDuration,
   sameMediaSource,
+  insertMediaSegmentAtTime,
   type MediaSequenceSegment,
 } from "../utils/manualEditor";
 import {
@@ -5717,26 +5718,30 @@ export function TransformationPage() {
     }
     if (asset.kind === "video") {
       const duration = Math.max(0.1, Number(asset.duration_seconds || 5.0));
-      const start = Number(videoLayout.duration.toFixed(3));
+      const insertAt = previewTime;
       const newSegment: MediaSequenceSegment = {
         id: `media-${asset.asset_id.slice(0, 8)}-${Date.now()}`,
         sourceStart: 0.0,
         sourceEnd: duration,
-        start,
-        end: Number((start + duration).toFixed(3)),
+        start: insertAt,
+        end: Number((insertAt + duration).toFixed(3)),
         duration: Number(duration.toFixed(3)),
         speed: 1,
         asset_id: asset.asset_id,
         name: asset.name,
         source_url: asset.source_url || mediaUrl(transformationId, asset.asset_id),
       };
-      const nextSequence = [...videoSequence, newSegment];
+      const nextSequence = insertMediaSegmentAtTime(videoSequence, newSegment, insertAt);
       commitMediaSequence(nextSequence, effectTimeline, "video");
-      setMessage(`${asset.name} ditambahkan ke timeline.`);
+      setMessage(`${asset.name} ditambahkan ke timeline pada playhead (${insertAt.toFixed(1)}s).`);
       try {
         const saved = await api<Transformation>(
           `/api/transformations/${transformationId}/media/${asset.asset_id}/add-to-timeline`,
-          { method: "POST" },
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ insert_at: insertAt }),
+          },
         );
         setDraft(saved);
         if (import.meta.env.DEV) {

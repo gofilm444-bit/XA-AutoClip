@@ -235,6 +235,10 @@ class EditorMediaAssetRead(BaseModel):
     mime_type: str
 
 
+class AddMediaToTimelineRequest(BaseModel):
+    insert_at: float | None = None
+
+
 class TransformationContextRead(BaseModel):
     project_title: str
     content_type: ContentType
