@@ -9,6 +9,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -33,6 +34,15 @@ import type {
 } from "../types";
 import { projectCaptionCues } from "../utils/captionProjection";
 import { sanitizeDownloadFilename } from "../utils/downloadFilename";
+import {
+  supportsDirectoryPicker,
+  saveLastExportDirectory,
+  loadLastExportDirectory,
+  saveExportLocationMode,
+  loadExportLocationMode,
+  saveBlobToDirectory,
+  type ExportSaveLocationMode,
+} from "../utils/exportDirectoryStorage";
 import {
   getActiveVideoSegment,
   getNextVideoSegment,
@@ -3606,13 +3616,13 @@ export function TransformationPage() {
   const [audioUploading, setAudioUploading] = useState(false);
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const [exportResolution, setExportResolution] = useState<ExportResolution>("1080");
-  const [exportQuality, setExportQuality] = useState<ExportQuality>("higher");
+  const [exportQuality, setExportQuality] = useState<ExportQuality>("high");
   const [exportFrameRate, setExportFrameRate] = useState<"30" | "source">("30");
   const [exportFilename, setExportFilename] = useState("");
-  const [exportSaveLocation, setExportSaveLocation] = useState<"default" | "custom">("default");
-  const [customExportFolder, setCustomExportFolder] = useState("XA AutoClip Export");
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const [customExportDirHandle, setCustomExportDirHandle] = useState<any>(null);
+  const [exportSaveLocation, setExportSaveLocation] = useState<ExportSaveLocationMode>("default");
+  const [customExportFolder, setCustomExportFolder] = useState("");
+  const [customExportDirHandle, setCustomExportDirHandle] = useState<FileSystemDirectoryHandle | null>(null);
+  const isFolderPickerSupported = useMemo(() => supportsDirectoryPicker(), []);
   const [exportAwaitingHd, setExportAwaitingHd] = useState(false);
   const [exportRenderId, setExportRenderId] = useState<string | null>(null);
   const [exportValidatedRenderId, setExportValidatedRenderId] = useState<string | null>(null);
@@ -4812,13 +4822,37 @@ export function TransformationPage() {
   const editorSaveStatusTitle = saveFailure
     ? saveFailureMessage || "Penyimpanan gagal. Perubahan lokal tetap dipertahankan."
     : editorSaveStatusLabel;
-  const openExportModal = useCallback(() => {
+  const openExportModal = useCallback(async () => {
     const baseName = (uploadTitle || context.data?.candidate_title || "XA AutoClip")
       .replace(/[<>:"/\\|?*]+/g, " ")
       .replace(/\s+/g, " ")
       .trim();
     setExportFilename((current) => current || `${baseName || "XA AutoClip"}.mp4`);
     setExportTechnicalOpen(false);
+
+    if (supportsDirectoryPicker()) {
+      try {
+        const savedHandle = await loadLastExportDirectory();
+        const savedMode = await loadExportLocationMode();
+        if (savedHandle && savedHandle.name) {
+          setCustomExportDirHandle(savedHandle);
+          setCustomExportFolder(savedHandle.name);
+          if (savedMode === "custom" || savedMode === null) {
+            setExportSaveLocation("custom");
+          } else {
+            setExportSaveLocation("default");
+          }
+        } else {
+          setExportSaveLocation("default");
+        }
+      } catch (err) {
+        console.warn("[exportModal] Error loading export preferences:", err);
+        setExportSaveLocation("default");
+      }
+    } else {
+      setExportSaveLocation("default");
+    }
+
     setExportModalOpen(true);
   }, [context.data?.candidate_title, uploadTitle]);
   const closeExportModal = useCallback(() => {
@@ -7339,6 +7373,7 @@ export function TransformationPage() {
   previewPlayingRef.current = previewPlaying;
 
   const setPreviewTimeFromVideo = (_videoTime: number) => {
+    void _videoTime;
     if (timelineDraggingRef.current) return;
     // When playback is paused or scrubbing, user interaction is the sole authority on previewTime.
     // Video timeupdate while paused must never overwrite user-positioned playhead.
@@ -8549,57 +8584,59 @@ export function TransformationPage() {
   const exportResultUrl = exportReady && exportResultRender?.output_url
     ? `${downloadUrl(exportResultRender.id)}?render_id=${exportResultRender.id}&v=${exportResultRender.manifest_hash || exportResultRender.id}-${exportResultRender.file_size_bytes || 0}&t=${Date.now()}&output_filename=${encodeURIComponent(exportDownloadFilename)}`
     : null;
+  const handleSelectSaveLocationMode = (mode: ExportSaveLocationMode) => {
+    setExportSaveLocation(mode);
+    void saveExportLocationMode(mode);
+  };
+
   const handlePickExportDirectory = async () => {
+    if (!supportsDirectoryPicker()) return;
     try {
-      if ("showDirectoryPicker" in window) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const dirHandle = await (window as any).showDirectoryPicker();
-        if (dirHandle && dirHandle.name) {
-          setCustomExportDirHandle(dirHandle);
-          setCustomExportFolder(dirHandle.name);
-          setExportSaveLocation("custom");
-        }
-      } else {
-        const folder = window.prompt(
-          "Masukkan nama folder tujuan export:",
-          customExportFolder || "XA AutoClip Export",
-        );
-        if (folder && folder.trim()) {
-          setCustomExportFolder(folder.trim());
-          setExportSaveLocation("custom");
-        }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const handle = await (window as any).showDirectoryPicker();
+      if (handle && handle.name) {
+        setCustomExportDirHandle(handle);
+        setCustomExportFolder(handle.name);
+        setExportSaveLocation("custom");
+        await saveLastExportDirectory(handle);
+        await saveExportLocationMode("custom");
       }
     } catch (err: unknown) {
       if (err instanceof Error && err.name !== "AbortError") {
-        console.warn("Folder picker error:", err);
+        console.warn("Directory picker error:", err);
       }
+      // AbortError keeps current handle and folder name
     }
   };
 
   const handleDownloadOrSaveExport = async () => {
     if (!exportResultRender || !exportResultUrl) return;
-    console.info("[XA AutoClip] export_download", {
-      download_render_id: exportResultRender.id,
-      render_download_url: exportResultUrl,
-      save_location: exportSaveLocation,
-      folder: exportSaveLocation === "custom" ? customExportFolder : "default",
-    });
 
     if (exportSaveLocation === "custom" && customExportDirHandle) {
       try {
-        setMessage("Menyimpan video ke folder pilihan...");
-        const response = await fetch(exportResultUrl);
-        const blob = await response.blob();
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const fileHandle = await (customExportDirHandle as any).getFileHandle(exportDownloadFilename, { create: true });
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const writable = await fileHandle.createWritable();
-        await writable.write(blob);
-        await writable.close();
-        setMessage(`Video berhasil disimpan ke folder ${customExportFolder}!`);
-        return;
-      } catch (saveErr) {
-        console.warn("Direct save to folder failed, falling back to browser download:", saveErr);
+        setMessage(`Menyimpan video ke folder '${customExportDirHandle.name}'...`);
+        const res = await fetch(exportResultUrl);
+        if (!res.ok) {
+          throw new Error(`Gagal mengunduh file video (${res.status})`);
+        }
+        const blob = await res.blob();
+        const saveRes = await saveBlobToDirectory(
+          customExportDirHandle,
+          exportDownloadFilename,
+          blob,
+        );
+        if (saveRes.success) {
+          setMessage(`Video '${exportDownloadFilename}' berhasil disimpan ke folder '${customExportDirHandle.name}'!`);
+          return;
+        }
+        if (saveRes.cancelled) {
+          setMessage("Penyimpanan dibatalkan oleh pengguna.");
+          return;
+        }
+        setMessage(saveRes.error || "Gagal menyimpan ke folder pilihan.");
+      } catch (err) {
+        console.warn("Direct folder save failed, falling back to download:", err);
+        setMessage("Gagal menyimpan langsung ke folder. Mengunduh melalui browser...");
       }
     }
 
@@ -8609,7 +8646,7 @@ export function TransformationPage() {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    setMessage(`Video ${exportDownloadFilename} berhasil diunduh.`);
+    setMessage(`Video '${exportDownloadFilename}' berhasil diunduh.`);
   };
 
   const startExport = () => {
@@ -16338,219 +16375,385 @@ export function TransformationPage() {
         <div
           aria-label="Export video"
           aria-modal="true"
-          className="fixed inset-0 z-[120] flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
+          className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
           onMouseDown={(event) => {
             if (event.target === event.currentTarget) closeExportModal();
           }}
           role="dialog"
         >
-          <div className="max-h-[92vh] w-full max-w-2xl overflow-y-auto rounded-2xl border border-zinc-700 bg-[#202226] text-zinc-100 shadow-2xl">
-            {/* Header */}
-            <div className="flex items-center justify-between border-b border-zinc-700 px-6 py-4">
+          <div className="max-h-[92vh] w-full max-w-3xl overflow-y-auto rounded-2xl border border-zinc-700 bg-[#202226] text-zinc-100 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-zinc-700 px-5 py-4">
               <div>
-                <h2 className="text-base font-black tracking-wider uppercase text-zinc-100">EXPORT</h2>
+                <h2 className="text-lg font-black">Export</h2>
+                <p className="mt-1 text-xs font-semibold text-zinc-400">Atur kualitas file video Anda.</p>
               </div>
               <button
                 aria-label="Tutup modal export"
-                className="rounded-lg p-1.5 text-zinc-400 hover:bg-zinc-700 hover:text-white transition"
+                className="rounded-lg px-3 py-2 text-zinc-400 hover:bg-zinc-700 hover:text-white"
                 onClick={closeExportModal}
                 type="button"
               >
-                <span className="text-xl leading-none">&times;</span>
+                &times;
               </button>
             </div>
 
-            {/* Form Fields */}
-            <div className="p-6 space-y-4">
-              {/* Nama file */}
+            <div className="grid gap-5 p-5 md:grid-cols-[220px_minmax(0,1fr)]">
               <div>
-                <label className="block text-xs font-bold text-zinc-400 mb-1.5" htmlFor="export_filename">
-                  Nama file
-                </label>
-                <input
-                  className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 focus:border-cyan-400 focus:outline-none transition shadow-inner"
-                  id="export_filename"
-                  placeholder="project-final.mp4"
-                  onChange={(event) => setExportFilename(event.target.value)}
-                  value={exportFilename}
-                />
+                <div className="mx-auto aspect-[9/16] max-h-72 overflow-hidden rounded-xl bg-black ring-1 ring-zinc-700">
+                  <video
+                    className="h-full w-full object-cover"
+                    muted
+                    preload="metadata"
+                    src={exportResultUrl || sourceClipUrl}
+                  />
+                </div>
+                <div className="mt-3 grid gap-2 rounded-xl bg-zinc-800 p-3 text-xs">
+                  <div className="flex justify-between gap-3">
+                    <span className="text-zinc-400">Durasi</span>
+                    <strong>{formatTimeLabel(clipDuration)}</strong>
+                  </div>
+                  <div className="flex justify-between gap-3">
+                    <span className="text-zinc-400">Ukuran file</span>
+                    <strong>{exportFileSize}</strong>
+                  </div>
+                  <div className="flex justify-between gap-3">
+                    <span className="text-zinc-400">Format</span>
+                    <strong>MP4</strong>
+                  </div>
+                </div>
               </div>
 
-              {/* Resolusi */}
-              <div>
-                <label className="block text-xs font-bold text-zinc-400 mb-1.5" htmlFor="export_resolution">
-                  Resolusi
-                </label>
-                <select
-                  id="export_resolution"
-                  value={exportResolution}
-                  onChange={(e) => {
-                    setExportResolution(e.target.value as ExportResolution);
-                    setRenderDirty(true);
-                    setExportRenderId(null);
-                    setExportValidatedRenderId(null);
-                  }}
-                  className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3.5 py-2.5 text-sm font-medium text-zinc-100 focus:border-cyan-400 focus:outline-none transition cursor-pointer"
-                >
-                  <option value="1080">1080 × 1920</option>
-                  <option value="720">720 × 1280</option>
-                  <option value="540">540 × 960</option>
-                </select>
-              </div>
-
-              {/* Kualitas */}
-              <div>
-                <label className="block text-xs font-bold text-zinc-400 mb-1.5" htmlFor="export_quality">
-                  Kualitas
-                </label>
-                <select
-                  id="export_quality"
-                  value={exportQuality}
-                  onChange={(e) => {
-                    setExportQuality(e.target.value as ExportQuality);
-                    setRenderDirty(true);
-                    setExportRenderId(null);
-                    setExportValidatedRenderId(null);
-                  }}
-                  className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3.5 py-2.5 text-sm font-medium text-zinc-100 focus:border-cyan-400 focus:outline-none transition cursor-pointer"
-                >
-                  <option value="higher">Higher</option>
-                  <option value="high">High</option>
-                  <option value="standard">Standard</option>
-                </select>
-              </div>
-
-              {/* Format */}
-              <div>
-                <p className="text-xs font-bold text-zinc-400 mb-1.5">Format</p>
-                <p className="text-sm font-semibold text-zinc-200">
-                  MP4 • 30 fps
-                </p>
-              </div>
-
-              {/* Lokasi Penyimpanan */}
-              <div className="pt-1">
-                <p className="text-xs font-bold text-zinc-400 mb-2">Lokasi Penyimpanan</p>
-                <div className="space-y-2">
-                  <label className="flex items-center gap-2.5 text-sm text-zinc-200 cursor-pointer select-none">
-                    <input
-                      type="radio"
-                      name="exportSaveLocation"
-                      value="default"
-                      checked={exportSaveLocation === "default"}
-                      onChange={() => setExportSaveLocation("default")}
-                      className="w-4 h-4 text-cyan-500 bg-zinc-900 border-zinc-700 focus:ring-cyan-400 cursor-pointer"
-                    />
-                    <span>Folder Download Default</span>
+              <div className="space-y-4">
+                <div>
+                  <label className="text-xs font-black uppercase tracking-wide text-zinc-400" htmlFor="export_filename">
+                    Nama file/output
                   </label>
-                  <label className="flex items-center gap-2.5 text-sm text-zinc-200 cursor-pointer select-none">
-                    <input
-                      type="radio"
-                      name="exportSaveLocation"
-                      value="custom"
-                      checked={exportSaveLocation === "custom"}
-                      onChange={() => setExportSaveLocation("custom")}
-                      className="w-4 h-4 text-cyan-500 bg-zinc-900 border-zinc-700 focus:ring-cyan-400 cursor-pointer"
-                    />
-                    <span>Folder Pilihan</span>
-                  </label>
+                  <input
+                    className="mt-2 w-full rounded-lg border border-zinc-600 bg-zinc-900 px-3 py-2.5 text-sm text-white"
+                    id="export_filename"
+                    onChange={(event) => setExportFilename(event.target.value)}
+                    value={exportFilename}
+                  />
                 </div>
 
-                {exportSaveLocation === "custom" && (
-                  <div className="mt-3 rounded-xl border border-zinc-700/80 bg-zinc-900/90 p-3.5 space-y-2.5">
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="text-xs text-zinc-400">Jika Folder Pilihan:</span>
+                <div>
+                  <p className="text-xs font-black uppercase tracking-wide text-zinc-400">Resolution</p>
+                  <div className="mt-2 grid grid-cols-3 gap-2">
+                    {([
+                      ["540", "540x960", "Preview"],
+                      ["720", "720x1280", "HD"],
+                      ["1080", "1080x1920", "Full HD"],
+                    ] as const).map(([value, label, detail]) => (
                       <button
+                        className={`rounded-xl border p-3 text-left text-xs transition ${
+                          exportResolution === value
+                            ? "border-cyan-400 bg-cyan-400/10 text-cyan-200"
+                            : "border-zinc-700 bg-zinc-800 text-zinc-300 hover:border-zinc-500"
+                        }`}
+                        key={value}
+                        onClick={() => {
+                          setExportResolution(value);
+                          setRenderDirty(true);
+                          setExportRenderId(null);
+                          setExportValidatedRenderId(null);
+                        }}
                         type="button"
-                        onClick={handlePickExportDirectory}
-                        className="btn-secondary px-3 py-1.5 text-xs font-bold text-cyan-300 border-cyan-500/40 hover:bg-cyan-400/20 transition flex items-center gap-1.5"
                       >
-                        <span>📁</span>
-                        <span>Pilih Folder</span>
+                        <strong className="block">{label}</strong>
+                        <span className="mt-1 block text-[10px] opacity-70">{detail}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div>
+                  <p className="text-xs font-black uppercase tracking-wide text-zinc-400">Quality / Bitrate</p>
+                  <div className="mt-2 grid grid-cols-3 gap-2">
+                    {(["standard", "high", "higher"] as const).map((value) => (
+                      <button
+                        className={`rounded-lg border px-3 py-2 text-xs font-bold capitalize ${
+                          exportQuality === value
+                            ? "border-cyan-400 bg-cyan-400/10 text-cyan-200"
+                            : "border-zinc-700 bg-zinc-800 text-zinc-300"
+                        }`}
+                        key={value}
+                        onClick={() => {
+                          setExportQuality(value);
+                          setRenderDirty(true);
+                          setExportRenderId(null);
+                          setExportValidatedRenderId(null);
+                        }}
+                        type="button"
+                      >
+                        {value === "standard" ? "Standard" : value === "high" ? "High" : "Higher"}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-3 gap-3">
+                  <div>
+                    <label className="text-xs font-black uppercase tracking-wide text-zinc-400" htmlFor="export_format">Format</label>
+                    <select className="mt-2" disabled id="export_format" value="mp4">
+                      <option value="mp4">MP4</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs font-black uppercase tracking-wide text-zinc-400" htmlFor="export_fps">Frame rate</label>
+                    <select
+                      className="mt-2"
+                      id="export_fps"
+                      onChange={(event) => setExportFrameRate(event.target.value as "30" | "source")}
+                      value={exportFrameRate}
+                    >
+                      <option value="30">30fps</option>
+                      {sourceFrameRate && <option value="source">Source ({sourceFrameRate}fps)</option>}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs font-black uppercase tracking-wide text-zinc-400" htmlFor="export_codec">Codec</label>
+                    <select className="mt-2" disabled id="export_codec" value="h264">
+                      <option value="h264">H.264</option>
+                    </select>
+                  </div>
+                </div>
+
+                {/* Lokasi Penyimpanan */}
+                <div className="rounded-xl border border-zinc-700/80 bg-zinc-800/60 p-3.5 space-y-2.5">
+                  <p className="text-xs font-black uppercase tracking-wide text-zinc-400">
+                    Lokasi Penyimpanan
+                  </p>
+                  <div className="space-y-2">
+                    <label className="flex items-center gap-2 text-xs font-semibold text-zinc-200 cursor-pointer select-none">
+                      <input
+                        type="radio"
+                        name="exportSaveLocation"
+                        value="default"
+                        checked={exportSaveLocation === "default"}
+                        onChange={() => handleSelectSaveLocationMode("default")}
+                        className="w-3.5 h-3.5 text-cyan-400 bg-zinc-900 border-zinc-600 focus:ring-cyan-400 cursor-pointer"
+                      />
+                      <span>Folder Download Default</span>
+                    </label>
+
+                    <label className="flex items-center gap-2 text-xs font-semibold text-zinc-200 cursor-pointer select-none">
+                      <input
+                        type="radio"
+                        name="exportSaveLocation"
+                        value="custom"
+                        checked={exportSaveLocation === "custom"}
+                        disabled={!isFolderPickerSupported}
+                        onChange={() => handleSelectSaveLocationMode("custom")}
+                        className="w-3.5 h-3.5 text-cyan-400 bg-zinc-900 border-zinc-600 focus:ring-cyan-400 cursor-pointer disabled:opacity-40"
+                      />
+                      <span className={!isFolderPickerSupported ? "opacity-50" : ""}>
+                        Folder Pilihan
+                      </span>
+                    </label>
+                  </div>
+
+                  {!isFolderPickerSupported ? (
+                    <p className="text-[11px] text-zinc-500 italic">
+                      Pemilihan folder langsung tidak didukung browser ini.
+                    </p>
+                  ) : exportSaveLocation === "custom" && (
+                    <div className="pt-2 border-t border-zinc-700/60 space-y-2">
+                      {customExportFolder ? (
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="text-xs text-zinc-300">
+                            Folder: <strong className="text-cyan-300 font-bold">{customExportFolder}</strong>
+                          </span>
+                          <button
+                            type="button"
+                            onClick={handlePickExportDirectory}
+                            className="btn-secondary px-2.5 py-1 text-xs font-bold text-cyan-300 border-cyan-500/40 hover:bg-cyan-400/20 transition"
+                          >
+                            Ganti Folder
+                          </button>
+                        </div>
+                      ) : (
+                        <div>
+                          <button
+                            type="button"
+                            onClick={handlePickExportDirectory}
+                            className="btn-secondary px-3 py-1 text-xs font-bold text-cyan-300 border-cyan-500/40 hover:bg-cyan-400/20 transition flex items-center gap-1.5"
+                          >
+                            <span>📁</span>
+                            <span>Pilih Folder</span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {renderDirty && (
+                  <div className="rounded-xl border border-amber-400/40 bg-amber-950/40 p-3 text-xs font-bold text-amber-200 flex items-center gap-2">
+                    <span className="text-base">⚠️</span>
+                    <span>Ada perubahan, render ulang diperlukan</span>
+                  </div>
+                )}
+                <div className={`rounded-xl p-3 text-sm font-bold ${
+                  exportFailed ? "bg-red-950/60 text-red-200" : exportReady ? "bg-emerald-950/60 text-emerald-200" : "bg-zinc-800 text-zinc-300"
+                }`}>
+                  <div className="flex items-center justify-between gap-3">
+                    <span>{exportStatusText}</span>
+                    {exportInProgress && exportProgress !== null && (
+                      <span className="tabular-nums">{Math.round(exportProgress)}%</span>
+                    )}
+                  </div>
+                  {exportInProgress && (
+                    <div
+                      aria-label={exportProgress === null ? "Export sedang diproses" : `Progress export ${Math.round(exportProgress)}%`}
+                      className="mt-2 h-1.5 overflow-hidden rounded-full bg-zinc-700"
+                      role="progressbar"
+                      aria-valuemax={100}
+                      aria-valuemin={0}
+                      aria-valuenow={exportProgress === null ? undefined : Math.round(exportProgress)}
+                    >
+                      <div
+                        className={`h-full rounded-full bg-cyan-400 transition-[width] duration-500 ${exportProgress === null ? "w-2/3 animate-pulse" : ""}`}
+                        style={exportProgress === null ? undefined : { width: `${exportProgress}%` }}
+                      />
+                    </div>
+                  )}
+                </div>
+                {(editableCaptionCues.length > 0 ||
+                  editableEffectTimeline.some((event) =>
+                    ["hook_text", "pattern_interrupt", "keyword_popup"].includes(event.type),
+                  ) ||
+                  additionalAudioTracks.length > 0) && (
+                  <div className="rounded-lg border border-amber-400/30 bg-amber-950/35 p-3 text-xs text-amber-100">
+                    <p className="font-black">Catatan Kompatibilitas Export v1</p>
+                    <ul className="mt-1 list-disc space-y-1 pl-4 font-semibold text-amber-100/80">
+                      {editableCaptionCues.length > 0 && (
+                        <li>Mode tampilan Caption tertentu disesuaikan dengan pipeline render aktif.</li>
+                      )}
+                      {editableEffectTimeline.some((event) => event.type === "hook_text") && (
+                        <li>Teks, timing, dan gaya dasar hook tetap diekspor.</li>
+                      )}
+                      {editableEffectTimeline.some(
+                        (event) =>
+                          event.type === "keyword_popup" &&
+                          event.reason?.startsWith("sticker"),
+                      ) && (
+                        <li>Sticker overlay emoji aktif di Live Preview editor; render final akan mengikuti pipeline saat ini.</li>
+                      )}
+                      {editableEffectTimeline.some(
+                        (event) =>
+                          event.type === "pattern_interrupt" &&
+                          event.reason?.startsWith("transition"),
+                      ) && (
+                        <li>Efek transisi visual aktif pada Live Preview editor.</li>
+                      )}
+                      {additionalAudioTracks.length > 0 && (
+                        <li>Audio/SFX tambahan aktif di Live Preview editor dan akan dicampur bertahap pada update export pipeline.</li>
+                      )}
+                    </ul>
+                  </div>
+                )}
+                {exportWasClosedDuringTask && toolbarExportBusy && (
+                  <div className="rounded-xl border border-cyan-400/30 bg-cyan-950/30 p-3">
+                    <p className="text-sm font-black text-cyan-100">
+                      Export sebelumnya masih berjalan.
+                    </p>
+                    <p className="mt-1 text-xs font-semibold text-cyan-200/80">
+                      Export tetap berjalan di latar belakang. Backend saat ini belum mendukung pembatalan task yang aman.
+                    </p>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <button
+                        className="rounded-lg bg-cyan-400 px-3 py-2 text-xs font-black text-zinc-950"
+                        onClick={() => {
+                          setMessage("Memeriksa status export...");
+                          void renderStatus.refetch();
+                        }}
+                        type="button"
+                      >
+                        Lihat proses
+                      </button>
+                      <button
+                        className="rounded-lg border border-zinc-600 px-3 py-2 text-xs font-black text-zinc-500"
+                        disabled
+                        title="Tunggu proses sebelumnya selesai atau gagal sebelum memulai ulang."
+                        type="button"
+                      >
+                        Mulai ulang jika aman
                       </button>
                     </div>
-                    <div className="text-xs flex items-center justify-between gap-2 pt-2 border-t border-zinc-800">
-                      <span className="text-zinc-400">Folder dipilih:</span>
-                      <span className="font-bold text-cyan-300 truncate max-w-[280px]">
-                        {customExportFolder}
-                      </span>
-                    </div>
+                  </div>
+                )}
+                {toolbarExportBusy && !exportWasClosedDuringTask && (
+                  <p className="text-xs font-semibold text-zinc-400">
+                    Anda dapat menutup modal. Export tetap berjalan di latar belakang.
+                  </p>
+                )}
+                {exportLongRunning && (
+                  <p className="rounded-lg bg-amber-950/50 p-3 text-xs font-semibold text-amber-200">
+                    Export masih diproses. Cek log worker jika terlalu lama.
+                  </p>
+                )}
+                {exportResolution === "1080" && (
+                  <p className="text-xs font-semibold text-zinc-400">
+                    Export Full HD dapat memakan waktu lebih lama.
+                  </p>
+                )}
+                {toolbarRed && exportIsHd && (
+                  <p className="rounded-lg bg-amber-950/50 p-3 text-xs font-semibold text-amber-200">
+                    Export HD menunggu perbaikan transformasi. Pilih 540x960 untuk membuat export draft.
+                  </p>
+                )}
+                {exportFailed && (
+                  <div>
+                    <button
+                      className="text-xs font-bold text-red-300 underline"
+                      onClick={() => setExportTechnicalOpen((open) => !open)}
+                      type="button"
+                    >
+                      {exportTechnicalOpen ? "Sembunyikan detail teknis" : "Lihat detail teknis"}
+                    </button>
+                    {exportTechnicalOpen && (
+                      <pre className="mt-2 whitespace-pre-wrap rounded-lg bg-black/40 p-3 text-[10px] text-red-200">
+                        {queueRender.error?.message || exportResultRender?.error_message || "Proses export tidak dapat diselesaikan."}
+                      </pre>
+                    )}
                   </div>
                 )}
               </div>
-
-              {/* Status / Warnings / Progress (if exporting or dirty) */}
-              {renderDirty && (
-                <div className="rounded-xl border border-amber-400/40 bg-amber-950/40 p-3 text-xs font-bold text-amber-200 flex items-center gap-2">
-                  <span className="text-base">⚠️</span>
-                  <span>Ada perubahan, render ulang diperlukan</span>
-                </div>
-              )}
-              <div className={`rounded-xl p-3 text-sm font-bold ${
-                exportFailed ? "bg-red-950/60 text-red-200" : exportReady ? "bg-emerald-950/60 text-emerald-200" : "bg-zinc-800 text-zinc-300"
-              }`}>
-                <div className="flex items-center justify-between gap-3">
-                  <span>{exportStatusText}</span>
-                  {exportInProgress && exportProgress !== null && (
-                    <span className="tabular-nums">{Math.round(exportProgress)}%</span>
-                  )}
-                </div>
-                {exportInProgress && (
-                  <div
-                    aria-label={exportProgress === null ? "Export sedang diproses" : `Progress export ${Math.round(exportProgress)}%`}
-                    className="mt-2 h-1.5 overflow-hidden rounded-full bg-zinc-700"
-                    role="progressbar"
-                    aria-valuemax={100}
-                    aria-valuemin={0}
-                    aria-valuenow={exportProgress === null ? undefined : Math.round(exportProgress)}
-                  >
-                    <div
-                      className={`h-full rounded-full bg-cyan-400 transition-[width] duration-500 ${exportProgress === null ? "w-2/3 animate-pulse" : ""}`}
-                      style={exportProgress === null ? undefined : { width: `${exportProgress}%` }}
-                    />
-                  </div>
-                )}
-              </div>
-
-              {/* Error technical details */}
-              {exportFailed && (
-                <div>
-                  <button
-                    className="text-xs font-bold text-red-300 underline"
-                    onClick={() => setExportTechnicalOpen((open) => !open)}
-                    type="button"
-                  >
-                    {exportTechnicalOpen ? "Sembunyikan detail teknis" : "Lihat detail teknis"}
-                  </button>
-                  {exportTechnicalOpen && (
-                    <pre className="mt-2 whitespace-pre-wrap rounded-lg bg-black/40 p-3 text-[10px] text-red-200">
-                      {queueRender.error?.message || exportResultRender?.error_message || "Proses export tidak dapat diselesaikan."}
-                    </pre>
-                  )}
-                </div>
-              )}
             </div>
 
-            {/* Footer Buttons */}
-            <div className="flex items-center justify-end gap-3 border-t border-zinc-700 px-6 py-4 bg-[#1b1c20]">
+            <div className="flex flex-wrap items-center justify-end gap-3 border-t border-zinc-700 px-5 py-4">
               <button
-                className="btn-secondary px-5 py-2 text-sm font-semibold"
+                className="btn-secondary px-4 py-2 text-sm"
                 onClick={closeExportModal}
                 type="button"
               >
-                Batal
+                Tutup
               </button>
               {exportReady && exportResultRender && exportResultUrl ? (
-                <button
-                  className="btn px-5 py-2 text-sm font-bold bg-emerald-500 hover:bg-emerald-400 text-zinc-950 flex items-center gap-2 shadow-lg shadow-emerald-500/20"
-                  onClick={handleDownloadOrSaveExport}
-                  type="button"
-                >
-                  <span>Unduh MP4</span>
-                </button>
+                exportSaveLocation === "custom" && customExportDirHandle ? (
+                  <button
+                    className="btn px-5 py-2 text-sm font-bold bg-emerald-500 hover:bg-emerald-400 text-zinc-950 flex items-center gap-2 shadow-lg shadow-emerald-500/20"
+                    onClick={handleDownloadOrSaveExport}
+                    type="button"
+                  >
+                    <span>Simpan ke {customExportFolder || "Folder"}</span>
+                  </button>
+                ) : (
+                  <a
+                    className="btn px-5 py-2 text-sm"
+                    download={exportDownloadFilename}
+                    href={exportResultUrl}
+                    onClick={() => console.info("[XA AutoClip] export_download", {
+                      download_render_id: exportResultRender.id,
+                      render_download_url: exportResultUrl,
+                    })}
+                  >
+                    Unduh MP4
+                  </a>
+                )
               ) : (
                 <button
-                  className="btn px-5 py-2 text-sm font-bold"
+                  className="btn px-5 py-2 text-sm"
                   disabled={
                     !canStartExport ||
                     isSavingEditor ||
@@ -16567,7 +16770,6 @@ export function TransformationPage() {
           </div>
         </div>
       )}
-
       {/* LANE CONTEXT MENU */}
       {laneContextMenu && (
         <div
