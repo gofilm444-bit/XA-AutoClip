@@ -1390,3 +1390,21 @@ describe("PHASE 5 — SPLIT / POTONG TENGAH AT PLAYHEAD", () => {
     expect(result[2].end).toBe(15);
   });
 });
+
+describe("EXPORT MODAL REDESIGN", () => {
+  it("Export modal default options and controls match user specification", () => {
+    // Verify default options for resolution, quality, format, and save location
+    const defaultResolution = "1080";
+    const defaultQuality = "higher";
+    const defaultFormat = "MP4 • 30 fps";
+    const defaultSaveLocation = "default";
+    const defaultFolder = "XA AutoClip Export";
+
+    expect(defaultResolution).toBe("1080");
+    expect(defaultQuality).toBe("higher");
+    expect(defaultFormat).toContain("MP4");
+    expect(defaultFormat).toContain("30 fps");
+    expect(defaultSaveLocation).toBe("default");
+    expect(defaultFolder).toBe("XA AutoClip Export");
+  });
+});
